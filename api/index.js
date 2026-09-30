@@ -91,21 +91,23 @@ async function fetchDirectYoutubeAudio(videoId) {
     const html = await response.text();
     totalBytesReceived += html.length;
 
-    // Extraer datos iniciales de reproducción de YouTube (ytInitialPlayerResponse)
     const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/) || html.match(/var ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/);
     if (playerMatch && playerMatch[1]) {
       try {
         const playerData = JSON.parse(playerMatch[1]);
         const streamingData = playerData.streamingData;
         if (streamingData) {
-          // Combinar adaptiveFormats y formats para buscar pistas de audio
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
           
-          // Filtrar específicamente formatos de solo audio que tengan URL directa
+          // Buscar explícitamente formato de audio puro o contenedor con audio
           let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/mp4') && f.url);
+          if (!audioFormat) {
+            audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/webm') && f.url);
+          }
           if (!audioFormat) {
             audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio') && f.url);
           }
+          
           if (audioFormat && audioFormat.url) {
             return audioFormat.url;
           }
@@ -113,14 +115,17 @@ async function fetchDirectYoutubeAudio(videoId) {
       } catch (err) {}
     }
 
-    // Método de respaldo por regex en caso de cambios en la estructura del reproductor
-    const streamRegex = /"audio\/mp4"[^}]*?"url":"([^"]+)"/g;
+    // Respaldo por expresiones regulares para extraer enlaces directos de audio de googlevideo
+    const streamRegex = /"audio\/(?:mp4|webm)"[^}]*?"url":"([^"]+)"/g;
     let match = streamRegex.exec(html);
-    if (match && match[1]) return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+    if (match && match[1]) {
+      return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+    }
+
     const fallbackRegex = /"url":"(https:\/\/[^"]+signature[^"]+)"/g;
     while ((match = fallbackRegex.exec(html)) !== null) {
       let foundUrl = match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
-      if (foundUrl.includes('googlevideo.com') && (foundUrl.includes('aitags') || foundUrl.includes('mime=audio'))) {
+      if (foundUrl.includes('googlevideo.com') && (foundUrl.includes('mime=audio') || foundUrl.includes('aitags'))) {
         return foundUrl;
       }
     }
@@ -274,7 +279,6 @@ module.exports = async function handler(req, res) {
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const parsedUrl = new URL(req.url, `${protocol}://${host}`);
     
-    // Normalizar la ruta eliminando prefijo /api si existe
     let pathname = parsedUrl.pathname.replace(/^\/api/, '');
     if (!pathname) pathname = '/';
 
