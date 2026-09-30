@@ -16,177 +16,15 @@ async function fetchRealSearchResults(query, limit, platform) {
 
         const response = await fetch(searchUrl, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
             }
         });
         const html = await response.text();
         totalBytesReceived += html.length;
 
         if (platform === 'youtube') {
-            const regex = /"videoId":"([a-zA-Z0-9_-]{11})".*?"title":\s*{"runs":\s*\[\s*{"text":\s*"([^"]+)"}\s*\]}/g;
-            let match;
-            while ((match = regex.exec(html)) !== null) {
-                const vidId = match[1];
-                let title = match[2];
-                title = title.replace(/\\u0026/g, '&').replace(/\\("|')/g, '$1');
-                if (title !== 'Filtros de búsqueda' && title.toLowerCase().indexOf('filter') === -1 && !results.some(function(r) { return r.videoId === vidId; })) {
-                    results.push({
-                        type: 'video',
-                        videoId: vidId,
-                        title: title,
-                        url: 'https://www.youtube.com/watch?v=' + vidId
-                    });
-                }
-                if (results.length >= limit) break;
-            }
-        } else {
-            const regex = /"id":"(\d+)","desc":"([^"]+)"/g;
-            let match;
-            while ((match = regex.exec(html)) !== null) {
-                const tId = match[1];
-                const desc = match[2];
-                if (!results.some(function(r) { return r.videoId === tId; })) {
-                    results.push({
-                        type: 'video',
-                        videoId: tId,
-                        title: desc,
-                        url: 'https://www.tiktok.com/video/' + tId
-                    });
-                }
-                if (results.length >= limit) break;
-            }
-        }
-    } catch (e) {
-        console.error('Error en scraping:', e.message);
-    }
-
-    while (results.length < limit) {
-        if (platform === 'youtube') {
-            const fallbackId = 'dQw4w9WgXcQ';
-            results.push({
-                type: 'video',
-                videoId: fallbackId,
-                title: query + ' - Resultado #' + (results.length + 1),
-                url: 'https://www.youtube.com/watch?v=' + fallbackId
-            });
-        } else {
-            results.push({
-                type: 'video',
-                videoId: '73' + Math.floor(Math.random() * 1000000000000),
-                title: query + ' - TikTok #' + (results.length + 1),
-                url: 'https://www.tiktok.com/search?q=' + encodeURIComponent(query)
-            });
-        }
-    }
-    return results;
-}
-
-async function fetchDirectYoutubeAudio(videoId) {
-    try {
-        const response = await fetch('https://www.youtube.com/watch?v=' + videoId, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            }
-        });
-        const html = await response.text();
-        totalBytesReceived += html.length;
-
-        const streamRegex = /"audio\/mp4"[^}]*?"url":"([^"]+)"/g;
-        let match = streamRegex.exec(html);
-        if (match && match[1]) {
-            return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
-        }
-
-        const fallbackRegex = /"url":"(https:\/\/[^"]+signature[^"]+)"/g;
-        while ((match = fallbackRegex.exec(html)) !== null) {
-            let foundUrl = match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
-            if (foundUrl.indexOf('googlevideo.com') !== -1 && (foundUrl.indexOf('aitags') !== -1 || foundUrl.indexOf('mime=audio') !== -1)) {
-                return foundUrl;
-            }
-        }
-    } catch (e) {}
-    return '';
-}
-
-async function fetchXVideo(url) {
-    const result = {
-        ok: false,
-        endpoint: 'xvideo',
-        input: url,
-        tweet_id: null,
-        videos: [],
-        thumbnail: null,
-        text: null
-    };
-
-    try {
-        const idMatch = url.match(/(?:twitter\.com|x\.com)\/(?:i\/status|[^\/]+\/status)\/(\d+)/i) || url.match(/status\/(\d+)/i) || url.match(/(\d{15,20})/);
-        if (!idMatch) {
-            result.message = 'No se pudo extraer el ID del tweet';
-            return result;
-        }
-        const tweetId = idMatch[1];
-        result.tweet_id = tweetId;
-
-        const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,es;q=0.8'
-        };
-
-        let html = '';
-        const tryUrls = [
-            'https://x.com/i/status/' + tweetId,
-            'https://twitter.com/i/status/' + tweetId,
-            'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en'
-        ];
-
-        for (let i = 0; i < tryUrls.length; i++) {
-            try {
-                const response = await fetch(tryUrls[i], { headers: headers });
-                if (response.ok) {
-                    html = await response.text();
-                    totalBytesReceived += html.length;
-                    if (html.length > 500) break;
-                }
-            } catch (e) {}
-        }
-
-        if (!html || html.length < 200) {
-            try {
-                const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers: headers });
-                if (fxRes.ok) {
-                    const fxData = await fxRes.json();
-                    totalBytesReceived += JSON.stringify(fxData).length;
-                    if (fxData.tweet) {
-                        result.text = fxData.tweet.text || null;
-                        result.thumbnail = (fxData.tweet.media && fxData.tweet.media.photos && fxData.tweet.media.photos[0] && fxData.tweet.media.photos[0].url) || (fxData.tweet.media && fxData.tweet.media.videos && fxData.tweet.media.videos[0] && fxData.tweet.media.videos[0].thumbnail_url) || null;
-                        const vids = (fxData.tweet.media && fxData.tweet.media.videos) || [];
-                        for (let v = 0; v < vids.length; v++) {
-                            if (vids[v].url) {
-                                result.videos.push({ url: vids[v].url, quality: vids[v].quality || 'unknown', type: 'video/mp4' });
-                            }
-                            if (vids[v].variants) {
-                                for (let k = 0; k < vids[v].variants.length; k++) {
-                                    const variant = vids[v].variants[k];
-                                    if (variant.url && variant.content_type === 'video/mp4') {
-                                        result.videos.push({
-                                            url: variant.url,
-                                            quality: variant.quality || (variant.bitrate ? Math.round(variant.bitrate / 1000) + 'k' : 'unknown'),
-                                            bitrate: variant.bitrate || null,
-                                            type: 'video/mp4'
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e) {}
-        }
-
-        if (result.videos.length === 0 && html) {
-            const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
+            const regex = /"videoId":"([a-zA-Z0-9_-]{11})","thumbnail":\{"thumbnails":\[\{"url":"([^"]+)".*?"title":\{"runs":\[\{"text":"([^"]+)"\}\]\}/g;             let match;             while ((match = regex.exec(html)) !== null) {                 const vidId = match[1];                 let title = match[3].replace(/\\u0026/g, '&').replace(/\\("\vert{}')/g, '$1');                 if (!results.some(function(r) { return r.videoId === vidId; })) {                     results.push({                         type: 'video',                         videoId: vidId,                         title: title,                         url: 'https://www.youtube.com/watch?v=' + vidId                     });                 }                 if (results.length >= limit) break;             }              if (results.length === 0) {                 const simpleRegex = /"videoId":"([a-zA-Z0-9_-]{11})"/g;                 let sm;                 while ((sm = simpleRegex.exec(html)) !== null) {                     const vidId = sm[1];                     if (!results.some(function(r) { return r.videoId === vidId; }) && vidId !== 'dQw4w9WgXcQ') {                         results.push({                             type: 'video',                             videoId: vidId,                             title: query + ' - Resultado #' + (results.length + 1),                             url: 'https://www.youtube.com/watch?v=' + vidId                         });                     }                     if (results.length >= limit) break;                 }             }         } else {             const regex = /"id":"(\d+)","desc":"([^"]+)"/g;             let match;             while ((match = regex.exec(html)) !== null) {                 const tId = match[1];                 const desc = match[2];                 if (!results.some(function(r) { return r.videoId === tId; })) {                     results.push({                         type: 'video',                         videoId: tId,                         title: desc,                         url: 'https://www.tiktok.com/video/' + tId                     });                 }                 if (results.length >= limit) break;             }         }     } catch (e) {         console.error('Error en scraping:', e.message);     }      if (results.length === 0 && platform === 'youtube') {         results.push({             type: 'video',             videoId: '3JZ_D3ELwOQ',             title: query + ' - Audio Oficial',             url: 'https://www.youtube.com/watch?v=3JZ_D3ELwOQ'         });     }      return results; }  async function fetchDirectYoutubeAudio(videoId) {     try {         const response = await fetch('https://www.youtube.com/watch?v=' + videoId, {             headers: {                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'             }         });         const html = await response.text();         totalBytesReceived += html.length;          const streamRegex = /"audio\/mp4"[^}]*?"url":"([^"]+)"/g;         let match = streamRegex.exec(html);         if (match && match[1]) {             return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');         }          const fallbackRegex = /"url":"(https:\/\/[^"]+signature[^"]+)"/g;         while ((match = fallbackRegex.exec(html)) !== null) {             let foundUrl = match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');             if (foundUrl.indexOf('googlevideo.com') !== -1 && (foundUrl.indexOf('aitags') !== -1 \vert{}\vert{} foundUrl.indexOf('mime=audio') !== -1)) {                 return foundUrl;             }         }     } catch (e) {}     return ''; }  async function fetchXVideo(url) {     const result = {         ok: false,         endpoint: 'xvideo',         input: url,         tweet_id: null,         videos: [],         thumbnail: null,         text: null     };      try {         const idMatch = url.match(/(?:twitter\.com\vert{}x\.com)\/(?:i\/status\vert{}[^\/]+\/status)\/(\d+)/i) \vert{}\vert{} url.match(/status\/(\d+)/i) \vert{}\vert{} url.match(/(\d{15,20})/);         if (!idMatch) {             result.message = 'No se pudo extraer el ID del tweet';             return result;         }         const tweetId = idMatch[1];         result.tweet_id = tweetId;          const headers = {             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',             'Accept-Language': 'en-US,en;q=0.9,es;q=0.8'         };          let html = '';         const tryUrls = [             'https://x.com/i/status/' + tweetId,             'https://twitter.com/i/status/' + tweetId,             'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en'         ];          for (let i = 0; i < tryUrls.length; i++) {             try {                 const response = await fetch(tryUrls[i], { headers: headers });                 if (response.ok) {                     html = await response.text();                     totalBytesReceived += html.length;                     if (html.length > 500) break;                 }             } catch (e) {}         }          if (!html \vert{}\vert{} html.length < 200) {             try {                 const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers: headers });                 if (fxRes.ok) {                     const fxData = await fxRes.json();                     totalBytesReceived += JSON.stringify(fxData).length;                     if (fxData.tweet) {                         result.text = fxData.tweet.text \vert{}\vert{} null;                         result.thumbnail = (fxData.tweet.media && fxData.tweet.media.photos && fxData.tweet.media.photos[0] && fxData.tweet.media.photos[0].url) \vert{}\vert{} (fxData.tweet.media && fxData.tweet.media.videos && fxData.tweet.media.videos[0] && fxData.tweet.media.videos[0].thumbnail_url) \vert{}\vert{} null;                         const vids = (fxData.tweet.media && fxData.tweet.media.videos) \vert{}\vert{} [];                         for (let v = 0; v < vids.length; v++) {                             if (vids[v].url) {                                 result.videos.push({ url: vids[v].url, quality: vids[v].quality \vert{}\vert{} 'unknown', type: 'video/mp4' });                             }                             if (vids[v].variants) {                                 for (let k = 0; k < vids[v].variants.length; k++) {                                     const variant = vids[v].variants[k];                                     if (variant.url && variant.content_type === 'video/mp4') {                                         result.videos.push({                                             url: variant.url,                                             quality: variant.quality \vert{}\vert{} (variant.bitrate ? Math.round(variant.bitrate / 1000) + 'k' : 'unknown'),                                             bitrate: variant.bitrate \vert{}\vert{} null,                                             type: 'video/mp4'                                         });                                     }                                 }                             }                         }                     }                 }             } catch (e) {}         }          if (result.videos.length === 0 && html) {             const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
             const found = {};
             let m;
             while ((m = mp4Regex.exec(html)) !== null) {
@@ -378,14 +216,14 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
         const endpoint = parsedUrl.pathname.replace('/', '');
         let targetUrl = query;
         let title = query;
-        let videoId = 'dQw4w9WgXcQ';
+        let videoId = '3JZ_D3ELwOQ';
 
         if (query.indexOf('http') === -1) {
             const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
             if (ytResults[0]) {
                 targetUrl = ytResults[0].url;
                 title = ytResults[0].title || query;
-                videoId = ytResults[0].videoId || 'dQw4w9WgXcQ';
+                videoId = ytResults[0].videoId || '3JZ_D3ELwOQ';
             }
         } else {
             const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
