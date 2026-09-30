@@ -1,10 +1,10 @@
-import http from 'http';
 import { URL } from 'url';
-const PORT = process.env.PORT || 3034;
+
 const startTime = Date.now();
 let totalRequests = 0;
 let totalBytesReceived = 0;
 let totalBytesSent = 0;
+
 async function fetchRealSearchResults(query, limit, platform) {
 let results = [];
 try {
@@ -70,6 +70,7 @@ results.push({ type: 'video', videoId: '3JZ_D3ELwOQ', title: query + ' - Audio O
 }
 return results;
 }
+
 async function fetchDirectYoutubeAudio(videoId) {
 try {
 const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' } });
@@ -88,6 +89,7 @@ return foundUrl;
 } catch (e) {}
 return '';
 }
+
 async function fetchXVideo(url) {
 const result = { ok: false, endpoint: 'xvideo', input: url, tweet_id: null, videos: [], thumbnail: null, text: null };
 try {
@@ -160,6 +162,7 @@ result.message = 'Error en scraper: ' + e.message;
 }
 return result;
 }
+
 async function fetchTikTokVideo(url) {
 try {
 const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' } });
@@ -221,16 +224,21 @@ downloads: vData.stats?.downloadCount || 0
 return { creator: "Jxmpier207", status: false, message: e.message };
 }
 }
-const server = http.createServer(async function(req, res) {
+
+export default async function handler(req, res) {
 totalRequests++;
-const parsedUrl = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
+const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+const protocol = req.headers['x-forwarded-proto'] || 'https';
+const parsedUrl = new URL(req.url, `${protocol}://${host}`);
 const query = parsedUrl.searchParams.get('query');
 const limitParam = parseInt(parsedUrl.searchParams.get('limit')) || 5;
 const limit = Math.min(Math.max(limitParam, 1), 20);
+
 if (parsedUrl.pathname === '/') {
 res.writeHead(302, { 'Location': '/docs' });
 return res.end();
 }
+
 if (parsedUrl.pathname === '/docs') {
 const uptimeMinutes = Math.floor((Date.now() - startTime) / 60000);
 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -294,7 +302,7 @@ pre{color:#00ff66;font-size:11px;overflow-x:auto;max-height:200px;margin:0;white
 <span class="sub-item" onclick="switchTab('downloaders',this)">📥 Descargas</span>
 <span class="sub-item" onclick="switchTab('search',this)">🔍 Búsquedas</span>
 </div>
-<div class="sidebar-footer"><span>RGB ENGINE</span><span style="color:#00ff66">● ONLINE :${PORT}</span></div>
+<div class="sidebar-footer"><span>RGB ENGINE</span><span style="color:#00ff66">● ONLINE (VERCEL)</span></div>
 </div>
 <div class="main-content"><div class="card-wrapper">
 <div id="guide" class="card active">
@@ -371,8 +379,10 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
 </script>
 </body></html>`);
 }
+
 res.setHeader('Access-Control-Allow-Origin', '*');
 res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
 if (parsedUrl.pathname === '/tiktok') {
 if (!query) return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta query' }));
 const data = await fetchTikTokVideo(query);
@@ -380,6 +390,7 @@ const payload = JSON.stringify(data, null, 2);
 totalBytesSent += payload.length;
 return res.end(payload);
 }
+
 if (parsedUrl.pathname === '/ytsearch' || parsedUrl.pathname === '/ttsearch') {
 if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
 const platform = parsedUrl.pathname === '/ytsearch' ? 'youtube' : 'tiktok';
@@ -388,6 +399,7 @@ const payload = JSON.stringify({ ok: true, source: platform, query: query, total
 totalBytesSent += payload.length;
 return res.end(payload);
 }
+
 if (parsedUrl.pathname === '/ytmp3' || parsedUrl.pathname === '/ytmp4') {
 if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
 const endpoint = parsedUrl.pathname.replace('/', '');
@@ -411,6 +423,7 @@ const payload = JSON.stringify({ ok: true, endpoint: endpoint, action: endpoint 
 totalBytesSent += payload.length;
 return res.end(payload);
 }
+
 if (parsedUrl.pathname === '/xvideo') {
 if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta link del tweet' }));
 const data = await fetchXVideo(query);
@@ -418,11 +431,9 @@ const payload = JSON.stringify(data, null, 2);
 totalBytesSent += payload.length;
 return res.end(payload);
 }
+
 res.statusCode = 404;
 const err = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + parsedUrl.pathname });
 totalBytesSent += err.length;
 res.end(err);
-});
-server.listen(PORT, '0.0.0.0', function() {
-console.log('[ZETA-CORE.API] Activo en http://127.0.0.1:' + PORT);
-});
+}
