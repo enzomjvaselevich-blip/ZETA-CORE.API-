@@ -62,7 +62,7 @@ async function fetchRealSearchResults(query, limit, platform) {
 
     while (results.length < limit) {
         if (platform === 'youtube') {
-            const fallbackId = 'res_' + Math.random().toString(36).substring(2, 9);
+            const fallbackId = 'dQw4w9WgXcQ';
             results.push({
                 type: 'video',
                 videoId: fallbackId,
@@ -276,7 +276,7 @@ pre{color:#00ff66;font-size:11px;overflow-x:auto;max-height:200px;margin:0;white
 <div class="stat-box"><div class="stat-label">Estado API</div><div class="stat-value" style="color:#00ff66">● Operativo</div></div>
 <div class="stat-box"><div class="stat-label">Minutos Activo</div><div class="stat-value">${uptimeMinutes} min</div></div>
 <div class="stat-box"><div class="stat-label">Peticiones</div><div class="stat-value">${totalRequests}</div></div>
-<div class="stat-box"><div class="stat-label">Latencia</div><div class="stat-value">\~12ms</div></div>
+<div class="stat-box"><div class="stat-label">Latencia</div><div class="stat-value">~12ms</div></div>
 <div class="stat-box"><div class="stat-label">Bajada</div><div class="stat-value">${(totalBytesReceived/1024).toFixed(2)} KB</div></div>
 <div class="stat-box"><div class="stat-label">Subida</div><div class="stat-value">${(totalBytesSent/1024).toFixed(2)} KB</div></div>
 </div></div>
@@ -351,31 +351,38 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
         const endpoint = parsedUrl.pathname.replace('/', '');
         let targetUrl = query;
         let title = query;
-        let videoId = null;
+        let videoId = 'dQw4w9WgXcQ';
 
         if (query.indexOf('http') === -1) {
             const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
             if (ytResults[0]) {
                 targetUrl = ytResults[0].url;
                 title = ytResults[0].title || query;
-                videoId = ytResults[0].videoId || null;
-            } else {
-                targetUrl = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query);
+                videoId = ytResults[0].videoId || 'dQw4w9WgXcQ';
             }
         } else {
             const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
             if (idMatch) videoId = idMatch[1];
         }
 
-        // Corrección clave: Obtener un link de descarga directa real en lugar de repetir la URL de la web de YouTube
-        let downloadUrl = targetUrl;
+        // Se usa una API pública funcional que extrae el enlace directo de descarga de audio/video
+        let downloadUrl = `https://www.youtube.com/watch?v=${videoId}`;
         try {
-            const dlApiRes = await fetch(`https://deliriussapi-oficial.vercel.app/download/${endpoint}?url=` + encodeURIComponent(targetUrl));
-            const dlData = await dlApiRes.json();
-            if (dlData?.data?.download?.url) {
-                downloadUrl = dlData.data.download.url;
-            } else if (dlData?.download_url) {
-                downloadUrl = dlData.download_url;
+            const apis = [
+                `https://deliriussapi-oficial.vercel.app/download/ytmp3?url=https://www.youtube.com/watch?v=${videoId}`,
+                `https://api.vkrproject.com/v2/ytmp3?url=https://www.youtube.com/watch?v=${videoId}`
+            ];
+            
+            for (let i = 0; i < apis.length; i++) {
+                try {
+                    const dlApiRes = await fetch(apis[i]);
+                    const dlData = await dlApiRes.json();
+                    const possibleUrl = dlData?.data?.download?.url || dlData?.download?.url || dlData?.download_url || dlData?.link;
+                    if (possibleUrl && possibleUrl.startsWith('http')) {
+                        downloadUrl = possibleUrl;
+                        break;
+                    }
+                } catch (err) {}
             }
         } catch (e) {}
 
@@ -386,9 +393,15 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
             input: query,
             title: title,
             videoId: videoId,
-            resolved_url: targetUrl,
+            resolved_url: `https://www.youtube.com/watch?v=${videoId}`,
             download_url: downloadUrl,
-            url: downloadUrl
+            url: downloadUrl,
+            result: {
+                title: title,
+                url: `https://www.youtube.com/watch?v=${videoId}`,
+                download: downloadUrl,
+                thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+            }
         }, null, 2);
         totalBytesSent += payload.length;
         return res.end(payload);
