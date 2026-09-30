@@ -2,7 +2,6 @@ const { URL } = require('url');
 const { randomUUID } = require('node:crypto');
 const secureApi = require('./secure-api');
 
-const startTime = Date.now();
 
 async function fetchRealSearchResults(query, limit, platform) {
   let results = [];
@@ -328,15 +327,7 @@ module.exports = async function handler(req, res) {
       return sendJson(400, { ok: false, message: 'El parámetro limit debe estar entre 1 y 20.', requestId });
     }
 
-    const rateLimit = await secureApi.enforceRateLimit(req);
-    res.setHeader('X-RateLimit-Remaining', String(rateLimit.remaining));
-    if (!rateLimit.success) {
-      res.setHeader('Retry-After', '60');
-      return sendJson(429, { ok: false, message: 'Límite de solicitudes excedido. Intenta de nuevo en un minuto.', requestId });
-    }
-
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    const parentSignal = globalController.signal;
 
     if (pathname === '/' || pathname === '') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -370,7 +361,6 @@ p{color:#b8b2d1;font-size:15px;margin-bottom:30px;line-height:1.6;font-weight:60
     }
 
     if (pathname === '/docs') {
-      const uptimeMinutes = Math.floor((Date.now() - startTime) / 60000);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(`<!DOCTYPE html>
 <html lang="es">
@@ -447,11 +437,8 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div class="creator-tag">By: FlextOFC ✨</div>
 <div class="stats-grid">
 <div class="stat-box"><div class="stat-label">Núcleo API</div><div class="stat-value" style="color:#00ff66">● Activo</div></div>
-<div class="stat-box"><div class="stat-label">Tiempo Activo</div><div class="stat-value">${uptimeMinutes} min</div></div>
-<div class="stat-box"><div class="stat-label">Peticiones</div><div class="stat-value">${totalRequests}</div></div>
-<div class="stat-box"><div class="stat-label">Latencia</div><div class="stat-value">~12ms</div></div>
-<div class="stat-box"><div class="stat-label">Bajada Data</div><div class="stat-value">${(totalBytesReceived/1024).toFixed(2)} KB</div></div>
-<div class="stat-box"><div class="stat-label">Subida Data</div><div class="stat-value">${(totalBytesSent/1024).toFixed(2)} KB</div></div>
+  <div class="stat-box"><div class="stat-label">Endpoints</div><div class="stat-value">YouTube · TikTok · X</div></div>
+  <div class="stat-box"><div class="stat-label">Protección</div><div class="stat-value">Rate limit compartido</div></div>
 </div></div>
 <div style="text-align:center"><button class="btn btn-rgb" onclick="switchTab('downloaders', document.querySelectorAll('.sub-item')[1])">📄 EXPLORAR DOCUMENTACIÓN</button></div>
 </div>
@@ -542,87 +529,99 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
 </body></html>`);
     }
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    const rateLimit = await secureApi.enforceRateLimit(req);
+    res.setHeader('X-RateLimit-Remaining', String(rateLimit.remaining));
+    if (!rateLimit.success) {
+      res.setHeader('Retry-After', '60');
+      return sendJson(429, { ok: false, message: 'Límite de solicitudes excedido. Intenta de nuevo en un minuto.', requestId });
+    }
 
+    const parentSignal = globalController.signal;
     if (pathname === '/tiktok') {
-      if (!query) return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta query' }));
-      const data = await fetchTikTokVideo(query);
-      const payload = JSON.stringify(data, null, 2);
-      totalBytesSent += payload.length;
-      return res.end(payload);
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro url.', requestId });
+      try {
+        return sendJson(200, await secureApi.fetchTikTokVideo(query, parentSignal));
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
+        return sendJson(error.statusCode || 502, { creator: 'Jxmpier207', status: false, message: secureApi.publicErrorMessage(error), requestId });
+      }
     }
 
     if (pathname === '/ytsearch' || pathname === '/ttsearch') {
-      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
-      const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
-      const results = await fetchRealSearchResults(query, limit, platform);
-      const payload = JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2);
-      totalBytesSent += payload.length;
-      return res.end(payload);
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query.', requestId });
+      try {
+        const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
+        const results = await secureApi.fetchRealSearchResults(query, limit, platform, parentSignal);
+        if (!results.length) return sendJson(404, { ok: false, message: 'No se encontraron resultados.', requestId });
+        return sendJson(200, { ok: true, source: platform, query, total_results: results.length, results, requestId });
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
+        return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
+      }
     }
 
-    if (pathname === '/youtube' || pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
-      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query o url' }));
-      
-      let resolvedType = type;
-      if (pathname === '/ytmp3') resolvedType = 'audio';
-      if (pathname === '/ytmp4') resolvedType = 'video';
-
-      let title = query;
-      let videoId = 'nlXqp3FVrq8';
-      if (!query.includes('http')) {
-        const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
-        if (ytResults[0]) {
-          title = ytResults[0].title || query;
-          videoId = ytResults[0].videoId || 'nlXqp3FVrq8';
+    if (['/youtube', '/ytmp3', '/ytmp4', '/docs/download/ytmp3', '/docs/download/ytmp4'].includes(pathname)) {
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query o url.', requestId });
+      try {
+        const resolvedType = pathname.endsWith('ytmp3') ? 'audio' : pathname.endsWith('ytmp4') ? 'video' : type;
+        let title = query;
+        let videoId;
+        if (/^https?:\/\//i.test(query)) {
+          videoId = secureApi.extractYoutubeVideoId(query);
+          if (!videoId) return sendJson(400, { ok: false, message: 'La URL de YouTube no es válida; se requiere HTTPS y una ruta reconocida.', requestId });
+        } else if (/^[a-z][a-z\d+.-]*:\/\//i.test(query)) {
+          return sendJson(400, { ok: false, message: 'Solo se aceptan enlaces HTTPS de YouTube.', requestId });
+        } else {
+          const results = await secureApi.fetchRealSearchResults(query, 1, 'youtube', parentSignal);
+          if (!results[0]) return sendJson(404, { ok: false, message: 'No se encontró un video para la búsqueda.', requestId });
+          title = results[0].title || query;
+          videoId = results[0].videoId;
         }
-      } else {
-        const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-        if (idMatch) videoId = idMatch[1];
-      }
-      
-      let mediaData = await fetchYoutubeMedia(videoId, resolvedType, quality);
-      
-      const payload = JSON.stringify({ 
-        ok: true, 
-        endpoint: 'youtube', 
-        type: resolvedType, 
-        quality: mediaData.quality, 
-        input: query, 
-        title: title, 
-        videoId: videoId, 
-        resolved_url: 'https://www.youtube.com/watch?v=' + videoId, 
-        download_url: mediaData.url, 
-        url: mediaData.url, 
-        result: { 
-          title: title, 
+        const media = await secureApi.fetchYoutubeMedia(videoId, resolvedType, quality, parentSignal);
+        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        return sendJson(200, {
+          ok: true,
+          endpoint: resolvedType === 'audio' ? 'ytmp3' : 'youtube',
           type: resolvedType,
-          quality: mediaData.quality,
-          url: 'https://www.youtube.com/watch?v=' + videoId, 
-          download: mediaData.url, 
-          thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' 
-        } 
-      }, null, 2);
-      
-      totalBytesSent += payload.length;
-      return res.end(payload);
+          quality: media.quality,
+          input: query,
+          title,
+          videoId,
+          resolved_url: videoUrl,
+          download_url: media.url,
+          url: media.url,
+          result: {
+            title,
+            type: resolvedType,
+            quality: media.quality,
+            url: videoUrl,
+            download: media.url,
+            thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          },
+          requestId,
+        });
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
+        return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
+      }
     }
 
     if (pathname === '/xvideo') {
-      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta link del tweet' }));
-      const data = await fetchXVideo(query);
-      const payload = JSON.stringify(data, null, 2);
-      totalBytesSent += payload.length;
-      return res.end(payload);
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el enlace de la publicación.', requestId });
+      try {
+        return sendJson(200, { ...(await secureApi.fetchXVideo(query, parentSignal)), requestId });
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
+        return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
+      }
     }
 
-    res.statusCode = 404;
-    const err = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + pathname });
-    totalBytesSent += err.length;
-    res.end(err);
+    return sendJson(404, { ok: false, message: 'Endpoint no encontrado.', requestId });
   } catch (error) {
-    res.statusCode = 500;
-    res.end(JSON.stringify({ ok: false, error: error.message }));
+    console.error(JSON.stringify({ requestId, statusCode: error.statusCode || 500, message: error.message }));
+    return sendJson(error.statusCode || 500, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
+  } finally {
+    clearTimeout(globalTimeout);
   }
 };

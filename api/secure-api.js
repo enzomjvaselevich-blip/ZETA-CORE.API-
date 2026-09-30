@@ -39,11 +39,7 @@ function createCombinedSignal(parentSignal, timeoutMs) {
 }
 
 function isAllowedHost(hostname, allowedHosts) {
-  const host = hostname.toLowerCase();
-  return allowedHosts.some((entry) => {
-    const domain = entry.toLowerCase();
-    return host === domain || host.endsWith(`.${domain}`);
-  });
+  return allowedHosts.includes(hostname.toLowerCase());
 }
 
 function validateUpstreamUrl(value, allowedHosts) {
@@ -65,7 +61,7 @@ function validateUpstreamUrl(value, allowedHosts) {
   return url;
 }
 
-async function readTextWithLimit(response, maxBytes) {
+async function readTextWithLimit(response, maxBytes, signal) {
   const contentLength = response.headers.get('content-length');
   if (contentLength !== null) {
     if (!/^\d+$/.test(contentLength)) {
@@ -97,7 +93,7 @@ async function readTextWithLimit(response, maxBytes) {
     }
   } catch (error) {
     if (error.statusCode) throw error;
-    if (response.signal?.aborted || error.name === 'AbortError') {
+    if (signal?.aborted || error.name === 'AbortError') {
       throw apiError(504, 'La lectura de la respuesta del proveedor excedió el tiempo límite.');
     }
     throw apiError(502, 'No se pudo leer la respuesta del proveedor.');
@@ -156,7 +152,11 @@ async function fetchTextSafe(initialUrl, options = {}) {
         throw apiError(502, 'El proveedor respondió con un error.', { upstreamStatus: response.status });
       }
 
-      const text = await readTextWithLimit(response, maxBytes);
+      if (acceptedStatuses.includes(response.status)) {
+        await response.body?.cancel().catch(() => {});
+        return { response, text: '', url: currentUrl };
+      }
+      const text = await readTextWithLimit(response, maxBytes, combined.signal);
       return { response, text, url: currentUrl };
     } finally {
       combined.cleanup();
@@ -256,8 +256,8 @@ async function fetchRealSearchResults(query, limit, platform, parentSignal) {
     ? `https://${host}/results?search_query=${encodeURIComponent(query)}`
     : `https://${host}/search?q=${encodeURIComponent(query)}`;
   const allowedHosts = isYoutube
-    ? ['youtube.com']
-    : ['tiktok.com', 'douyin.com'];
+    ? ['youtube.com', 'www.youtube.com']
+    : ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'douyin.com', 'www.douyin.com', 'v.douyin.com'];
   const { text } = await fetchTextSafe(url, { allowedHosts, parentSignal, timeoutMs: 4500 });
   const results = [];
 
@@ -309,7 +309,7 @@ function getYoutubeFormatUrl(format) {
   if (!format?.url || typeof format.url !== 'string') return null;
   try {
     const url = new URL(format.url);
-    if (url.protocol !== 'https:' || !isAllowedHost(url.hostname, ['googlevideo.com'])) return null;
+    if (url.protocol !== 'https:' || !(url.hostname === 'googlevideo.com' || url.hostname.endsWith('.googlevideo.com'))) return null;
     return url.href;
   } catch {
     return null;
@@ -318,7 +318,7 @@ function getYoutubeFormatUrl(format) {
 
 async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
   const { text } = await fetchTextSafe(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, {
-    allowedHosts: ['youtube.com'],
+    allowedHosts: ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'],
     parentSignal,
     timeoutMs: 4500,
   });
@@ -370,7 +370,7 @@ function validTikTokUrl(input) {
   }
   if (
     url.protocol !== 'https:' || url.port || url.username || url.password ||
-    !isAllowedHost(url.hostname, ['tiktok.com', 'douyin.com'])
+    !isAllowedHost(url.hostname, ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'douyin.com', 'www.douyin.com', 'v.douyin.com'])
   ) {
     throw apiError(400, 'Solo se aceptan enlaces HTTPS de TikTok o Douyin.');
   }
@@ -380,7 +380,7 @@ function validTikTokUrl(input) {
 async function fetchTikTokVideo(initialUrl, parentSignal) {
   validTikTokUrl(initialUrl);
   const { text } = await fetchTextSafe(initialUrl, {
-    allowedHosts: ['tiktok.com', 'douyin.com'],
+    allowedHosts: ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'douyin.com', 'www.douyin.com', 'v.douyin.com'],
     parentSignal,
     timeoutMs: 4500,
   });
@@ -458,7 +458,7 @@ function getVideoVariants(tweet) {
     if (!variant.url || (variant.contentType && variant.contentType !== 'video/mp4')) continue;
     try {
       const url = new URL(variant.url);
-      if (url.protocol !== 'https:' || !isAllowedHost(url.hostname, ['video.twimg.com'])) continue;
+      if (url.protocol !== 'https:' || url.hostname !== 'video.twimg.com') continue;
       unique.set(url.href, {
         url: url.href,
         quality: variant.quality || 'unknown',
@@ -499,7 +499,7 @@ async function fetchXVideo(inputUrl, parentSignal) {
     },
     {
       url: `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en`,
-      hosts: ['syndication.twimg.com'],
+      hosts: ['cdn.syndication.twimg.com'],
       maxBytes: 2 * 1024 * 1024,
     },
   ];
@@ -575,6 +575,8 @@ function publicErrorMessage(error) {
 
 module.exports = {
   apiError,
+  fetchTextSafe,
+  extractTweetId,
   enforceRateLimit,
   extractYoutubeVideoId,
   fetchRealSearchResults,
