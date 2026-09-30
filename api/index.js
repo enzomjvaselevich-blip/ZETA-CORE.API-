@@ -1,5 +1,4 @@
-import { URL } from 'url';
-
+const { URL } = require('url');
 const startTime = Date.now();
 let totalRequests = 0;
 let totalBytesReceived = 0;
@@ -225,7 +224,7 @@ return { creator: "Jxmpier207", status: false, message: e.message };
 }
 }
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
 totalRequests++;
 const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
 const protocol = req.headers['x-forwarded-proto'] || 'https';
@@ -436,4 +435,4 @@ res.statusCode = 404;
 const err = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + parsedUrl.pathname });
 totalBytesSent += err.length;
 res.end(err);
-}
+};
