@@ -5,21 +5,24 @@ const secureApi = require('./secure-api');
 
 async function fetchRealSearchResults(query, limit, platform) {
   let results = [];
+  const searchUrl = platform === 'youtube'
+    ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query)
+    : 'https://www.tiktok.com/search?q=' + encodeURIComponent(query);
+  const { signal, cleanup } = createCombinedSignal(parentSignal, 5000);
   try {
-    const searchUrl = platform === 'youtube' 
-      ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query) 
-      : 'https://www.tiktok.com/search?q=' + encodeURIComponent(query);
-      
-    const response = await fetch(searchUrl, { 
-      headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' 
-      } 
+    const response = await fetch(searchUrl, {
+      signal: signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+      }
     });
-    
-    const html = await response.text();
-    totalBytesReceived += html.length;
-    
+    if (!response.ok) {
+      const err = new Error(`El servicio de ${platform} respondió con un error remoto HTTP ${response.status}`);
+      err.statusCode = 502;
+      throw err;
+    }
+    const html = await readTextWithLimit(response, 4 * 1024 * 1024);
     if (platform === 'youtube') {
       const match = html.match(/var ytInitialData = ({[\s\S]*?});<\/script>/) || html.match(/window\["ytInitialData"\] = ({[\s\S]*?});<\/script>/);
       if (match && match[1]) {
@@ -47,7 +50,6 @@ async function fetchRealSearchResults(query, limit, platform) {
           }
         } catch (parseErr) {}
       }
-      
       if (results.length === 0) {
         const regex = /"videoId":"([a-zA-Z0-9_-]{11})"/g;
         let sm;
@@ -71,27 +73,35 @@ async function fetchRealSearchResults(query, limit, platform) {
         if (results.length >= limit) break;
       }
     }
+    return results;
   } catch (e) {
-    console.error('Error en scraping:', e.message);
+    if (e.name === 'AbortError' || e.statusCode === 504) {
+      const err = new Error(`Tiempo de espera agotado al consultar ${platform}.`);
+      err.statusCode = 504;
+      throw err;
+    }
+    if (!e.statusCode) e.statusCode = 502;
+    throw e;
+  } finally {
+    cleanup();
   }
-  
-  if (results.length === 0 && platform === 'youtube') {
-    results.push({ type: 'video', videoId: 'nlXqp3FVrq8', title: query + ' - Audio Oficial', url: 'https://www.youtube.com/watch?v=nlXqp3FVrq8' });
-  }
-  return results;
 }
-
-async function fetchYoutubeMedia(videoId, type, quality) {
+async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
+  const { signal, cleanup } = createCombinedSignal(parentSignal, 5000);
   try {
-    const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
-      headers: { 
+    const response = await fetch('https://www.youtube.com/watch?v=' + videoId, {
+      signal: signal,
+      headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept-Language': 'es-ES,es;q=0.9'
-      } 
+      }
     });
-    const html = await response.text();
-    totalBytesReceived += html.length;
-
+    if (!response.ok) {
+      const err = new Error(`YouTube respondió con un estado de error HTTP ${response.status}`);
+      err.statusCode = 502;
+      throw err;
+    }
+    const html = await readTextWithLimit(response, 4 * 1024 * 1024);
     const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/) || html.match(/var ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/);
     if (playerMatch && playerMatch[1]) {
       try {
@@ -99,11 +109,9 @@ async function fetchYoutubeMedia(videoId, type, quality) {
         const streamingData = playerData.streamingData;
         if (streamingData) {
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
-          
           if (type === 'audio') {
             let audioFormats = allFormats.filter(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
             audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-            
             let audioFormat = audioFormats[0] || allFormats.find(f => f.url && f.mimeType && f.mimeType.includes('audio/'));
             if (audioFormat && audioFormat.url) {
               return { url: audioFormat.url, quality: 'audio-128kbps', bitrate: audioFormat.bitrate || 128000 };
@@ -114,7 +122,6 @@ async function fetchYoutubeMedia(videoId, type, quality) {
             else if (quality === '480p') targetHeight = 480;
             else if (quality === '360p') targetHeight = 360;
             else if (quality === '720p') targetHeight = 720;
-
             let videoFormat = allFormats.find(f => f.height === targetHeight && f.url && f.mimeType.includes('video/'));
             if (!videoFormat) {
               videoFormat = allFormats.find(f => f.url && f.mimeType.includes('video/'));
@@ -126,151 +133,226 @@ async function fetchYoutubeMedia(videoId, type, quality) {
         }
       } catch (err) {}
     }
-  } catch (e) {}
-  
-  const fallbackUrl = 'https://rr3---sn-gvnuxnzs.googlevideo.com/videoplayback?expire=3716248320&ei=1&initbypass=yes&id=' + type + '_' + videoId;
-  return { url: fallbackUrl, quality: type === 'audio' ? 'audio-128kbps' : (quality || 'default'), bitrate: null };
+    const notFoundErr = new Error("No se pudo extraer el enlace directo de descarga desde el contenido de YouTube.");
+    notFoundErr.statusCode = 404;
+    throw notFoundErr;
+  } catch (e) {
+    if (e.name === 'AbortError' || e.statusCode === 504) {
+      const err = new Error("Tiempo de espera agotado al comunicarse con YouTube.");
+      err.statusCode = 504;
+      throw err;
+    }
+    if (!e.statusCode) e.statusCode = 502;
+    throw e;
+  } finally {
+    cleanup();
+  }
 }
-
-async function fetchXVideo(url) {
-  const result = { ok: false, endpoint: 'xvideo', input: url, tweet_id: null, videos: [], thumbnail: null, text: null };
+async function fetchXVideo(inputUrl, parentSignal) {
+  let tweetId = null;
   try {
-    const idMatch = url.match(/(?:twitter\.com|x\.com)\/(?:i\/status|[^\/]+\/status)\/(\d+)/i) || url.match(/status\/(\d+)/i) || url.match(/(\d{15,20})/);
-    if (!idMatch) {
-      result.message = 'No se pudo extraer el ID del tweet';
-      return result;
+    const u = new URL(inputUrl);
+    if (u.protocol !== 'https:') {
+      const err = new Error('Solo se aceptan URLs con protocolo HTTPS.');
+      err.statusCode = 400;
+      throw err;
     }
-    const tweetId = idMatch[1];
-    result.tweet_id = tweetId;
-    const headers = { 
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 
-      'Accept-Language': 'en-US,en;q=0.9,es;q=0.8' 
-    };
-    let html = '';
-    const tryUrls = [ 'https://x.com/i/status/' + tweetId, 'https://twitter.com/i/status/' + tweetId, 'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en' ];
-    for (let i = 0; i < tryUrls.length; i++) {
-      try {
-        const response = await fetch(tryUrls[i], { headers });
-        if (response.ok) {
-          html = await response.text();
-          totalBytesReceived += html.length;
-          if (html.length > 500) break;
-        }
-      } catch (e) {}
+    const host = u.hostname.toLowerCase();
+    const validXHosts = ['twitter.com', 'www.twitter.com', 'x.com', 'www.x.com'];
+    if (!validXHosts.includes(host)) {
+      const err = new Error('Dominio no permitido. Debe ser x.com o twitter.com.');
+      err.statusCode = 400;
+      throw err;
     }
-    if (!html || html.length < 200) {
-      try {
-        const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers });
-        if (fxRes.ok) {
-          const fxData = await fxRes.json();
-          totalBytesReceived += JSON.stringify(fxData).length;
+    const match = u.pathname.match(/(?:status|i\/status)\/(\d{15,20})/);
+    if (match) tweetId = match[1];
+  } catch (e) {
+    if (e.statusCode) throw e;
+    const err = new Error('Estructura de URL de X/Twitter inválida.');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!tweetId) {
+    const err = new Error('No se pudo extraer un ID de tweet válido desde la URL proporcionada.');
+    err.statusCode = 400;
+    throw err;
+  }
+  const result = { ok: true, endpoint: 'xvideo', input: inputUrl, tweet_id: tweetId, videos: [], thumbnail: null, text: null };
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,es;q=0.8'
+  };
+  let lastError = null;
+  const tryUrls = ['https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en', 'https://api.fxtwitter.com/status/' + tweetId];
+  for (let i = 0; i < tryUrls.length; i++) {
+    if (parentSignal && parentSignal.aborted) {
+      const err = new Error('Límite de tiempo global alcanzado para la solicitud.');
+      err.statusCode = 504;
+      throw err;
+    }
+    const { signal, cleanup } = createCombinedSignal(parentSignal, 3000);
+    try {
+      const response = await fetch(tryUrls[i], { headers, signal });
+      if (response.ok) {
+        const textResp = await readTextWithLimit(response, 2 * 1024 * 1024);
+        if (tryUrls[i].includes('fxtwitter')) {
+          const fxData = JSON.parse(textResp);
           if (fxData.tweet) {
             result.text = fxData.tweet.text || null;
             result.thumbnail = (fxData.tweet.media?.photos?.[0]?.url) || (fxData.tweet.media?.videos?.[0]?.thumbnail_url) || null;
             const vids = fxData.tweet.media?.videos || [];
             for (let v = 0; v < vids.length; v++) {
               if (vids[v].url) result.videos.push({ url: vids[v].url, quality: vids[v].quality || 'unknown', type: 'video/mp4' });
-              if (vids[v].variants) {
-                for (let k = 0; k < vids[v].variants.length; k++) {
-                  const variant = vids[v].variants[k];
-                  if (variant.url && variant.content_type === 'video/mp4') {
-                    result.videos.push({ url: variant.url, quality: variant.quality || (variant.bitrate ? Math.round(variant.bitrate / 1000) + 'k' : 'unknown'), bitrate: variant.bitrate || null, type: 'video/mp4' });
-                  }
-                }
-              }
+            }
+          }
+        } else {
+          const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
+          const found = {};
+          let m;
+          while ((m = mp4Regex.exec(textResp)) !== null) {
+            let clean = m[0].replace(/\\u0026/g, '&').replace(/\\"/g, '').replace(/\\/g, '');
+            if (!found[clean] && clean.includes('video.twimg.com')) {
+              found[clean] = true;
+              result.videos.push({ url: clean, quality: clean.includes('720') ? '720p' : clean.includes('360') ? '360p' : clean.includes('480') ? '480p' : 'unknown', type: 'video/mp4' });
             }
           }
         }
-      } catch (e) {}
-    }
-    if (result.videos.length === 0 && html) {
-      const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
-      const found = {};
-      let m;
-      while ((m = mp4Regex.exec(html)) !== null) {
-        let clean = m[0].replace(/\\u0026/g, '&').replace(/\\"/g, '').replace(/\\/g, '');
-        if (!found[clean] && clean.includes('video.twimg.com')) {
-          found[clean] = true;
-          result.videos.push({ url: clean, quality: clean.includes('720') ? '720p' : clean.includes('360') ? '360p' : clean.includes('480') ? '480p' : 'unknown', type: 'video/mp4' });
+        if (result.videos.length > 0) {
+          cleanup();
+          break;
         }
       }
+    } catch (e) {
+      lastError = e;
+    } finally {
+      cleanup();
     }
-    if (result.videos.length > 0) {
-      result.ok = true;
-      result.total_videos = result.videos.length;
-      result.best = result.videos[0].url;
-    } else {
-      result.message = 'No se encontraron videos en este tweet';
-    }
-  } catch (e) {
-    result.message = 'Error en scraper: ' + e.message;
   }
-  return result;
+  if (result.videos.length > 0) {
+    result.total_videos = result.videos.length;
+    result.best = result.videos[0].url;
+    return result;
+  }
+  if (lastError && (lastError.name === 'AbortError' || lastError.statusCode === 504)) {
+    const err = new Error('Tiempo de espera agotado al consultar los servidores de X/Twitter.');
+    err.statusCode = 504;
+    throw err;
+  }
+  if (lastError && lastError.statusCode && lastError.statusCode !== 404) {
+    throw lastError;
+  }
+  const notFoundErr = new Error('No se encontraron videos disponibles en el tweet indicado.');
+  notFoundErr.statusCode = 404;
+  throw notFoundErr;
 }
-
-async function fetchTikTokVideo(url) {
-  try {
-    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' } });
-    const html = await response.text();
-    totalBytesReceived += html.length;
-    let vData = null;
-    const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
-    if (univMatch) {
-      const univ = JSON.parse(univMatch[1]);
-      vData = univ.__DEFAULT_SCOPE__['webapp.video-detail']?.itemInfo?.itemStruct;
-    } else {
-      const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
-      if (sigiMatch) {
-        const sigi = JSON.parse(sigiMatch[1]);
-        const itemId = Object.keys(sigi.ItemModule)[0];
-        vData = sigi.ItemModule[itemId];
-      }
+async function fetchTikTokVideo(initialUrl, parentSignal) {
+  let currentUrl = initialUrl;
+  let redirects = 0;
+  const maxRedirects = 5;
+  while (redirects < maxRedirects) {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(currentUrl);
+    } catch (err) {
+      const e = new Error('La URL proporcionada no es válida.');
+      e.statusCode = 400;
+      throw e;
     }
-    if (!vData) throw new Error("No data found");
-    return {
-      creator: "Jxmpier207",
-      status: true,
-      data: {
-        id: vData.id || "",
-        url: url,
-        type: "video",
-        title: vData.desc || "",
-        cover: vData.video?.cover || "",
-        duration: vData.video?.duration || 0,
-        size: "",
-        hd_size: "",
-        images: [],
-        links: {
-          hd: vData.video?.playAddr || "",
-          sd: vData.video?.playAddr || "",
-          wm: vData.video?.downloadAddr || "",
-          mp3: vData.music?.playUrl || ""
-        },
-        author: {
-          username: vData.author?.uniqueId || "",
-          nickname: vData.author?.nickname || "",
-          avatar: vData.author?.avatarLarger || ""
-        },
-        music: {
-          title: vData.music?.title || "",
-          author: vData.music?.authorName || "",
-          cover: vData.music?.coverLarge || ""
-        },
-        stats: {
-          views: vData.stats?.playCount || 0,
-          likes: vData.stats?.diggCount || 0,
-          comments: vData.stats?.commentCount || 0,
-          shares: vData.stats?.shareCount || 0,
-          downloads: vData.stats?.downloadCount || 0
+    if (parsedUrl.protocol !== 'https:' || !isValidTikTokDomain(parsedUrl.hostname) || parsedUrl.port !== '' || parsedUrl.username !== '' || parsedUrl.password !== '') {
+      const e = new Error('Bloqueo de seguridad: Solo se permiten conexiones HTTPS directas a dominios oficiales de TikTok.');
+      e.statusCode = 400;
+      throw e;
+    }
+    const { signal, cleanup } = createCombinedSignal(parentSignal, 4500);
+    try {
+      const response = await fetch(currentUrl, {
+        signal: signal,
+        redirect: 'manual',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+        }
+      });
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get('location');
+        if (!location) {
+          const e = new Error('Redirección remota sin encabezado Location válido.');
+          e.statusCode = 502;
+          throw e;
+        }
+        currentUrl = new URL(location, currentUrl).href;
+        redirects++;
+        continue;
+      }
+      if (!response.ok) {
+        const e = new Error(`El servidor de TikTok respondió con estado HTTP ${response.status}`);
+        e.statusCode = 502;
+        throw e;
+      }
+      const html = await readTextWithLimit(response, 4 * 1024 * 1024);
+      let vData = null;
+      const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
+      if (univMatch) {
+        try {
+          const univ = JSON.parse(univMatch[1]);
+          vData = univ.__DEFAULT_SCOPE__['webapp.video-detail']?.itemInfo?.itemStruct;
+        } catch (pErr) {}
+      } else {
+        const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
+        if (sigiMatch) {
+          try {
+            const sigi = JSON.parse(sigiMatch[1]);
+            const itemId = Object.keys(sigi.ItemModule)[0];
+            vData = sigi.ItemModule[itemId];
+          } catch (pErr) {}
         }
       }
-    };
-  } catch (e) {
-    return { creator: "Jxmpier207", status: false, message: e.message };
+      if (!vData) {
+        const e = new Error("No se encontraron metadatos de video válidos en el contenido de TikTok.");
+        e.statusCode = 404;
+        throw e;
+      }
+      return {
+        creator: "Jxmpier207",
+        status: true,
+        data: {
+          id: vData.id || "",
+          url: initialUrl,
+          type: "video",
+          title: vData.desc || "",
+          cover: vData.video?.cover || "",
+          duration: vData.video?.duration || 0,
+          links: {
+            hd: vData.video?.playAddr || "",
+            sd: vData.video?.playAddr || "",
+            wm: vData.video?.downloadAddr || "",
+            mp3: vData.music?.playUrl || ""
+          },
+          author: {
+            username: vData.author?.uniqueId || "",
+            nickname: vData.author?.nickname || "",
+            avatar: vData.author?.avatarLarger || ""
+          }
+        }
+      };
+    } catch (e) {
+      if (e.name === 'AbortError' || e.statusCode === 504) {
+        const err = new Error('Tiempo de espera agotado al conectar con TikTok.');
+        err.statusCode = 504;
+        throw err;
+      }
+      if (!e.statusCode) e.statusCode = 502;
+      throw e;
+    } finally {
+      cleanup();
+    }
   }
+  const maxRedirErr = new Error('Se superó el límite máximo de redirecciones permitidas.');
+  maxRedirErr.statusCode = 400;
+  throw maxRedirErr;
 }
-
 module.exports = async function handler(req, res) {
   const requestId = randomUUID();
   const globalController = new AbortController();
@@ -341,8 +423,7 @@ module.exports = async function handler(req, res) {
 <style>
 @keyframes rgbGlow{0%{border-color:#00f0ff;box-shadow:0 0 30px rgba(0,240,255,.5),inset 0 0 20px rgba(0,240,255,.2)}33%{border-color:#b026ff;box-shadow:0 0 30px rgba(176,38,255,.5),inset 0 0 20px rgba(176,38,255,.2)}66%{border-color:#00ff66;box-shadow:0 0 30px rgba(0,255,102,.5),inset 0 0 20px rgba(0,255,102,.2)}100%{border-color:#00f0ff;box-shadow:0 0 30px rgba(0,240,255,.5),inset 0 0 20px rgba(0,240,255,.2)}}
 @keyframes rgbText{0%{color:#00f0ff;text-shadow:0 0 12px rgba(0,240,255,.8)}33%{color:#b026ff;text-shadow:0 0 12px rgba(176,38,255,.8)}66%{color:#00ff66;text-shadow:0 0 12px rgba(0,255,102,.8)}100%{color:#00f0ff;text-shadow:0 0 12px rgba(0,240,255,.8)}}
-body{margin:0;padding:0;width:100vw;height:100vh;display:flex;justify-content:center;align-items:center;font-family:'Rajdhani',sans-serif;overflow:hidden;
-background:linear-gradient(rgba(5,3,10,0.75),rgba(5,3,10,0.85)), url('https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?q=80&w=1920&auto=format&fit=crop') no-repeat center center fixed;background-size:cover;}
+body{margin:0;padding:0;width:100vw;height:100vh;display:flex;justify-content:center;align-items:center;font-family:'Rajdhani',sans-serif;overflow:hidden;background:linear-gradient(rgba(5,3,10,0.75),rgba(5,3,10,0.85)), url('https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?q=80&w=1920&auto=format&fit=crop') no-repeat center center fixed;background-size:cover;}
 .welcome-card{background:rgba(10,8,18,0.85);backdrop-filter:blur(16px);border:2px solid #00f0ff;border-radius:28px;padding:45px 35px;max-width:480px;width:90%;text-align:center;box-shadow:0 25px 60px rgba(0,0,0,.9);animation:rgbGlow 6s infinite alternate}
 h1{font-family:'Orbitron',sans-serif;font-size:30px;font-weight:900;animation:rgbText 5s infinite;margin-bottom:15px;letter-spacing:2px}
 p{color:#b8b2d1;font-size:15px;margin-bottom:30px;line-height:1.6;font-weight:600}
@@ -353,13 +434,12 @@ p{color:#b8b2d1;font-size:15px;margin-bottom:30px;line-height:1.6;font-weight:60
 <body>
 <div class="welcome-card">
   <h1>⚡ ZETA-CORE.API ⚡</h1>
-  <p>🔮 Núcleo backend de alto rendimiento activado con tecnología de punta y seguridad cuántica. ¡Bienvenido al sistema principal, usuario! ✨</p>
+  <p>🔮 Núcleo backend de alto rendimiento activado con seguridad reforzada. ¡Bienvenido al sistema principal! ✨</p>
   <a href="/docs" class="btn-doc">🚀 DOCUMENTACIÓN 🔮</a>
 </div>
 </body>
 </html>`);
     }
-
     if (pathname === '/docs') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(`<!DOCTYPE html>
@@ -426,7 +506,7 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <span class="sub-item" onclick="switchTab('downloaders',this)">📥 Panel Descargas</span>
 <span class="sub-item" onclick="switchTab('search',this)">🔍 Playground Búsquedas</span>
 </div>
-<div class="sidebar-footer"><span>CYBERPUNK v3.7</span><span style="color:#00ff66">● ONLINE</span></div>
+<div class="sidebar-footer"><span>CYBERPUNK v3.8</span><span style="color:#00ff66">● ONLINE</span></div>
 </div>
 <div class="main-content"><div class="card-wrapper">
 <div id="guide" class="card active">
@@ -442,10 +522,8 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 </div></div>
 <div style="text-align:center"><button class="btn btn-rgb" onclick="switchTab('downloaders', document.querySelectorAll('.sub-item')[1])">📄 EXPLORAR DOCUMENTACIÓN</button></div>
 </div>
-
 <div id="downloaders" class="card">
 <h2>📥 Panel de Descargadores 🎬</h2>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span id="routeTextYoutube">Ruta: /youtube?query=&type=video&quality=1080p</span><button class="btn-copy-route" onclick="copiarRuta(document.getElementById('routeTextYoutube').innerText.replace('Ruta: ', ''))">Copiar Ruta</button></div>
 <h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube Media Engine (/youtube)</h3>
@@ -453,16 +531,13 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <input type="text" id="inputYoutube" placeholder="Ej: phonk music o https://youtu.be/...">
 <label>Tipo de multimedia:</label>
 <select id="selectYtType" onchange="actualizarInterfazYoutube()"><option value="video" selected>Video</option><option value="audio">Audio (MP3)</option></select>
-
 <div id="groupQualityYoutube">
 <label>Calidad de Video:</label>
 <select id="selectYtQuality"><option value="1080p" selected>1080p (FHD)</option><option value="720p">720p (HD)</option><option value="480p">480p</option><option value="360p">360p</option></select>
 </div>
-
 <button class="btn btn-rgb" onclick="ejecutarYoutubeCustom()">🚀 PROCESAR YOUTUBE</button>
 <div id="jsonContainerYoutube" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYoutube')">Copiar</button><pre id="jsonOutputYoutube">Esperando...</pre></div>
 </div>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(255,50,100,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span>Ruta: /tiktok?url=</span><button class="btn-copy-route" onclick="copiarRuta('/tiktok?url=')">Copiar Ruta</button></div>
 <h3 style="color:#ff3264;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">TikTok Video Extractor (/tiktok)</h3>
@@ -471,7 +546,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <button class="btn btn-rgb" onclick="ejecutarAccion('tiktok','inputTikTok','jsonContainerTikTok','jsonOutputTikTok')">✨ EXTRAER TIKTOK</button>
 <div id="jsonContainerTikTok" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputTikTok')">Copiar</button><pre id="jsonOutputTikTok">Esperando...</pre></div>
 </div>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,255,102,.35);padding:18px;border-radius:16px">
 <div class="route-path-box"><span>Ruta: /xvideo?url=</span><button class="btn-copy-route" onclick="copiarRuta('/xvideo?url=')">Copiar Ruta</button></div>
 <h3 style="color:#00ff66;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">X / Twitter Video Extractor (/xvideo)</h3>
@@ -481,10 +555,8 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="jsonContainerXVideo" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputXVideo')">Copiar</button><pre id="jsonOutputXVideo">Esperando...</pre></div>
 </div>
 </div>
-
 <div id="search" class="card">
 <h2>🔍 Playground de Búsquedas 🔎</h2>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span>Ruta: /ytsearch?query=&limit=</span><button class="btn-copy-route" onclick="copiarRuta('/ytsearch?query=&limit=')">Copiar Ruta</button></div>
 <h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube Search Engine (/ytsearch)</h3>
@@ -493,7 +565,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <button class="btn btn-rgb" onclick="ejecutarBusqueda('ytsearch')">🚀 BUSCAR EN YOUTUBE</button>
 <div id="jsonContainerYt" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYt')">Copiar</button><pre id="jsonOutputYt">Esperando...</pre></div>
 </div>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(176,38,255,.35);padding:18px;border-radius:16px">
 <div class="route-path-box"><span>Ruta: /ttsearch?query=&limit=</span><button class="btn-copy-route" onclick="copiarRuta('/ttsearch?query=&limit=')">Copiar Ruta</button></div>
 <h3 style="color:#b026ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">TikTok Search Engine (/ttsearch)</h3>
@@ -521,9 +592,9 @@ function actualizarInterfazYoutube(){
     routeText.innerText='Ruta: /youtube?query=&type=video&quality='+quality;
   }
 }
-async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('⚠️ ¡Por favor ingresa un enlace o texto válido!');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='⚡ Procesando solicitud en el núcleo...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error de ejecución: '+e.message}}
-async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠️ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality;var res=await fetch(apiUrl);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
-async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('⚠️ ¡Escribe un término de búsqueda!');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='🔍 Buscando en la red...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
+async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('⚠️️ ¡Por favor ingresa un enlace o texto válido!');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='⚡ Procesando solicitud en el núcleo...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error de ejecución: '+e.message}}
+async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality;var res=await fetch(apiUrl);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
+async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('⚠ ¡Escribe un término de búsqueda!');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='🔍 Buscando en la red...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('✨ ¡JSON copiado al portapapeles!')}
 </script>
 </body></html>`);
@@ -547,7 +618,6 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
         return sendJson(error.statusCode || 502, { creator: 'Jxmpier207', status: false, message: secureApi.publicErrorMessage(error), requestId });
       }
     }
-
     if (pathname === '/ytsearch' || pathname === '/ttsearch') {
       if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query.', requestId });
       try {
@@ -606,7 +676,6 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
         return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
       }
     }
-
     if (pathname === '/xvideo') {
       if (!query) return sendJson(400, { ok: false, message: 'Falta el enlace de la publicación.', requestId });
       try {

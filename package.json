@@ -1,8 +1,8 @@
 {
   "name": "zeta-core-api",
   "version": "1.0.0",
-  "description": "API para Zeta Core",
-  "main": "index.js",
+  "type": "commonjs",
+  "main": "api/index.js",
   "scripts": {
     "start": "node index.js",
     "test": "node --test"
