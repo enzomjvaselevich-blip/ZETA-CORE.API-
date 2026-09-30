@@ -672,8 +672,8 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
           requestId,
         });
       } catch (error) {
-        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
-        return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, code: error.code || null, message: error.message }));
+        return sendJson(error.statusCode || 502, { ok: false, code: error.code || 'UPSTREAM_ERROR', message: secureApi.publicErrorMessage(error), requestId });
       }
     }
     if (pathname === '/xvideo') {

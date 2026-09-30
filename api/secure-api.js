@@ -15,6 +15,7 @@ let rateLimiter;
 function apiError(statusCode, message, options = {}) {
   const error = new Error(message);
   error.statusCode = statusCode;
+  if (options.code) error.code = options.code;
   if (options.upstreamStatus) error.upstreamStatus = options.upstreamStatus;
   return error;
 }
@@ -347,7 +348,9 @@ function selectYoutubeMediaFormat(formats, type, quality) {
       };
     }
   }
-  throw apiError(502, 'YOUTUBE_FORMAT_UNAVAILABLE', 'No hay un enlace multimedia compatible disponible para este video.');
+  throw apiError(502, 'No hay un enlace multimedia directo compatible disponible para este video.', {
+    code: 'YOUTUBE_FORMAT_UNAVAILABLE',
+  });
 }
 
 async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
@@ -390,12 +393,26 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
   try {
     const { Innertube } = await import('youtubei.js');
     const youtube = await Innertube.create({ fetch: fetchWithTimeout });
-    const playerData = await youtube.getBasicInfo(videoId, { client: 'IOS' });
-    const formats = [
-      ...(playerData.streaming_data?.formats || []),
-      ...(playerData.streaming_data?.adaptive_formats || []),
-    ];
-    return selectYoutubeMediaFormat(formats, type, quality);
+    let lastFormatError;
+    for (const client of ['IOS', 'ANDROID', 'WEB', 'MWEB']) {
+      if (controller.signal.aborted || parentSignal?.aborted) {
+        throw apiError(504, 'REQUEST_TIMEOUT', 'YouTube tardó demasiado en responder.');
+      }
+      try {
+        const playerData = await youtube.getBasicInfo(videoId, { client });
+        const formats = [
+          ...(playerData.streaming_data?.formats || []),
+          ...(playerData.streaming_data?.adaptive_formats || []),
+        ];
+        return selectYoutubeMediaFormat(formats, type, quality);
+      } catch (error) {
+        if (error.code !== 'YOUTUBE_FORMAT_UNAVAILABLE') throw error;
+        lastFormatError = error;
+      }
+    }
+    throw lastFormatError || apiError(502, 'No hay un enlace multimedia directo compatible disponible para este video.', {
+      code: 'YOUTUBE_FORMAT_UNAVAILABLE',
+    });
   } catch (error) {
     if (error.statusCode) throw error;
     if (parentSignal?.aborted || controller.signal.aborted) {
@@ -604,6 +621,12 @@ async function fetchXVideo(inputUrl, parentSignal) {
 }
 
 function publicErrorMessage(error) {
+  if (error.code === 'YOUTUBE_FORMAT_UNAVAILABLE') {
+    return 'YouTube no ofreció un enlace directo de audio compatible para este video. Prueba con otro video.';
+  }
+  if (error.code === 'YOUTUBE_UPSTREAM_FAILED') {
+    return 'No fue posible consultar YouTube. Intenta de nuevo en unos segundos.';
+  }
   switch (error.statusCode) {
     case 400:
       return error.message;
