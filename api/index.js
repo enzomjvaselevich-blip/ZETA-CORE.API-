@@ -367,6 +367,18 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
             if (idMatch) videoId = idMatch[1];
         }
 
+        // Corrección clave: Obtener un link de descarga directa real en lugar de repetir la URL de la web de YouTube
+        let downloadUrl = targetUrl;
+        try {
+            const dlApiRes = await fetch(`https://deliriussapi-oficial.vercel.app/download/${endpoint}?url=` + encodeURIComponent(targetUrl));
+            const dlData = await dlApiRes.json();
+            if (dlData?.data?.download?.url) {
+                downloadUrl = dlData.data.download.url;
+            } else if (dlData?.download_url) {
+                downloadUrl = dlData.download_url;
+            }
+        } catch (e) {}
+
         const payload = JSON.stringify({
             ok: true,
             endpoint: endpoint,
@@ -375,8 +387,8 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
             title: title,
             videoId: videoId,
             resolved_url: targetUrl,
-            download_url: targetUrl,
-            url: targetUrl
+            download_url: downloadUrl,
+            url: downloadUrl
         }, null, 2);
         totalBytesSent += payload.length;
         return res.end(payload);
