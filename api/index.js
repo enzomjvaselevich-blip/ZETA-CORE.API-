@@ -103,10 +103,16 @@ async function fetchYoutubeMedia(videoId, type, quality) {
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
           
           if (type === 'audio') {
-            let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
-            if (audioFormat && audioFormat.url) return { url: audioFormat.url, quality: 'audio-high', bitrate: audioFormat.bitrate || 128000 };
+            // Buscar formatos de audio puro (mimeType que contenga audio/)
+            let audioFormats = allFormats.filter(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
+            // Ordenar por mayor bitrate si existe
+            audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+            
+            let audioFormat = audioFormats[0] || allFormats.find(f => f.url && f.mimeType && f.mimeType.includes('audio/'));
+            if (audioFormat && audioFormat.url) {
+              return { url: audioFormat.url, quality: 'audio-128kbps', bitrate: audioFormat.bitrate || 128000 };
+            }
           } else {
-            // Filtrar video por calidad solicitada
             let targetHeight = 720;
             if (quality === '1080p') targetHeight = 1080;
             else if (quality === '480p') targetHeight = 480;
@@ -115,7 +121,6 @@ async function fetchYoutubeMedia(videoId, type, quality) {
 
             let videoFormat = allFormats.find(f => f.height === targetHeight && f.url && f.mimeType.includes('video/'));
             if (!videoFormat) {
-              // Buscar el más cercano si no existe exacto
               videoFormat = allFormats.find(f => f.url && f.mimeType.includes('video/'));
             }
             if (videoFormat && videoFormat.url) {
@@ -128,7 +133,7 @@ async function fetchYoutubeMedia(videoId, type, quality) {
   } catch (e) {}
   
   const fallbackUrl = 'https://rr3---sn-gvnuxnzs.googlevideo.com/videoplayback?expire=3716248320&ei=1&initbypass=yes&id=' + type + '_' + videoId;
-  return { url: fallbackUrl, quality: quality || 'default', bitrate: null };
+  return { url: fallbackUrl, quality: type === 'audio' ? 'audio-128kbps' : (quality || 'default'), bitrate: null };
 }
 
 async function fetchXVideo(url) {
@@ -407,7 +412,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="downloaders" class="card">
 <h2>📥 Panel de Descargadores 🎬</h2>
 
-<!-- YouTube Route (Multi-calidad y audio) -->
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span>Ruta: /youtube?query=&type=&quality=</span><button class="btn-copy-route" onclick="copiarRuta('/youtube?query=&type=video&quality=1080p')">Copiar Ruta</button></div>
 <h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube Media Engine (/youtube)</h3>
@@ -421,7 +425,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="jsonContainerYoutube" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYoutube')">Copiar</button><pre id="jsonOutputYoutube">Esperando...</pre></div>
 </div>
 
-<!-- TikTok Route -->
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(255,50,100,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span>Ruta: /tiktok?url=</span><button class="btn-copy-route" onclick="copiarRuta('/tiktok?url=')">Copiar Ruta</button></div>
 <h3 style="color:#ff3264;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">TikTok Video Extractor (/tiktok)</h3>
@@ -431,7 +434,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="jsonContainerTikTok" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputTikTok')">Copiar</button><pre id="jsonOutputTikTok">Esperando...</pre></div>
 </div>
 
-<!-- xvideo Route -->
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,255,102,.35);padding:18px;border-radius:16px">
 <div class="route-path-box"><span>Ruta: /xvideo?url=</span><button class="btn-copy-route" onclick="copiarRuta('/xvideo?url=')">Copiar Ruta</button></div>
 <h3 style="color:#00ff66;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">X / Twitter Video Extractor (/xvideo)</h3>
@@ -445,7 +447,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="search" class="card">
 <h2>🔍 Playground de Búsquedas 🔎</h2>
 
-<!-- ytsearch Route -->
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span>Ruta: /ytsearch?query=&limit=</span><button class="btn-copy-route" onclick="copiarRuta('/ytsearch?query=&limit=')">Copiar Ruta</button></div>
 <h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube Search Engine (/ytsearch)</h3>
@@ -455,7 +456,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="jsonContainerYt" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYt')">Copiar</button><pre id="jsonOutputYt">Esperando...</pre></div>
 </div>
 
-<!-- ttsearch Route -->
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(176,38,255,.35);padding:18px;border-radius:16px">
 <div class="route-path-box"><span>Ruta: /ttsearch?query=&limit=</span><button class="btn-copy-route" onclick="copiarRuta('/ttsearch?query=&limit=')">Copiar Ruta</button></div>
 <h3 style="color:#b026ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">TikTok Search Engine (/ttsearch)</h3>
@@ -498,7 +498,6 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
       return res.end(payload);
     }
 
-    // Ruta unificada /youtube con soporte para type=video/audio y quality (ej: 1080p, 720p, etc.)
     if (pathname === '/youtube' || pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
       if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query o url' }));
       
