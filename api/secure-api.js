@@ -518,6 +518,9 @@ async function fetchTikTokVideo(initialUrl, parentSignal) {
   };
 }
 
+// Tweet-video extraction lives in `api/documentos/xvideo.js`. It reuses
+// `getVideoVariants` and `extractTweetId` below but only scrapes X/Twitter's
+// own public syndication endpoint — no third-party proxy APIs (e.g. fxtwitter).
 function getVideoVariants(tweet) {
   const variants = [
     ...(tweet.media?.videos || []).flatMap((video) => [
@@ -567,73 +570,6 @@ function extractTweetId(inputUrl) {
   return id;
 }
 
-async function fetchXVideo(inputUrl, parentSignal) {
-  const tweetId = extractTweetId(inputUrl);
-  const sources = [
-    {
-      url: `https://api.fxtwitter.com/status/${tweetId}`,
-      hosts: ['api.fxtwitter.com'],
-      maxBytes: 2 * 1024 * 1024,
-    },
-    {
-      url: `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=en`,
-      hosts: ['cdn.syndication.twimg.com'],
-      maxBytes: 2 * 1024 * 1024,
-    },
-  ];
-  let validResponses = 0;
-  let lastFailure = null;
-  let text = null;
-  let thumbnail = null;
-  const videosByUrl = new Map();
-
-  for (const source of sources) {
-    if (parentSignal?.aborted) throw apiError(504, 'Se agotó el tiempo total de la solicitud.');
-    try {
-      const { response, text: body } = await fetchTextSafe(source.url, {
-        allowedHosts: source.hosts,
-        parentSignal,
-        timeoutMs: 2800,
-        maxBytes: source.maxBytes,
-        acceptedStatuses: [404],
-      });
-      if (response.status === 404) {
-        validResponses += 1;
-        continue;
-      }
-      const data = parseJson(body, 'X/Twitter devolvió datos inválidos.');
-      const tweet = data.tweet || data;
-      if (!tweet || typeof tweet !== 'object') throw apiError(502, 'X/Twitter devolvió datos inesperados.');
-      validResponses += 1;
-      text = text || tweet.text || null;
-      thumbnail = thumbnail || tweet.media?.photos?.[0]?.url || tweet.media?.videos?.[0]?.thumbnail_url || null;
-      for (const video of getVideoVariants(tweet)) videosByUrl.set(video.url, video);
-    } catch (error) {
-      lastFailure = error;
-      if (error.statusCode === 504) break;
-    }
-  }
-
-  const videos = [...videosByUrl.values()];
-  if (videos.length) {
-    return {
-      ok: true,
-      endpoint: 'xvideo',
-      input: inputUrl,
-      tweet_id: tweetId,
-      videos,
-      total_videos: videos.length,
-      best: videos[0].url,
-      thumbnail,
-      text,
-    };
-  }
-  if (lastFailure?.statusCode === 504) throw lastFailure;
-  if (validResponses === 0 && lastFailure) throw apiError(502, 'No fue posible consultar los proveedores de X/Twitter.');
-  if (validResponses === 0) throw apiError(502, 'Los proveedores de X/Twitter no devolvieron una respuesta válida.');
-  throw apiError(404, 'No se encontraron videos disponibles en la publicación indicada.');
-}
-
 function publicErrorMessage(error) {
   if (error.code === 'YOUTUBE_FORMAT_UNAVAILABLE') {
     return 'YouTube no ofreció un enlace directo de audio compatible para este video. Prueba con otro video.';
@@ -660,12 +596,13 @@ function publicErrorMessage(error) {
 module.exports = {
   apiError,
   fetchTextSafe,
+  parseJson,
   extractTweetId,
+  getVideoVariants,
   enforceRateLimit,
   extractYoutubeVideoId,
   fetchRealSearchResults,
   fetchTikTokVideo,
-  fetchXVideo,
   fetchYoutubeMedia,
   selectYoutubeMediaFormat,
   publicErrorMessage,
