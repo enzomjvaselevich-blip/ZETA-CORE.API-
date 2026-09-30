@@ -5,7 +5,7 @@ let totalRequests = 0;
 let totalBytesReceived = 0;
 let totalBytesSent = 0;
 
-// Rate Limiter en memoria por IP (Límite: 60 peticiones por minuto)
+// Rate Limiter en memoria (60 peticiones/minuto por dirección IP)
 const rateLimitMap = new Map();
 function applyRateLimit(ip, limit = 60, windowMs = 60000) {
   const now = Date.now();
@@ -20,7 +20,7 @@ function applyRateLimit(ip, limit = 60, windowMs = 60000) {
   return record.count <= limit;
 }
 
-// Helper para consumir streams o texto con un límite máximo de bytes
+// Función helper para restringir y consumir el cuerpo de respuestas remotas por tamaño de bytes
 async function readTextWithLimit(response, maxBytes = 5 * 1024 * 1024) {
   const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
   if (contentLength > maxBytes) {
@@ -53,7 +53,7 @@ async function readTextWithLimit(response, maxBytes = 5 * 1024 * 1024) {
   return text;
 }
 
-// Validadores de dominios autorizados
+// Validadores estrictos de dominio por objeto URL
 function isValidTikTokDomain(hostname) {
   if (!hostname) return false;
   const h = hostname.toLowerCase();
@@ -66,7 +66,7 @@ function isValidYoutubeDomain(hostname) {
   return h === 'youtube.com' || h.endsWith('.youtube.com') || h === 'youtu.be' || h.endsWith('.youtu.be');
 }
 
-// Búsqueda en tiempo real
+// Scraper de búsquedas en tiempo real
 async function fetchRealSearchResults(query, limit, platform) {
   let results = [];
   const searchUrl = platform === 'youtube' 
@@ -86,7 +86,7 @@ async function fetchRealSearchResults(query, limit, platform) {
     });
 
     if (!response.ok) {
-      throw new Error(`El servidor de ${platform} devolvió un estado HTTP ${response.status}`);
+      throw new Error(`Servidor de ${platform} respondió con código HTTP ${response.status}`);
     }
     
     const html = await readTextWithLimit(response, 5 * 1024 * 1024);
@@ -152,6 +152,7 @@ async function fetchRealSearchResults(query, limit, platform) {
   return results;
 }
 
+// Extractor multimedia de YouTube
 async function fetchYoutubeMedia(videoId, type, quality) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 7000);
@@ -166,7 +167,7 @@ async function fetchYoutubeMedia(videoId, type, quality) {
     });
 
     if (!response.ok) {
-      throw new Error(`YouTube respondió con estado HTTP ${response.status}`);
+      throw new Error(`YouTube devolvió un código de estado HTTP ${response.status}`);
     }
 
     const html = await readTextWithLimit(response, 5 * 1024 * 1024);
@@ -212,9 +213,10 @@ async function fetchYoutubeMedia(videoId, type, quality) {
     clearTimeout(timeout);
   }
   
-  throw new Error("No se pudo extraer el enlace de descarga multimedia de YouTube de forma segura.");
+  throw new Error("No se pudo extraer el enlace de descarga multimedia de YouTube.");
 }
 
+// Extractor de publicaciones de X / Twitter
 async function fetchXVideo(url) {
   const result = { ok: false, endpoint: 'xvideo', input: url, tweet_id: null, videos: [], thumbnail: null, text: null };
   try {
@@ -277,7 +279,7 @@ async function fetchXVideo(url) {
           }
         }
       } catch (e) {
-        console.error('Error con API alternativa de X:', e.message);
+        console.error('Error con API de respaldo de X:', e.message);
       } finally {
         clearTimeout(timeout);
       }
@@ -309,6 +311,7 @@ async function fetchXVideo(url) {
   return result;
 }
 
+// Extractor de videos de TikTok
 async function fetchTikTokVideo(initialUrl) {
   let currentUrl = initialUrl;
   let redirects = 0;
@@ -323,7 +326,7 @@ async function fetchTikTokVideo(initialUrl) {
     }
 
     if (parsedUrl.protocol !== 'https:' || !isValidTikTokDomain(parsedUrl.hostname)) {
-      throw new Error('Seguridad bloqueada: Solo se permiten conexiones HTTPS a dominios oficiales de TikTok o Douyin.');
+      throw new Error('Bloqueo de seguridad: Solo se permiten conexiones HTTPS hacia dominios de TikTok.');
     }
 
     const controller = new AbortController();
@@ -349,7 +352,7 @@ async function fetchTikTokVideo(initialUrl) {
       }
 
       if (!response.ok) {
-        throw new Error(`Servidor respondió con código de estado HTTP ${response.status}`);
+        throw new Error(`Servidor de TikTok respondió con estado HTTP ${response.status}`);
       }
 
       const html = await readTextWithLimit(response, 5 * 1024 * 1024);
@@ -369,7 +372,7 @@ async function fetchTikTokVideo(initialUrl) {
         }
       }
 
-      if (!vData) throw new Error("No se pudo extraer la información interna del video de TikTok.");
+      if (!vData) throw new Error("No se pudo extraer la información del video de TikTok.");
 
       return {
         creator: "Jxmpier207",
@@ -417,19 +420,20 @@ async function fetchTikTokVideo(initialUrl) {
   throw new Error('Se superó el límite máximo de redirecciones.');
 }
 
+// Handler principal del servidor
 module.exports = async function handler(req, res) {
   try {
-    // Control de IP y Rate Limiting
+    // 1. Control de IP y Rate Limiting
     const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '127.0.0.1';
     if (!applyRateLimit(clientIp)) {
       res.statusCode = 429;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      const errPayload = JSON.stringify({ ok: false, message: 'Límite de peticiones excedido. Intenta nuevamente en un minuto.' });
+      const errPayload = JSON.stringify({ ok: false, message: 'Límite de peticiones excedido. Intenta de nuevo en un minuto.' });
       totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
       return res.end(errPayload);
     }
 
-    // Restricción estricta de Métodos HTTP
+    // 2. Restricción estricta de métodos HTTP
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       res.statusCode = 405;
       res.setHeader('Allow', 'GET, HEAD');
@@ -439,7 +443,7 @@ module.exports = async function handler(req, res) {
       return res.end(errPayload);
     }
 
-    // Respuesta rápida a solicitudes HEAD sin ejecutar scrapers ni peticiones remotas
+    // 3. Respuesta inmediata a solicitudes HEAD sin ejecutar scraping ni llamadas externas
     if (req.method === 'HEAD') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -456,7 +460,7 @@ module.exports = async function handler(req, res) {
 
     const rawQuery = parsedUrl.searchParams.get('query') || parsedUrl.searchParams.get('url') || '';
     
-    // Acotar longitud máxima de entrada (Query / URL)
+    // 4. Acotar longitud máxima de la consulta
     if (rawQuery.length > 500) {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -466,13 +470,13 @@ module.exports = async function handler(req, res) {
     }
     const query = rawQuery.trim();
 
-    // Validación estricta de parámetro type
+    // 5. Validación estricta del parámetro type
     let typeParam = (parsedUrl.searchParams.get('type') || 'video').toLowerCase();
     const validTypes = ['video', 'audio'];
     if (!validTypes.includes(typeParam)) typeParam = 'video';
     const type = typeParam;
 
-    // Validación estricta de parámetro quality
+    // 6. Validación estricta del parámetro quality
     let qualityParam = (parsedUrl.searchParams.get('quality') || '720p').toLowerCase();
     const validQualities = ['1080p', '720p', '480p', '360p'];
     if (!validQualities.includes(qualityParam)) qualityParam = '720p';
@@ -505,7 +509,7 @@ p{color:#b8b2d1;font-size:15px;margin-bottom:30px;line-height:1.6;font-weight:60
 <body>
 <div class="welcome-card">
   <h1>⚡ ZETA-CORE.API ⚡</h1>
-  <p>🔮 Núcleo backend de alto rendimiento activado con seguridad reforzada. ¡Bienvenido al sistema principal, usuario! ✨</p>
+  <p>🔮 Núcleo backend de alto rendimiento activado con seguridad reforzada. ¡Bienvenido al sistema principal! ✨</p>
   <a href="/docs" class="btn-doc">🚀 DOCUMENTACIÓN 🔮</a>
 </div>
 </body>
@@ -745,6 +749,7 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
       let title = query;
       let videoId = null;
 
+      // 7. Parseo estricto y validación de URL de YouTube
       if (query.includes('http://') || query.includes('https://')) {
         try {
           const parsedYtUrl = new URL(query);
@@ -832,9 +837,9 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
     }
 
     res.statusCode = 404;
-    const err = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + pathname });
-    totalBytesSent += Buffer.byteLength(err, 'utf-8');
-    res.end(err);
+    const errPayload = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + pathname });
+    totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
+    res.end(errPayload);
   } catch (error) {
     res.statusCode = 500;
     const errPayload = JSON.stringify({ ok: false, error: 'Error interno del servidor' });
