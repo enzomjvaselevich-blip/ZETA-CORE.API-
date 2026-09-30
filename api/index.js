@@ -81,6 +81,33 @@ async function fetchRealSearchResults(query, limit, platform) {
     return results;
 }
 
+async function fetchDirectYoutubeAudio(videoId) {
+    try {
+        const response = await fetch('https://www.youtube.com/watch?v=' + videoId, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            }
+        });
+        const html = await response.text();
+        totalBytesReceived += html.length;
+
+        const streamRegex = /"audio\/mp4"[^}]*?"url":"([^"]+)"/g;
+        let match = streamRegex.exec(html);
+        if (match && match[1]) {
+            return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+        }
+
+        const fallbackRegex = /"url":"(https:\/\/[^"]+signature[^"]+)"/g;
+        while ((match = fallbackRegex.exec(html)) !== null) {
+            let foundUrl = match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+            if (foundUrl.indexOf('googlevideo.com') !== -1 && (foundUrl.indexOf('aitags') !== -1 || foundUrl.indexOf('mime=audio') !== -1)) {
+                return foundUrl;
+            }
+        }
+    } catch (e) {}
+    return '';
+}
+
 async function fetchXVideo(url) {
     const result = {
         ok: false,
@@ -365,23 +392,7 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
             if (idMatch) videoId = idMatch[1];
         }
 
-        let downloadUrl = '';
-        try {
-            const apiRes = await fetch('https://api.siputzx.my.id/api/d/ytmp3?url=https://www.youtube.com/watch?v=' + videoId);
-            const apiData = await apiRes.json();
-            if (apiData && apiData.status && apiData.data && apiData.data.dl) {
-                downloadUrl = apiData.data.dl;
-                if (apiData.data.title) title = apiData.data.title;
-            }
-        } catch (e) {}
-
-        if (!downloadUrl) {
-            try {
-                const altRes = await fetch('https://api.vkrproject.com/v2/ytmp3?url=https://www.youtube.com/watch?v=' + videoId);
-                const altData = await altRes.json();
-                downloadUrl = altData?.data?.download?.url || altData?.download?.url || '';
-            } catch (e) {}
-        }
+        let downloadUrl = await fetchDirectYoutubeAudio(videoId);
 
         if (!downloadUrl) {
             downloadUrl = 'https://www.youtube.com/watch?v=' + videoId;
