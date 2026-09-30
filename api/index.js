@@ -90,6 +90,30 @@ async function fetchDirectYoutubeAudio(videoId) {
     });
     const html = await response.text();
     totalBytesReceived += html.length;
+
+    // Extraer datos iniciales de reproducción de YouTube (ytInitialPlayerResponse)
+    const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/) || html.match(/var ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/);
+    if (playerMatch && playerMatch[1]) {
+      try {
+        const playerData = JSON.parse(playerMatch[1]);
+        const streamingData = playerData.streamingData;
+        if (streamingData) {
+          // Combinar adaptiveFormats y formats para buscar pistas de audio
+          const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
+          
+          // Filtrar específicamente formatos de solo audio que tengan URL directa
+          let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/mp4') && f.url);
+          if (!audioFormat) {
+            audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio') && f.url);
+          }
+          if (audioFormat && audioFormat.url) {
+            return audioFormat.url;
+          }
+        }
+      } catch (err) {}
+    }
+
+    // Método de respaldo por regex en caso de cambios en la estructura del reproductor
     const streamRegex = /"audio\/mp4"[^}]*?"url":"([^"]+)"/g;
     let match = streamRegex.exec(html);
     if (match && match[1]) return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
