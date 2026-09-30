@@ -83,7 +83,6 @@ async function fetchRealSearchResults(query, limit, platform) {
   return results;
 }
 
-// Función optimizada para extraer el stream directo o proveer un enlace funcional
 async function fetchDirectYoutubeAudio(videoId) {
   try {
     const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
@@ -118,7 +117,6 @@ async function fetchDirectYoutubeAudio(videoId) {
     }
   } catch (e) {}
   
-  // Enlace de respaldo directo asegurando que nunca devuelva cadena vacía
   return 'https://rr3---sn-gvnuxnzs.googlevideo.com/videoplayback?expire=3716248320&ei=1&initbypass=yes&id=audio_' + videoId;
 }
 
@@ -264,14 +262,14 @@ async function fetchTikTokVideo(url) {
 module.exports = async function handler(req, res) {
   try {
     totalRequests++;
-    const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+    const host = req.headers['x-forwarded-host'] || req.headers.host || 'zeta-core-api.vercel.app';
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const parsedUrl = new URL(req.url, `${protocol}://${host}`);
     
     let pathname = parsedUrl.pathname.replace(/^\/api/, '');
     if (!pathname) pathname = '/';
 
-    const query = parsedUrl.searchParams.get('query');
+    const query = parsedUrl.searchParams.get('query') || parsedUrl.searchParams.get('url');
     const limitParam = parseInt(parsedUrl.searchParams.get('limit')) || 5;
     const limit = Math.min(Math.max(limitParam, 1), 20);
 
@@ -375,14 +373,14 @@ pre{color:#00ff66;font-size:11px;overflow-x:auto;max-height:200px;margin:0;white
 <h3 style="color:#00f0ff;margin-top:0;font-size:15px">YouTube MP3 (ytmp3)</h3>
 <label>Enlace o título:</label>
 <input type="text" id="inputYtMp3" placeholder="Ej: hola remix">
-<button class="btn btn-rgb" onclick="ejecutarAccion('ytmp3','inputYtMp3','jsonContainerYtMp3','jsonOutputYtMp3')">Generar MP3</button>
+<button class="btn btn-rgb" onclick="ejecutarAccion('docs/download/ytmp3','inputYtMp3','jsonContainerYtMp3','jsonOutputYtMp3')">Generar MP3</button>
 <div id="jsonContainerYtMp3" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYtMp3')">Copiar</button><pre id="jsonOutputYtMp3">Esperando...</pre></div>
 </div>
 <div style="background:rgba(16,12,25,.6);border:1px solid rgba(176,38,255,.3);padding:16px;border-radius:14px;margin-bottom:15px">
 <h3 style="color:#b026ff;margin-top:0;font-size:15px">YouTube MP4 (ytmp4)</h3>
 <label>Enlace o título:</label>
 <input type="text" id="inputYtMp4" placeholder="Ej: Link de YouTube...">
-<button class="btn btn-rgb" onclick="ejecutarAccion('ytmp4','inputYtMp4','jsonContainerYtMp4','jsonOutputYtMp4')">Generar MP4</button>
+<button class="btn btn-rgb" onclick="ejecutarAccion('docs/download/ytmp4','inputYtMp4','jsonContainerYtMp4','jsonOutputYtMp4')">Generar MP4</button>
 <div id="jsonContainerYtMp4" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYtMp4')">Copiar</button><pre id="jsonOutputYtMp4">Esperando...</pre></div>
 </div>
 <div style="background:rgba(16,12,25,.6);border:1px solid rgba(0,255,102,.3);padding:16px;border-radius:14px">
@@ -414,7 +412,7 @@ pre{color:#00ff66;font-size:11px;overflow-x:auto;max-height:200px;margin:0;white
 <script>
 function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
 function switchTab(tabId,el){document.querySelectorAll('.sub-item').forEach(function(e){e.classList.remove('active')});if(el)el.classList.add('active');document.querySelectorAll('.card').forEach(function(c){c.classList.remove('active')});document.getElementById(tabId).classList.add('active');if(window.innerWidth<=900)toggleSidebar()}
-async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('Ingresa un enlace o texto.');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='Procesando...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='Error: '+e.message}}
+async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('Ingresa un enlace o texto.');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='Procesando...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='Error: '+e.message}}
 async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('Escribe un término.');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='Buscando...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='Error: '+e.message}}
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('¡Copiado!')}
 </script>
@@ -441,9 +439,10 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
       return res.end(payload);
     }
 
-    if (pathname === '/ytmp3' || pathname === '/ytmp4') {
-      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
-      const endpoint = pathname.replace('/', '');
+    // Rutas originales y soporte para las nuevas rutas solicitadas (/docs/download/ytmp3 y /docs/download/ytmp4)
+    if (pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
+      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query o url' }));
+      const endpoint = pathname.includes('ytmp3') ? 'ytmp3' : 'ytmp4';
       let title = query;
       let videoId = 'nlXqp3FVrq8';
       if (!query.includes('http')) {
