@@ -1,4 +1,4 @@
-import { URL } from 'url';
+const { URL } = require('url');
 
 const startTime = Date.now();
 let totalRequests = 0;
@@ -243,24 +243,30 @@ async function fetchTikTokVideo(url) {
   }
 }
 
-export default async function handler(req, res) {
-  totalRequests++;
-  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
-  const protocol = req.headers['x-forwarded-proto'] || 'https';
-  const parsedUrl = new URL(req.url, `${protocol}://${host}`);
-  const query = parsedUrl.searchParams.get('query');
-  const limitParam = parseInt(parsedUrl.searchParams.get('limit')) || 5;
-  const limit = Math.min(Math.max(limitParam, 1), 20);
+module.exports = async function handler(req, res) {
+  try {
+    totalRequests++;
+    const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const parsedUrl = new URL(req.url, `${protocol}://${host}`);
+    
+    // Normalizar la ruta eliminando prefijo /api si existe
+    let pathname = parsedUrl.pathname.replace(/^\/api/, '');
+    if (!pathname) pathname = '/';
 
-  if (parsedUrl.pathname === '/') {
-    res.writeHead(302, { 'Location': '/docs' });
-    return res.end();
-  }
+    const query = parsedUrl.searchParams.get('query');
+    const limitParam = parseInt(parsedUrl.searchParams.get('limit')) || 5;
+    const limit = Math.min(Math.max(limitParam, 1), 20);
 
-  if (parsedUrl.pathname === '/docs') {
-    const uptimeMinutes = Math.floor((Date.now() - startTime) / 60000);
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    return res.end(`<!DOCTYPE html>
+    if (pathname === '/' || pathname === '') {
+      res.writeHead(302, { 'Location': '/docs' });
+      return res.end();
+    }
+
+    if (pathname === '/docs') {
+      const uptimeMinutes = Math.floor((Date.now() - startTime) / 60000);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(`<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
@@ -396,62 +402,64 @@ async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('¡Copiado!')}
 </script>
 </body></html>`);
-  }
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-
-  if (parsedUrl.pathname === '/tiktok') {
-    if (!query) return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta query' }));
-    const data = await fetchTikTokVideo(query);
-    const payload = JSON.stringify(data, null, 2);
-    totalBytesSent += payload.length;
-    return res.end(payload);
-  }
-
-  if (parsedUrl.pathname === '/ytsearch' || parsedUrl.pathname === '/ttsearch') {
-    if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
-    const platform = parsedUrl.pathname === '/ytsearch' ? 'youtube' : 'tiktok';
-    const results = await fetchRealSearchResults(query, limit, platform);
-    const payload = JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2);
-    totalBytesSent += payload.length;
-    return res.end(payload);
-  }
-
-  if (parsedUrl.pathname === '/ytmp3' || parsedUrl.pathname === '/ytmp4') {
-    if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
-    const endpoint = parsedUrl.pathname.replace('/', '');
-    let targetUrl = query;
-    let title = query;
-    let videoId = '3JZ_D3ELwOQ';
-    if (!query.includes('http')) {
-      const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
-      if (ytResults[0]) {
-        targetUrl = ytResults[0].url;
-        title = ytResults[0].title || query;
-        videoId = ytResults[0].videoId || '3JZ_D3ELwOQ';
-      }
-    } else {
-      const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-      if (idMatch) videoId = idMatch[1];
     }
-    let downloadUrl = await fetchDirectYoutubeAudio(videoId);
-    if (!downloadUrl) downloadUrl = 'https://www.youtube.com/watch?v=' + videoId;
-    const payload = JSON.stringify({ ok: true, endpoint: endpoint, action: endpoint === 'ytmp3' ? 'MP3' : 'MP4', input: query, title: title, videoId: videoId, resolved_url: 'https://www.youtube.com/watch?v=' + videoId, download_url: downloadUrl, url: downloadUrl, result: { title: title, url: 'https://www.youtube.com/watch?v=' + videoId, download: downloadUrl, thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' } }, null, 2);
-    totalBytesSent += payload.length;
-    return res.end(payload);
-  }
 
-  if (parsedUrl.pathname === '/xvideo') {
-    if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta link del tweet' }));
-    const data = await fetchXVideo(query);
-    const payload = JSON.stringify(data, null, 2);
-    totalBytesSent += payload.length;
-    return res.end(payload);
-  }
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
-  res.statusCode = 404;
-  const err = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + parsedUrl.pathname });
-  totalBytesSent += err.length;
-  res.end(err);
-}
+    if (pathname === '/tiktok') {
+      if (!query) return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta query' }));
+      const data = await fetchTikTokVideo(query);
+      const payload = JSON.stringify(data, null, 2);
+      totalBytesSent += payload.length;
+      return res.end(payload);
+    }
+
+    if (pathname === '/ytsearch' || pathname === '/ttsearch') {
+      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
+      const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
+      const results = await fetchRealSearchResults(query, limit, platform);
+      const payload = JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2);
+      totalBytesSent += payload.length;
+      return res.end(payload);
+    }
+
+    if (pathname === '/ytmp3' || pathname === '/ytmp4') {
+      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
+      const endpoint = pathname.replace('/', '');
+      let title = query;
+      let videoId = '3JZ_D3ELwOQ';
+      if (!query.includes('http')) {
+        const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
+        if (ytResults[0]) {
+          title = ytResults[0].title || query;
+          videoId = ytResults[0].videoId || '3JZ_D3ELwOQ';
+        }
+      } else {
+        const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+        if (idMatch) videoId = idMatch[1];
+      }
+      let downloadUrl = await fetchDirectYoutubeAudio(videoId);
+      if (!downloadUrl) downloadUrl = 'https://www.youtube.com/watch?v=' + videoId;
+      const payload = JSON.stringify({ ok: true, endpoint: endpoint, action: endpoint === 'ytmp3' ? 'MP3' : 'MP4', input: query, title: title, videoId: videoId, resolved_url: 'https://www.youtube.com/watch?v=' + videoId, download_url: downloadUrl, url: downloadUrl, result: { title: title, url: 'https://www.youtube.com/watch?v=' + videoId, download: downloadUrl, thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' } }, null, 2);
+      totalBytesSent += payload.length;
+      return res.end(payload);
+    }
+
+    if (pathname === '/xvideo') {
+      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta link del tweet' }));
+      const data = await fetchXVideo(query);
+      const payload = JSON.stringify(data, null, 2);
+      totalBytesSent += payload.length;
+      return res.end(payload);
+    }
+
+    res.statusCode = 404;
+    const err = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + pathname });
+    totalBytesSent += err.length;
+    res.end(err);
+  } catch (error) {
+    res.statusCode = 500;
+    res.end(JSON.stringify({ ok: false, error: error.message }));
+  }
+};
