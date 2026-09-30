@@ -1,9 +1,8 @@
 const { URL } = require('url');
+const { randomUUID } = require('node:crypto');
+const secureApi = require('./secure-api');
 
 const startTime = Date.now();
-let totalRequests = 0;
-let totalBytesReceived = 0;
-let totalBytesSent = 0;
 
 async function fetchRealSearchResults(query, limit, platform) {
   let results = [];
@@ -274,20 +273,70 @@ async function fetchTikTokVideo(url) {
 }
 
 module.exports = async function handler(req, res) {
+  const requestId = randomUUID();
+  const globalController = new AbortController();
+  const globalTimeout = setTimeout(() => {
+    globalController.abort(secureApi.apiError(504, 'Se agotó el tiempo total de la solicitud.'));
+  }, 8500);
+  const sendJson = (statusCode, payload) => {
+    res.statusCode = statusCode;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.end(JSON.stringify(payload));
+  };
+
   try {
-    totalRequests++;
-    const host = req.headers['x-forwarded-host'] || req.headers.host || 'zeta-core-api.vercel.app';
-    const protocol = req.headers['x-forwarded-proto'] || 'https';
-    const parsedUrl = new URL(req.url, `${protocol}://${host}`);
-    
-    let pathname = parsedUrl.pathname.replace(/^\/api/, '');
+    const parsedUrl = new URL(req.url || '/', 'https://api.invalid');
+    let pathname = parsedUrl.pathname.replace(/^\/api(?=\/|$)/, '');
     if (!pathname) pathname = '/';
 
-    const query = parsedUrl.searchParams.get('query') || parsedUrl.searchParams.get('url');
-    const type = parsedUrl.searchParams.get('type') || 'video';
-    const quality = parsedUrl.searchParams.get('quality') || '720p';
-    const limitParam = parseInt(parsedUrl.searchParams.get('limit')) || 5;
-    const limit = Math.min(Math.max(limitParam, 1), 20);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Strict-Transport-Security', 'max-age=63072000');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('X-Request-Id', requestId);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.setHeader('Allow', 'GET, HEAD');
+      return sendJson(405, { ok: false, message: 'Método no permitido. Utiliza GET o HEAD.', requestId });
+    }
+    if (req.method === 'HEAD') {
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      return res.end();
+    }
+
+    const rawQuery = parsedUrl.searchParams.get('query') || parsedUrl.searchParams.get('url') || '';
+    if (rawQuery.length > 500) {
+      return sendJson(400, { ok: false, message: 'La longitud de la consulta excede el máximo permitido (500 caracteres).', requestId });
+    }
+    const query = rawQuery.trim();
+    const type = (parsedUrl.searchParams.get('type') || 'video').toLowerCase();
+    if (!['video', 'audio'].includes(type)) {
+      return sendJson(400, { ok: false, message: 'El parámetro type debe ser video o audio.', requestId });
+    }
+    const quality = (parsedUrl.searchParams.get('quality') || '720p').toLowerCase();
+    if (!['1080p', '720p', '480p', '360p'].includes(quality)) {
+      return sendJson(400, { ok: false, message: 'El parámetro quality debe ser 1080p, 720p, 480p o 360p.', requestId });
+    }
+    const rawLimit = parsedUrl.searchParams.get('limit');
+    if (rawLimit !== null && !/^\d+$/.test(rawLimit)) {
+      return sendJson(400, { ok: false, message: 'El parámetro limit debe ser un entero entre 1 y 20.', requestId });
+    }
+    const limit = rawLimit === null ? 5 : Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+      return sendJson(400, { ok: false, message: 'El parámetro limit debe estar entre 1 y 20.', requestId });
+    }
+
+    const rateLimit = await secureApi.enforceRateLimit(req);
+    res.setHeader('X-RateLimit-Remaining', String(rateLimit.remaining));
+    if (!rateLimit.success) {
+      res.setHeader('Retry-After', '60');
+      return sendJson(429, { ok: false, message: 'Límite de solicitudes excedido. Intenta de nuevo en un minuto.', requestId });
+    }
+
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    const parentSignal = globalController.signal;
 
     if (pathname === '/' || pathname === '') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
