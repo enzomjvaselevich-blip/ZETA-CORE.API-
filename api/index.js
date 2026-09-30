@@ -83,6 +83,76 @@ async function fetchRealSearchResults(query, limit, platform) {
   return results;
 }
 
+async function decipherYouTubeStreamUrl(url, html) {
+  try {
+    let parsed = new URL(url);
+    let s = parsed.searchParams.get('s');
+    let sp = parsed.searchParams.get('sp') || 'sig';
+    if (!s) return url; // Si ya viene plano sin cifrar de firma, retornarlo
+
+    // Buscar el script base.js del reproductor
+    let jsMatch = html.match(/\/s\/player\/[a-zA-Z0-9_]+\/player_ias\.vflset\/[a-z_]+\/base\.js/);
+    if (!jsMatch) {
+      jsMatch = html.match(/"([^"]+\/base\.js)"/);
+    }
+    if (!jsMatch) return url;
+
+    let jsUrl = 'https://www.youtube.com' + (jsMatch[0].startsWith('/') ? jsMatch[0] : '/' + jsMatch[0]);
+    let jsRes = await fetch(jsUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' }
+    });
+    let jsCode = await jsRes.text();
+    totalBytesReceived += jsCode.length;
+
+    // Extraer función de descifrado del código de YouTube localmente
+    let helperFuncNameMatch = jsCode.match(/\b([a-zA-Z0-9$]{2})\s*=\s*function\(a\)\{\s*a\s*=\s*a\.split\(""(\s*,\s*[a-zA-Z0-9$.]+\(a\))*/);
+    if (!helperFuncNameMatch) {
+      // Patrón alternativo común en base.js recientes
+      let altMatch = jsCode.match(/([a-zA-Z0-9$]+)=function\(a\)\{a=a\.split\(""\);([\s\S]*?)\.join\(""\)\};/);
+      if (altMatch) {
+        let body = altMatch[2];
+        let objNameMatch = body.match(/([a-zA-Z0-9$]+)\.[a-zA-Z0-9$]+\(a,\d+\)/);
+        if (objNameMatch) {
+          let objName = objNameMatch[1];
+          let objDefMatch = jsCode.match(new RegExp(`var\\s+${objName}=\\s*\\{([\\s\\S]*?)\\};`));
+          if (objDefMatch) {
+            let objBody = objDefMatch[1];
+            let methods = {};
+            let mRegex = /([a-zA-Z0-9$]+):\s*function\((.*?)\)\s*\{([^}]+)\}/g;
+            let mm;
+            while ((mm = mRegex.exec(objBody)) !== null) {
+              methods[mm[1]] = { args: mm[2], body: mm[3] };
+            }
+
+            let steps = body.split(';');
+            let arr = s.split('');
+            for (let step of steps) {
+              let sCall = step.match(/([a-zA-Z0-9$]+)\.([a-zA-Z0-9$]+)\(a,(\d+)\)/);
+              if (sCall) {
+                let obj = sCall[1], method = sCall[2], val = parseInt(sCall[3]);
+                if (obj === objName && methods[method]) {
+                  let mBody = methods[method].body;
+                  if (mBody.includes('reverse')) {
+                    arr.reverse();
+                  } else if (mBody.includes('splice') || mBody.includes('slice')) {
+                    arr = arr.slice(val);
+                  } else {
+                    let c = arr[0]; arr[0] = arr[val % arr.length]; arr[val % arr.length] = c;
+                  }
+                }
+              }
+            }
+            parsed.searchParams.set(sp, arr.join(''));
+            parsed.searchParams.delete('s');
+            return parsed.toString();
+          }
+        }
+      }
+    }
+  } catch (e) {}
+  return url;
+}
+
 async function fetchDirectYoutubeAudio(videoId) {
   try {
     const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
@@ -102,16 +172,27 @@ async function fetchDirectYoutubeAudio(videoId) {
         if (streamingData) {
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
           
-          let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/mp4') && f.url);
+          let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/mp4') && (f.url || f.signatureCipher));
           if (!audioFormat) {
-            audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/webm') && f.url);
+            audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/webm') && (f.url || f.signatureCipher));
           }
           if (!audioFormat) {
-            audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio') && f.url);
+            audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio') && (f.url || f.signatureCipher));
           }
           
-          if (audioFormat && audioFormat.url) {
-            return audioFormat.url;
+          if (audioFormat) {
+            let rawUrl = audioFormat.url;
+            if (!rawUrl && audioFormat.signatureCipher) {
+              const cipherParams = new URLSearchParams(audioFormat.signatureCipher);
+              rawUrl = cipherParams.get('url');
+              let sVal = cipherParams.get('s');
+              if (sVal) {
+                rawUrl += '&s=' + encodeURIComponent(sVal);
+              }
+            }
+            if (rawUrl) {
+              return await decipherYouTubeStreamUrl(rawUrl, html);
+            }
           }
         }
       } catch (err) {}
