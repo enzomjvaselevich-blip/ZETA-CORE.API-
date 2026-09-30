@@ -184,22 +184,24 @@ test('propaga timeout del proveedor como 504', async () => {
 });
 
 test('no confunde fallos de proveedores de X con ausencia de video', async () => {
+  const { fetchXVideo } = require('./documentos/xvideo');
   global.fetch = async () => {
     throw new TypeError('provider unavailable');
   };
   await assert.rejects(
-    secureApi.fetchXVideo('https://x.com/example/status/123456789012345'),
+    fetchXVideo('https://x.com/example/status/123456789012345'),
     { statusCode: 502 },
   );
 });
 
 test('reserva 404 de X para respuestas válidas sin video', async () => {
+  const { fetchXVideo } = require('./documentos/xvideo');
   global.fetch = async (url) => new Response(
     String(url).includes('fxtwitter') ? JSON.stringify({ tweet: { text: 'hello' } }) : JSON.stringify({ text: 'hello' }),
     { headers: { 'content-type': 'application/json' } },
   );
   await assert.rejects(
-    secureApi.fetchXVideo('https://x.com/example/status/123456789012345'),
+    fetchXVideo('https://x.com/example/status/123456789012345'),
     { statusCode: 404 },
   );
 });

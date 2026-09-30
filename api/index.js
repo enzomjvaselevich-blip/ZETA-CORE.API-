@@ -1,358 +1,17 @@
 const { URL } = require('url');
 const { randomUUID } = require('node:crypto');
 const secureApi = require('./secure-api');
+const { searchYoutube } = require('./documentos/ytsearch');
+const { searchTikTok } = require('./documentos/ttsearch');
+const { extractTikTokVideo } = require('./documentos/tiktok');
+const { getYoutubeAudio, downloadYoutubeAudio } = require('./documentos/ytmp3');
+const { getYoutubeVideo, downloadYoutubeVideo } = require('./documentos/ytmp4');
+const { fetchXVideo } = require('./documentos/xvideo');
 
+// NOTA: todo el scraping real (YouTube, TikTok, X/Twitter) vive ahora en los
+// módulos de la carpeta `api/documentos/`, uno por endpoint. Este archivo
+// solo enruta las peticiones HTTP hacia esos módulos y sirve el panel HTML.
 
-async function fetchRealSearchResults(query, limit, platform) {
-  let results = [];
-  const searchUrl = platform === 'youtube'
-    ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query)
-    : 'https://www.tiktok.com/search?q=' + encodeURIComponent(query);
-  const { signal, cleanup } = createCombinedSignal(parentSignal, 5000);
-  try {
-    const response = await fetch(searchUrl, {
-      signal: signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
-      }
-    });
-    if (!response.ok) {
-      const err = new Error(`El servicio de ${platform} respondió con un error remoto HTTP ${response.status}`);
-      err.statusCode = 502;
-      throw err;
-    }
-    const html = await readTextWithLimit(response, 4 * 1024 * 1024);
-    if (platform === 'youtube') {
-      const match = html.match(/var ytInitialData = ({[\s\S]*?});<\/script>/) || html.match(/window\["ytInitialData"\] = ({[\s\S]*?});<\/script>/);
-      if (match && match[1]) {
-        try {
-          const json = JSON.parse(match[1]);
-          const contents = json.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents;
-          if (contents) {
-            for (let i = 0; i < contents.length; i++) {
-              const itemRenderer = contents[i]?.itemSectionRenderer?.contents;
-              if (itemRenderer) {
-                for (let j = 0; j < itemRenderer.length; j++) {
-                  const video = itemRenderer[j]?.videoRenderer;
-                  if (video && video.videoId) {
-                    const vidId = video.videoId;
-                    const title = video.title?.runs?.[0]?.text || query;
-                    if (!results.some(r => r.videoId === vidId)) {
-                      results.push({ type: 'video', videoId: vidId, title: title, url: 'https://www.youtube.com/watch?v=' + vidId });
-                    }
-                    if (results.length >= limit) break;
-                  }
-                }
-              }
-              if (results.length >= limit) break;
-            }
-          }
-        } catch (parseErr) {}
-      }
-      if (results.length === 0) {
-        const regex = /"videoId":"([a-zA-Z0-9_-]{11})"/g;
-        let sm;
-        while ((sm = regex.exec(html)) !== null) {
-          const vidId = sm[1];
-          if (!results.some(r => r.videoId === vidId) && vidId !== 'dQw4w9WgXcQ') {
-            results.push({ type: 'video', videoId: vidId, title: query + ' - Resultado #' + (results.length + 1), url: 'https://www.youtube.com/watch?v=' + vidId });
-          }
-          if (results.length >= limit) break;
-        }
-      }
-    } else {
-      const regex = /"id":"(\d+)","desc":"([^"]+)"/g;
-      let match;
-      while ((match = regex.exec(html)) !== null) {
-        const tId = match[1];
-        const desc = match[2];
-        if (!results.some(r => r.videoId === tId)) {
-          results.push({ type: 'video', videoId: tId, title: desc, url: 'https://www.tiktok.com/video/' + tId });
-        }
-        if (results.length >= limit) break;
-      }
-    }
-    return results;
-  } catch (e) {
-    if (e.name === 'AbortError' || e.statusCode === 504) {
-      const err = new Error(`Tiempo de espera agotado al consultar ${platform}.`);
-      err.statusCode = 504;
-      throw err;
-    }
-    if (!e.statusCode) e.statusCode = 502;
-    throw e;
-  } finally {
-    cleanup();
-  }
-}
-async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
-  const { signal, cleanup } = createCombinedSignal(parentSignal, 5000);
-  try {
-    const response = await fetch('https://www.youtube.com/watch?v=' + videoId, {
-      signal: signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept-Language': 'es-ES,es;q=0.9'
-      }
-    });
-    if (!response.ok) {
-      const err = new Error(`YouTube respondió con un estado de error HTTP ${response.status}`);
-      err.statusCode = 502;
-      throw err;
-    }
-    const html = await readTextWithLimit(response, 4 * 1024 * 1024);
-    const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/) || html.match(/var ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/);
-    if (playerMatch && playerMatch[1]) {
-      try {
-        const playerData = JSON.parse(playerMatch[1]);
-        const streamingData = playerData.streamingData;
-        if (streamingData) {
-          const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
-          if (type === 'audio') {
-            let audioFormats = allFormats.filter(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
-            audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-            let audioFormat = audioFormats[0] || allFormats.find(f => f.url && f.mimeType && f.mimeType.includes('audio/'));
-            if (audioFormat && audioFormat.url) {
-              return { url: audioFormat.url, quality: 'audio-128kbps', bitrate: audioFormat.bitrate || 128000 };
-            }
-          } else {
-            let targetHeight = 720;
-            if (quality === '1080p') targetHeight = 1080;
-            else if (quality === '480p') targetHeight = 480;
-            else if (quality === '360p') targetHeight = 360;
-            else if (quality === '720p') targetHeight = 720;
-            let videoFormat = allFormats.find(f => f.height === targetHeight && f.url && f.mimeType.includes('video/'));
-            if (!videoFormat) {
-              videoFormat = allFormats.find(f => f.url && f.mimeType.includes('video/'));
-            }
-            if (videoFormat && videoFormat.url) {
-              return { url: videoFormat.url, quality: (videoFormat.height ? videoFormat.height + 'p' : quality), bitrate: videoFormat.bitrate || null };
-            }
-          }
-        }
-      } catch (err) {}
-    }
-    const notFoundErr = new Error("No se pudo extraer el enlace directo de descarga desde el contenido de YouTube.");
-    notFoundErr.statusCode = 404;
-    throw notFoundErr;
-  } catch (e) {
-    if (e.name === 'AbortError' || e.statusCode === 504) {
-      const err = new Error("Tiempo de espera agotado al comunicarse con YouTube.");
-      err.statusCode = 504;
-      throw err;
-    }
-    if (!e.statusCode) e.statusCode = 502;
-    throw e;
-  } finally {
-    cleanup();
-  }
-}
-async function fetchXVideo(inputUrl, parentSignal) {
-  let tweetId = null;
-  try {
-    const u = new URL(inputUrl);
-    if (u.protocol !== 'https:') {
-      const err = new Error('Solo se aceptan URLs con protocolo HTTPS.');
-      err.statusCode = 400;
-      throw err;
-    }
-    const host = u.hostname.toLowerCase();
-    const validXHosts = ['twitter.com', 'www.twitter.com', 'x.com', 'www.x.com'];
-    if (!validXHosts.includes(host)) {
-      const err = new Error('Dominio no permitido. Debe ser x.com o twitter.com.');
-      err.statusCode = 400;
-      throw err;
-    }
-    const match = u.pathname.match(/(?:status|i\/status)\/(\d{15,20})/);
-    if (match) tweetId = match[1];
-  } catch (e) {
-    if (e.statusCode) throw e;
-    const err = new Error('Estructura de URL de X/Twitter inválida.');
-    err.statusCode = 400;
-    throw err;
-  }
-  if (!tweetId) {
-    const err = new Error('No se pudo extraer un ID de tweet válido desde la URL proporcionada.');
-    err.statusCode = 400;
-    throw err;
-  }
-  const result = { ok: true, endpoint: 'xvideo', input: inputUrl, tweet_id: tweetId, videos: [], thumbnail: null, text: null };
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,es;q=0.8'
-  };
-  let lastError = null;
-  const tryUrls = ['https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en', 'https://api.fxtwitter.com/status/' + tweetId];
-  for (let i = 0; i < tryUrls.length; i++) {
-    if (parentSignal && parentSignal.aborted) {
-      const err = new Error('Límite de tiempo global alcanzado para la solicitud.');
-      err.statusCode = 504;
-      throw err;
-    }
-    const { signal, cleanup } = createCombinedSignal(parentSignal, 3000);
-    try {
-      const response = await fetch(tryUrls[i], { headers, signal });
-      if (response.ok) {
-        const textResp = await readTextWithLimit(response, 2 * 1024 * 1024);
-        if (tryUrls[i].includes('fxtwitter')) {
-          const fxData = JSON.parse(textResp);
-          if (fxData.tweet) {
-            result.text = fxData.tweet.text || null;
-            result.thumbnail = (fxData.tweet.media?.photos?.[0]?.url) || (fxData.tweet.media?.videos?.[0]?.thumbnail_url) || null;
-            const vids = fxData.tweet.media?.videos || [];
-            for (let v = 0; v < vids.length; v++) {
-              if (vids[v].url) result.videos.push({ url: vids[v].url, quality: vids[v].quality || 'unknown', type: 'video/mp4' });
-            }
-          }
-        } else {
-          const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
-          const found = {};
-          let m;
-          while ((m = mp4Regex.exec(textResp)) !== null) {
-            let clean = m[0].replace(/\\u0026/g, '&').replace(/\\"/g, '').replace(/\\/g, '');
-            if (!found[clean] && clean.includes('video.twimg.com')) {
-              found[clean] = true;
-              result.videos.push({ url: clean, quality: clean.includes('720') ? '720p' : clean.includes('360') ? '360p' : clean.includes('480') ? '480p' : 'unknown', type: 'video/mp4' });
-            }
-          }
-        }
-        if (result.videos.length > 0) {
-          cleanup();
-          break;
-        }
-      }
-    } catch (e) {
-      lastError = e;
-    } finally {
-      cleanup();
-    }
-  }
-  if (result.videos.length > 0) {
-    result.total_videos = result.videos.length;
-    result.best = result.videos[0].url;
-    return result;
-  }
-  if (lastError && (lastError.name === 'AbortError' || lastError.statusCode === 504)) {
-    const err = new Error('Tiempo de espera agotado al consultar los servidores de X/Twitter.');
-    err.statusCode = 504;
-    throw err;
-  }
-  if (lastError && lastError.statusCode && lastError.statusCode !== 404) {
-    throw lastError;
-  }
-  const notFoundErr = new Error('No se encontraron videos disponibles en el tweet indicado.');
-  notFoundErr.statusCode = 404;
-  throw notFoundErr;
-}
-async function fetchTikTokVideo(initialUrl, parentSignal) {
-  let currentUrl = initialUrl;
-  let redirects = 0;
-  const maxRedirects = 5;
-  while (redirects < maxRedirects) {
-    let parsedUrl;
-    try {
-      parsedUrl = new URL(currentUrl);
-    } catch (err) {
-      const e = new Error('La URL proporcionada no es válida.');
-      e.statusCode = 400;
-      throw e;
-    }
-    if (parsedUrl.protocol !== 'https:' || !isValidTikTokDomain(parsedUrl.hostname) || parsedUrl.port !== '' || parsedUrl.username !== '' || parsedUrl.password !== '') {
-      const e = new Error('Bloqueo de seguridad: Solo se permiten conexiones HTTPS directas a dominios oficiales de TikTok.');
-      e.statusCode = 400;
-      throw e;
-    }
-    const { signal, cleanup } = createCombinedSignal(parentSignal, 4500);
-    try {
-      const response = await fetch(currentUrl, {
-        signal: signal,
-        redirect: 'manual',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
-        }
-      });
-      if ([301, 302, 303, 307, 308].includes(response.status)) {
-        const location = response.headers.get('location');
-        if (!location) {
-          const e = new Error('Redirección remota sin encabezado Location válido.');
-          e.statusCode = 502;
-          throw e;
-        }
-        currentUrl = new URL(location, currentUrl).href;
-        redirects++;
-        continue;
-      }
-      if (!response.ok) {
-        const e = new Error(`El servidor de TikTok respondió con estado HTTP ${response.status}`);
-        e.statusCode = 502;
-        throw e;
-      }
-      const html = await readTextWithLimit(response, 4 * 1024 * 1024);
-      let vData = null;
-      const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
-      if (univMatch) {
-        try {
-          const univ = JSON.parse(univMatch[1]);
-          vData = univ.__DEFAULT_SCOPE__['webapp.video-detail']?.itemInfo?.itemStruct;
-        } catch (pErr) {}
-      } else {
-        const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
-        if (sigiMatch) {
-          try {
-            const sigi = JSON.parse(sigiMatch[1]);
-            const itemId = Object.keys(sigi.ItemModule)[0];
-            vData = sigi.ItemModule[itemId];
-          } catch (pErr) {}
-        }
-      }
-      if (!vData) {
-        const e = new Error("No se encontraron metadatos de video válidos en el contenido de TikTok.");
-        e.statusCode = 404;
-        throw e;
-      }
-      return {
-        creator: "Jxmpier207",
-        status: true,
-        data: {
-          id: vData.id || "",
-          url: initialUrl,
-          type: "video",
-          title: vData.desc || "",
-          cover: vData.video?.cover || "",
-          duration: vData.video?.duration || 0,
-          links: {
-            hd: vData.video?.playAddr || "",
-            sd: vData.video?.playAddr || "",
-            wm: vData.video?.downloadAddr || "",
-            mp3: vData.music?.playUrl || ""
-          },
-          author: {
-            username: vData.author?.uniqueId || "",
-            nickname: vData.author?.nickname || "",
-            avatar: vData.author?.avatarLarger || ""
-          }
-        }
-      };
-    } catch (e) {
-      if (e.name === 'AbortError' || e.statusCode === 504) {
-        const err = new Error('Tiempo de espera agotado al conectar con TikTok.');
-        err.statusCode = 504;
-        throw err;
-      }
-      if (!e.statusCode) e.statusCode = 502;
-      throw e;
-    } finally {
-      cleanup();
-    }
-  }
-  const maxRedirErr = new Error('Se superó el límite máximo de redirecciones permitidas.');
-  maxRedirErr.statusCode = 400;
-  throw maxRedirErr;
-}
 module.exports = async function handler(req, res) {
   const requestId = randomUUID();
   const globalController = new AbortController();
@@ -540,8 +199,8 @@ pre{color:#9cdcfe;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="downloaders" class="card">
 <h2>Panel de descargadores</h2>
 <div class="endpoint-block">
-<div class="route-path-box"><span id="routeTextYoutube">Ruta: /youtube?query=&type=video&quality=1080p</span><button class="btn-copy-route" onclick="copiarRuta(document.getElementById('routeTextYoutube').innerText.replace('Ruta: ', ''))">Copiar</button></div>
-<h3>YouTube Media Engine (/youtube)</h3>
+<div class="route-path-box"><span id="routeTextYoutube">Ruta: /ytmp4?query=&quality=1080p (descarga el archivo .mp4)</span><button class="btn-copy-route" onclick="copiarRuta(document.getElementById('routeTextYoutube').innerText.replace('Ruta: ', ''))">Copiar</button></div>
+<h3>YouTube Downloader (/ytmp3 y /ytmp4)</h3>
 <label>Enlace o término de búsqueda:</label>
 <input type="text" id="inputYoutube" placeholder="Ej: phonk music o https://youtu.be/...">
 <label>Tipo de multimedia:</label>
@@ -600,15 +259,29 @@ function actualizarInterfazYoutube(){
   var routeText=document.getElementById('routeTextYoutube');
   if(type==='audio'){
     qualityGroup.style.display='none';
-    routeText.innerText='Ruta: /ytmp3?query=';
+    routeText.innerText='Ruta: /ytmp3?query= (descarga el archivo .mp3)';
   } else {
     qualityGroup.style.display='block';
     var quality=document.getElementById('selectYtQuality').value;
-    routeText.innerText='Ruta: /youtube?query=&type=video&quality='+quality;
+    routeText.innerText='Ruta: /ytmp4?query=&quality='+quality+' (descarga el archivo .mp4)';
   }
 }
 async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('Por favor ingresa un enlace o texto válido.');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='Procesando solicitud...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='Error de ejecución: '+e.message}}
-async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('Ingresa un término o enlace.');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='Extrayendo multimedia de YouTube...';try{var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality;var res=await fetch(apiUrl);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='Error: '+e.message}}
+// El botón dispara la descarga real del archivo (mp3/mp4): el navegador
+// recibe la respuesta con Content-Disposition: attachment y la guarda como
+// cualquier descarga normal, en vez de mostrar un JSON con un enlace.
+function ejecutarYoutubeCustom(){
+  var val=document.getElementById('inputYoutube').value.trim();
+  var type=document.getElementById('selectYtType').value;
+  var quality=document.getElementById('selectYtQuality').value;
+  if(!val){alert('Ingresa un término o enlace.');return}
+  var container=document.getElementById('jsonContainerYoutube');
+  var output=document.getElementById('jsonOutputYoutube');
+  container.style.display='block';
+  output.innerText='Iniciando descarga del archivo, revisa tu carpeta de Descargas...';
+  var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/ytmp4?query='+encodeURIComponent(val)+'&quality='+quality;
+  window.location.href=apiUrl;
+}
 async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('Escribe un término de búsqueda.');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='Buscando...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='Error: '+e.message}}
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText)}
 </script>
@@ -623,11 +296,16 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
       return sendJson(429, { ok: false, message: 'Límite de solicitudes excedido. Intenta de nuevo en un minuto.', requestId });
     }
 
+    // Todas las rutas de abajo delegan el scraping real a los módulos de
+    // `api/documentos/` (uno por endpoint: ytmp3, ytmp4, tiktok, ytsearch,
+    // ttsearch, xvideo). Este handler solo valida la petición HTTP y decide
+    // si la respuesta es JSON (información) o el archivo descargado en sí.
     const parentSignal = globalController.signal;
+
     if (pathname === '/tiktok') {
       if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro url.', requestId });
       try {
-        return sendJson(200, await secureApi.fetchTikTokVideo(query, parentSignal));
+        return sendJson(200, { ...(await extractTikTokVideo(query, parentSignal)), requestId });
       } catch (error) {
         console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
         return sendJson(error.statusCode || 502, { creator: 'Jxmpier207', status: false, message: secureApi.publicErrorMessage(error), requestId });
@@ -637,7 +315,7 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
       if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query.', requestId });
       try {
         const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
-        const results = await secureApi.fetchRealSearchResults(query, limit, platform, parentSignal);
+        const results = pathname === '/ytsearch' ? await searchYoutube(query, limit, parentSignal) : await searchTikTok(query, limit, parentSignal);
         if (!results.length) return sendJson(404, { ok: false, message: 'No se encontraron resultados.', requestId });
         return sendJson(200, { ok: true, source: platform, query, total_results: results.length, results, requestId });
       } catch (error) {
@@ -646,29 +324,39 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
       }
     }
 
-    if (['/youtube', '/ytmp3', '/ytmp4', '/docs/download/ytmp3', '/docs/download/ytmp4'].includes(pathname)) {
+    // /ytmp3 y /ytmp4 entregan el archivo real como descarga (streaming),
+    // no un JSON con un link. /youtube conserva la respuesta JSON informativa.
+    if (pathname === '/ytmp3') {
       if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query o url.', requestId });
       try {
-        const resolvedType = pathname.endsWith('ytmp3') ? 'audio' : pathname.endsWith('ytmp4') ? 'video' : type;
-        let title = query;
-        let videoId;
-        if (/^https?:\/\//i.test(query)) {
-          videoId = secureApi.extractYoutubeVideoId(query);
-          if (!videoId) return sendJson(400, { ok: false, message: 'La URL de YouTube no es válida; se requiere HTTPS y una ruta reconocida.', requestId });
-        } else if (/^[a-z][a-z\d+.-]*:\/\//i.test(query)) {
-          return sendJson(400, { ok: false, message: 'Solo se aceptan enlaces HTTPS de YouTube.', requestId });
-        } else {
-          const results = await secureApi.fetchRealSearchResults(query, 1, 'youtube', parentSignal);
-          if (!results[0]) return sendJson(404, { ok: false, message: 'No se encontró un video para la búsqueda.', requestId });
-          title = results[0].title || query;
-          videoId = results[0].videoId;
-        }
-        const media = await secureApi.fetchYoutubeMedia(videoId, resolvedType, quality, parentSignal);
+        await downloadYoutubeAudio(query, res, parentSignal);
+        return undefined;
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, code: error.code || null, message: error.message }));
+        if (res.headersSent) return res.end();
+        return sendJson(error.statusCode || 502, { ok: false, code: error.code || 'UPSTREAM_ERROR', message: secureApi.publicErrorMessage(error), requestId });
+      }
+    }
+    if (pathname === '/ytmp4') {
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query o url.', requestId });
+      try {
+        await downloadYoutubeVideo(query, quality, res, parentSignal);
+        return undefined;
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, code: error.code || null, message: error.message }));
+        if (res.headersSent) return res.end();
+        return sendJson(error.statusCode || 502, { ok: false, code: error.code || 'UPSTREAM_ERROR', message: secureApi.publicErrorMessage(error), requestId });
+      }
+    }
+    if (pathname === '/youtube') {
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query o url.', requestId });
+      try {
+        const { videoId, title, media } = type === 'audio' ? await getYoutubeAudio(query, parentSignal) : await getYoutubeVideo(query, quality, parentSignal);
         const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
         return sendJson(200, {
           ok: true,
-          endpoint: resolvedType === 'audio' ? 'ytmp3' : 'youtube',
-          type: resolvedType,
+          endpoint: 'youtube',
+          type,
           quality: media.quality,
           input: query,
           title,
@@ -678,7 +366,7 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
           url: media.url,
           result: {
             title,
-            type: resolvedType,
+            type,
             quality: media.quality,
             url: videoUrl,
             download: media.url,
@@ -694,7 +382,7 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
     if (pathname === '/xvideo') {
       if (!query) return sendJson(400, { ok: false, message: 'Falta el enlace de la publicación.', requestId });
       try {
-        return sendJson(200, { ...(await secureApi.fetchXVideo(query, parentSignal)), requestId });
+        return sendJson(200, { ...(await fetchXVideo(query, parentSignal)), requestId });
       } catch (error) {
         console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
         return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
