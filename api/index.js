@@ -101,11 +101,8 @@ async function fetchDirectYoutubeAudio(videoId) {
         const streamingData = playerData.streamingData;
         if (streamingData) {
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
-          
           let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
-          if (audioFormat && audioFormat.url) {
-            return audioFormat.url;
-          }
+          if (audioFormat && audioFormat.url) return audioFormat.url;
         }
       } catch (err) {}
     }
@@ -116,7 +113,6 @@ async function fetchDirectYoutubeAudio(videoId) {
       return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
     }
   } catch (e) {}
-  
   return 'https://rr3---sn-gvnuxnzs.googlevideo.com/videoplayback?expire=3716248320&ei=1&initbypass=yes&id=audio_' + videoId;
 }
 
@@ -274,8 +270,32 @@ module.exports = async function handler(req, res) {
     const limit = Math.min(Math.max(limitParam, 1), 20);
 
     if (pathname === '/' || pathname === '') {
-      res.writeHead(302, { 'Location': '/docs' });
-      return res.end();
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(`<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZETA-CORE.API | Bienvenida</title>
+<style>
+@keyframes rgbGlow{0%{border-color:#00f0ff;box-shadow:0 0 25px rgba(0,240,255,.4),inset 0 0 15px rgba(0,240,255,.2)}33%{border-color:#b026ff;box-shadow:0 0 25px rgba(176,38,255,.4),inset 0 0 15px rgba(176,38,255,.2)}66%{border-color:#00ff66;box-shadow:0 0 25px rgba(0,255,102,.4),inset 0 0 15px rgba(0,255,102,.2)}100%{border-color:#00f0ff;box-shadow:0 0 25px rgba(0,240,255,.4),inset 0 0 15px rgba(0,240,255,.2)}}
+@keyframes rgbText{0%{color:#00f0ff;text-shadow:0 0 10px rgba(0,240,255,.6)}33%{color:#b026ff;text-shadow:0 0 10px rgba(176,38,255,.6)}66%{color:#0ff;text-shadow:0 0 10px rgba(0,255,102,.6)}100%{color:#00f0ff;text-shadow:0 0 10px rgba(0,240,255,.6)}}
+body{background:linear-gradient(135deg,#06050a 0%,#120b22 50%,#050f1a 100%);color:#f0edff;font-family:'Segoe UI',system-ui,sans-serif;margin:0;padding:0;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden}
+.welcome-card{background:rgba(12,10,20,.95);border:2px solid #00f0ff;border-radius:24px;padding:40px;max-width:500px;width:90%;text-align:center;box-shadow:0 20px 50px rgba(0,0,0,.8);animation:rgbGlow 6s infinite alternate}
+h1{font-size:28px;font-weight:900;animation:rgbText 5s infinite;margin-bottom:10px}
+p{color:#9b93af;font-size:14px;margin-bottom:25px;line-height:1.5}
+.btn-doc{display:inline-block;padding:14px 30px;background:linear-gradient(135deg,#00f0ff,#b026ff,#00ff66);background-size:200% 200%;color:#05040a;font-weight:900;font-size:16px;border:none;border-radius:14px;cursor:pointer;text-decoration:none;box-shadow:0 5px 20px rgba(176,38,255,.4);transition:transform .2s}
+.btn-doc:hover{transform:scale(1.05)}
+</style>
+</head>
+<body>
+<div class="welcome-card">
+  <h1>⚡ ZETA-CORE.API ⚡</h1>
+  <p>Bienvenido al núcleo de alto rendimiento. Accede a la documentación completa para probar los endpoints y consultar las rutas exactas de integración.</p>
+  <a href="/docs" class="btn-doc">📄 Documento</a>
+</div>
+</body>
+</html>`);
     }
 
     if (pathname === '/docs') {
@@ -286,7 +306,7 @@ module.exports = async function handler(req, res) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>ZETA-CORE.API | Dashboard Pro</title>
+<title>ZETA-CORE.API | Dashboard & Docs</title>
 <style>
 @keyframes rgbGlow{0%{border-color:#00f0ff;box-shadow:0 0 20px rgba(0,240,255,.4),inset 0 0 15px rgba(0,240,255,.2)}33%{border-color:#b026ff;box-shadow:0 0 20px rgba(176,38,255,.4),inset 0 0 15px rgba(176,38,255,.2)}66%{border-color:#00ff66;box-shadow:0 0 20px rgba(0,255,102,.4),inset 0 0 15px rgba(0,255,102,.2)}100%{border-color:#00f0ff;box-shadow:0 0 20px rgba(0,240,255,.4),inset 0 0 15px rgba(0,240,255,.2)}}
 @keyframes rgbText{0%{color:#00f0ff;text-shadow:0 0 10px rgba(0,240,255,.6)}33%{color:#b026ff;text-shadow:0 0 10px rgba(176,38,255,.6)}66%{color:#00ff66;text-shadow:0 0 10px rgba(0,255,102,.6)}100%{color:#00f0ff;text-shadow:0 0 10px rgba(0,240,255,.6)}}
@@ -324,6 +344,8 @@ input,select{width:100%;padding:12px;background:rgba(15,12,24,.95);border:1px so
 .json-box{margin-top:15px;background:#040308;border:1px solid rgba(0,255,102,.3);border-radius:12px;padding:12px;position:relative;display:none}
 pre{color:#00ff66;font-size:11px;overflow-x:auto;max-height:200px;margin:0;white-space:pre-wrap;font-family:'Courier New',monospace}
 .btn-copy{position:absolute;top:8px;right:8px;background:rgba(0,255,102,.2);color:#00ff66;border:1px solid rgba(0,255,102,.4);padding:4px 10px;border-radius:6px;font-size:10px;cursor:pointer;font-weight:bold}
+.route-path-box{display:flex;align-items:center;justify-content:space-between;background:rgba(0,240,255,.07);border:1px dashed rgba(0,240,255,.4);padding:6px 12px;border-radius:8px;margin-bottom:12px;font-family:monospace;font-size:11px;color:#00f0ff}
+.btn-copy-route{background:rgba(0,240,255,.2);color:#00f0ff;border:none;padding:3px 8px;border-radius:4px;font-size:10px;cursor:pointer;font-weight:bold}
 .sidebar-footer{padding:15px;border-top:1px solid rgba(255,255,255,.08);font-size:11px;color:var(--text-muted);display:flex;justify-content:space-between;align-items:center}
 .overlay{position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,.7);backdrop-filter:blur(5px);z-index:150;display:none}
 .overlay.show{display:block}
@@ -337,11 +359,11 @@ pre{color:#00ff66;font-size:11px;overflow-x:auto;max-height:200px;margin:0;white
 <div class="sidebar-menu">
 <div class="menu-category-title">✨ Sistema</div>
 <span class="sub-item active" onclick="switchTab('guide',this)">🚀 Dashboard</span>
-<div class="menu-category-title">⚡ Motores</div>
+<div class="menu-category-title">⚡ Motores & Rutas</div>
 <span class="sub-item" onclick="switchTab('downloaders',this)">📥 Descargas</span>
 <span class="sub-item" onclick="switchTab('search',this)">🔍 Búsquedas</span>
 </div>
-<div class="sidebar-footer"><span>RGB ENGINE</span><span style="color:#00ff66">● ONLINE (VERCEL)</span></div>
+<div class="sidebar-footer"><span>RGB ENGINE</span><span style="color:#00ff66">● ONLINE</span></div>
 </div>
 <div class="main-content"><div class="card-wrapper">
 <div id="guide" class="card active">
@@ -358,50 +380,70 @@ pre{color:#00ff66;font-size:11px;overflow-x:auto;max-height:200px;margin:0;white
 <div class="stat-box"><div class="stat-label">Bajada</div><div class="stat-value">${(totalBytesReceived/1024).toFixed(2)} KB</div></div>
 <div class="stat-box"><div class="stat-label">Subida</div><div class="stat-value">${(totalBytesSent/1024).toFixed(2)} KB</div></div>
 </div></div>
-<div style="text-align:center"><button class="btn btn-rgb" onclick="switchTab('search',null)">Ir al Playground →</button></div>
+<div style="text-align:center"><button class="btn btn-rgb" onclick="switchTab('downloaders', document.querySelectorAll('.sub-item')[1])">📄 Documentación</button></div>
 </div>
+
 <div id="downloaders" class="card">
 <h2>📥 Panel de Descargadores</h2>
+
+<!-- TikTok Route -->
 <div style="background:rgba(16,12,25,.6);border:1px solid rgba(255,50,100,.3);padding:16px;border-radius:14px;margin-bottom:15px">
-<h3 style="color:#ff3264;margin-top:0;font-size:15px">TikTok Video (tiktok)</h3>
+<div class="route-path-box"><span>Ruta: /tiktok?url=</span><button class="btn-copy-route" onclick="copiarRuta('/tiktok?url=')">Copiar Ruta</button></div>
+<h3 style="color:#ff3264;margin-top:0;font-size:15px">TikTok Video (/tiktok)</h3>
 <label>Enlace del video:</label>
 <input type="text" id="inputTikTok" placeholder="https://www.tiktok.com/...">
 <button class="btn btn-rgb" onclick="ejecutarAccion('tiktok','inputTikTok','jsonContainerTikTok','jsonOutputTikTok')">Extraer TikTok</button>
 <div id="jsonContainerTikTok" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputTikTok')">Copiar</button><pre id="jsonOutputTikTok">Esperando...</pre></div>
 </div>
+
+<!-- ytmp3 Route -->
 <div style="background:rgba(16,12,25,.6);border:1px solid rgba(0,240,255,.3);padding:16px;border-radius:14px;margin-bottom:15px">
-<h3 style="color:#00f0ff;margin-top:0;font-size:15px">YouTube MP3 (ytmp3)</h3>
+<div class="route-path-box"><span>Ruta: /docs/download/ytmp3?query=</span><button class="btn-copy-route" onclick="copiarRuta('/docs/download/ytmp3?query=')">Copiar Ruta</button></div>
+<h3 style="color:#00f0ff;margin-top:0;font-size:15px">YouTube MP3 (/docs/download/ytmp3)</h3>
 <label>Enlace o título:</label>
 <input type="text" id="inputYtMp3" placeholder="Ej: hola remix">
 <button class="btn btn-rgb" onclick="ejecutarAccion('docs/download/ytmp3','inputYtMp3','jsonContainerYtMp3','jsonOutputYtMp3')">Generar MP3</button>
 <div id="jsonContainerYtMp3" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYtMp3')">Copiar</button><pre id="jsonOutputYtMp3">Esperando...</pre></div>
 </div>
+
+<!-- ytmp4 Route -->
 <div style="background:rgba(16,12,25,.6);border:1px solid rgba(176,38,255,.3);padding:16px;border-radius:14px;margin-bottom:15px">
-<h3 style="color:#b026ff;margin-top:0;font-size:15px">YouTube MP4 (ytmp4)</h3>
+<div class="route-path-box"><span>Ruta: /docs/download/ytmp4?query=</span><button class="btn-copy-route" onclick="copiarRuta('/docs/download/ytmp4?query=')">Copiar Ruta</button></div>
+<h3 style="color:#b026ff;margin-top:0;font-size:15px">YouTube MP4 (/docs/download/ytmp4)</h3>
 <label>Enlace o título:</label>
 <input type="text" id="inputYtMp4" placeholder="Ej: Link de YouTube...">
 <button class="btn btn-rgb" onclick="ejecutarAccion('docs/download/ytmp4','inputYtMp4','jsonContainerYtMp4','jsonOutputYtMp4')">Generar MP4</button>
 <div id="jsonContainerYtMp4" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYtMp4')">Copiar</button><pre id="jsonOutputYtMp4">Esperando...</pre></div>
 </div>
+
+<!-- xvideo Route -->
 <div style="background:rgba(16,12,25,.6);border:1px solid rgba(0,255,102,.3);padding:16px;border-radius:14px">
-<h3 style="color:#00ff66;margin-top:0;font-size:15px">X / Twitter Video (xvideo)</h3>
+<div class="route-path-box"><span>Ruta: /xvideo?url=</span><button class="btn-copy-route" onclick="copiarRuta('/xvideo?url=')">Copiar Ruta</button></div>
+<h3 style="color:#00ff66;margin-top:0;font-size:15px">X / Twitter Video (/xvideo)</h3>
 <label>Enlace del tweet:</label>
 <input type="text" id="inputXVideo" placeholder="https://x.com/user/status/123">
 <button class="btn btn-rgb" onclick="ejecutarAccion('xvideo','inputXVideo','jsonContainerXVideo','jsonOutputXVideo')">Extraer Video</button>
 <div id="jsonContainerXVideo" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputXVideo')">Copiar</button><pre id="jsonOutputXVideo">Esperando...</pre></div>
 </div>
 </div>
+
 <div id="search" class="card">
 <h2>🔍 Playground de Búsquedas</h2>
+
+<!-- ytsearch Route -->
 <div style="background:rgba(16,12,25,.6);border:1px solid rgba(0,240,255,.3);padding:16px;border-radius:14px;margin-bottom:15px">
-<h3 style="color:#00f0ff;margin-top:0;font-size:15px">YouTube Search</h3>
+<div class="route-path-box"><span>Ruta: /ytsearch?query=&limit=</span><button class="btn-copy-route" onclick="copiarRuta('/ytsearch?query=&limit=')">Copiar Ruta</button></div>
+<h3 style="color:#00f0ff;margin-top:0;font-size:15px">YouTube Search (/ytsearch)</h3>
 <label>Término:</label><input type="text" id="inputYt" placeholder="Messi edits...">
 <label>Cantidad:</label><select id="limitYt"><option value="1">1</option><option value="5" selected>5</option><option value="10">10</option></select>
 <button class="btn btn-rgb" onclick="ejecutarBusqueda('ytsearch')">Buscar YouTube</button>
 <div id="jsonContainerYt" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYt')">Copiar</button><pre id="jsonOutputYt">Esperando...</pre></div>
 </div>
+
+<!-- ttsearch Route -->
 <div style="background:rgba(16,12,25,.6);border:1px solid rgba(176,38,255,.3);padding:16px;border-radius:14px">
-<h3 style="color:#b026ff;margin-top:0;font-size:15px">TikTok Search</h3>
+<div class="route-path-box"><span>Ruta: /ttsearch?query=&limit=</span><button class="btn-copy-route" onclick="copiarRuta('/ttsearch?query=&limit=')">Copiar Ruta</button></div>
+<h3 style="color:#b026ff;margin-top:0;font-size:15px">TikTok Search (/ttsearch)</h3>
 <label>Término:</label><input type="text" id="inputTt" placeholder="Anime edit...">
 <label>Cantidad:</label><select id="limitTt"><option value="1">1</option><option value="5" selected>5</option><option value="10">10</option></select>
 <button class="btn btn-rgb" onclick="ejecutarBusqueda('ttsearch')">Buscar TikTok</button>
@@ -411,7 +453,8 @@ pre{color:#00ff66;font-size:11px;overflow-x:auto;max-height:200px;margin:0;white
 </div></div>
 <script>
 function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
-function switchTab(tabId,el){document.querySelectorAll('.sub-item').forEach(function(e){e.classList.remove('active')});if(el)el.classList.add('active');document.querySelectorAll('.card').forEach(function(c){c.classList.remove('active')});document.getElementById(tabId).classList.add('active');if(window.innerWidth<=900)toggleSidebar()}
+function switchTab(tabId,el){document.querySelectorAll('.sub-item').forEach(function(e){e.classList.remove('active')});if(el)el.classList.add('active');document.querySelectorAll('.card').forEach(function(c){c.classList.remove('active')});document.getElementById(tabId).classList.add('active');history.pushState(null, '', '/docs');if(window.innerWidth<=900)toggleSidebar()}
+function copiarRuta(texto){navigator.clipboard.writeText(texto);alert('¡Ruta copiada al portapapeles!');}
 async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('Ingresa un enlace o texto.');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='Procesando...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='Error: '+e.message}}
 async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('Escribe un término.');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='Buscando...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='Error: '+e.message}}
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('¡Copiado!')}
@@ -439,7 +482,6 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
       return res.end(payload);
     }
 
-    // Rutas originales y soporte para las nuevas rutas solicitadas (/docs/download/ytmp3 y /docs/download/ytmp4)
     if (pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
       if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query o url' }));
       const endpoint = pathname.includes('ytmp3') ? 'ytmp3' : 'ytmp4';
