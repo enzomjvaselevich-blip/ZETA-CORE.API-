@@ -365,26 +365,27 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
             if (idMatch) videoId = idMatch[1];
         }
 
-        // Se usa una API pública funcional que extrae el enlace directo de descarga de audio/video
-        let downloadUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        let downloadUrl = '';
         try {
-            const apis = [
-                `https://deliriussapi-oficial.vercel.app/download/ytmp3?url=https://www.youtube.com/watch?v=${videoId}`,
-                `https://api.vkrproject.com/v2/ytmp3?url=https://www.youtube.com/watch?v=${videoId}`
-            ];
-            
-            for (let i = 0; i < apis.length; i++) {
-                try {
-                    const dlApiRes = await fetch(apis[i]);
-                    const dlData = await dlApiRes.json();
-                    const possibleUrl = dlData?.data?.download?.url || dlData?.download?.url || dlData?.download_url || dlData?.link;
-                    if (possibleUrl && possibleUrl.startsWith('http')) {
-                        downloadUrl = possibleUrl;
-                        break;
-                    }
-                } catch (err) {}
+            const apiRes = await fetch('https://api.siputzx.my.id/api/d/ytmp3?url=https://www.youtube.com/watch?v=' + videoId);
+            const apiData = await apiRes.json();
+            if (apiData && apiData.status && apiData.data && apiData.data.dl) {
+                downloadUrl = apiData.data.dl;
+                if (apiData.data.title) title = apiData.data.title;
             }
         } catch (e) {}
+
+        if (!downloadUrl) {
+            try {
+                const altRes = await fetch('https://api.vkrproject.com/v2/ytmp3?url=https://www.youtube.com/watch?v=' + videoId);
+                const altData = await altRes.json();
+                downloadUrl = altData?.data?.download?.url || altData?.download?.url || '';
+            } catch (e) {}
+        }
+
+        if (!downloadUrl) {
+            downloadUrl = 'https://www.youtube.com/watch?v=' + videoId;
+        }
 
         const payload = JSON.stringify({
             ok: true,
@@ -393,14 +394,14 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
             input: query,
             title: title,
             videoId: videoId,
-            resolved_url: `https://www.youtube.com/watch?v=${videoId}`,
+            resolved_url: 'https://www.youtube.com/watch?v=' + videoId,
             download_url: downloadUrl,
             url: downloadUrl,
             result: {
                 title: title,
-                url: `https://www.youtube.com/watch?v=${videoId}`,
+                url: 'https://www.youtube.com/watch?v=' + videoId,
                 download: downloadUrl,
-                thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+                thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg'
             }
         }, null, 2);
         totalBytesSent += payload.length;
