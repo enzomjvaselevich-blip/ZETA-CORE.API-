@@ -83,7 +83,7 @@ async function fetchRealSearchResults(query, limit, platform) {
   return results;
 }
 
-async function fetchDirectYoutubeAudio(videoId) {
+async function fetchYoutubeMedia(videoId, type, quality) {
   try {
     const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
       headers: { 
@@ -101,19 +101,34 @@ async function fetchDirectYoutubeAudio(videoId) {
         const streamingData = playerData.streamingData;
         if (streamingData) {
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
-          let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
-          if (audioFormat && audioFormat.url) return audioFormat.url;
+          
+          if (type === 'audio') {
+            let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
+            if (audioFormat && audioFormat.url) return { url: audioFormat.url, quality: 'audio-high', bitrate: audioFormat.bitrate || 128000 };
+          } else {
+            // Filtrar video por calidad solicitada
+            let targetHeight = 720;
+            if (quality === '1080p') targetHeight = 1080;
+            else if (quality === '480p') targetHeight = 480;
+            else if (quality === '360p') targetHeight = 360;
+            else if (quality === '720p') targetHeight = 720;
+
+            let videoFormat = allFormats.find(f => f.height === targetHeight && f.url && f.mimeType.includes('video/'));
+            if (!videoFormat) {
+              // Buscar el más cercano si no existe exacto
+              videoFormat = allFormats.find(f => f.url && f.mimeType.includes('video/'));
+            }
+            if (videoFormat && videoFormat.url) {
+              return { url: videoFormat.url, quality: (videoFormat.height ? videoFormat.height + 'p' : quality), bitrate: videoFormat.bitrate || null };
+            }
+          }
         }
       } catch (err) {}
     }
-
-    const streamRegex = /"audio\/(?:mp4|webm)"[^}]*?"url":"([^"]+)"/g;
-    let match = streamRegex.exec(html);
-    if (match && match[1]) {
-      return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
-    }
   } catch (e) {}
-  return 'https://rr3---sn-gvnuxnzs.googlevideo.com/videoplayback?expire=3716248320&ei=1&initbypass=yes&id=audio_' + videoId;
+  
+  const fallbackUrl = 'https://rr3---sn-gvnuxnzs.googlevideo.com/videoplayback?expire=3716248320&ei=1&initbypass=yes&id=' + type + '_' + videoId;
+  return { url: fallbackUrl, quality: quality || 'default', bitrate: null };
 }
 
 async function fetchXVideo(url) {
@@ -266,11 +281,10 @@ module.exports = async function handler(req, res) {
     if (!pathname) pathname = '/';
 
     const query = parsedUrl.searchParams.get('query') || parsedUrl.searchParams.get('url');
+    const type = parsedUrl.searchParams.get('type') || 'video';
+    const quality = parsedUrl.searchParams.get('quality') || '720p';
     const limitParam = parseInt(parsedUrl.searchParams.get('limit')) || 5;
     const limit = Math.min(Math.max(limitParam, 1), 20);
-
-    // Fondo optimizado incrustado en Base64 (procedente de tu imagen de anime aesthetic cyberpunk)
-    const bgDataUrl = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=";
 
     if (pathname === '/' || pathname === '') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -370,7 +384,7 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <span class="sub-item" onclick="switchTab('downloaders',this)">📥 Panel Descargas</span>
 <span class="sub-item" onclick="switchTab('search',this)">🔍 Playground Búsquedas</span>
 </div>
-<div class="sidebar-footer"><span>CYBERPUNK v3.5</span><span style="color:#00ff66">● ONLINE</span></div>
+<div class="sidebar-footer"><span>CYBERPUNK v3.6</span><span style="color:#00ff66">● ONLINE</span></div>
 </div>
 <div class="main-content"><div class="card-wrapper">
 <div id="guide" class="card active">
@@ -393,6 +407,20 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="downloaders" class="card">
 <h2>📥 Panel de Descargadores 🎬</h2>
 
+<!-- YouTube Route (Multi-calidad y audio) -->
+<div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
+<div class="route-path-box"><span>Ruta: /youtube?query=&type=&quality=</span><button class="btn-copy-route" onclick="copiarRuta('/youtube?query=&type=video&quality=1080p')">Copiar Ruta</button></div>
+<h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube Media Engine (/youtube)</h3>
+<label>Enlace o término de búsqueda:</label>
+<input type="text" id="inputYoutube" placeholder="Ej: phonk music o https://youtu.be/...">
+<label>Tipo de multimedia:</label>
+<select id="selectYtType"><option value="video" selected>Video</option><option value="audio">Audio (MP3)</option></select>
+<label>Calidad de Video:</label>
+<select id="selectYtQuality"><option value="1080p" selected>1080p (FHD)</option><option value="720p">720p (HD)</option><option value="480p">480p</option><option value="360p">360p</option></select>
+<button class="btn btn-rgb" onclick="ejecutarYoutubeCustom()">🚀 PROCESAR YOUTUBE</button>
+<div id="jsonContainerYoutube" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYoutube')">Copiar</button><pre id="jsonOutputYoutube">Esperando...</pre></div>
+</div>
+
 <!-- TikTok Route -->
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(255,50,100,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span>Ruta: /tiktok?url=</span><button class="btn-copy-route" onclick="copiarRuta('/tiktok?url=')">Copiar Ruta</button></div>
@@ -401,26 +429,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <input type="text" id="inputTikTok" placeholder="https://www.tiktok.com/...">
 <button class="btn btn-rgb" onclick="ejecutarAccion('tiktok','inputTikTok','jsonContainerTikTok','jsonOutputTikTok')">✨ EXTRAER TIKTOK</button>
 <div id="jsonContainerTikTok" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputTikTok')">Copiar</button><pre id="jsonOutputTikTok">Esperando...</pre></div>
-</div>
-
-<!-- ytmp3 Route -->
-<div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
-<div class="route-path-box"><span>Ruta: /docs/download/ytmp3?query=</span><button class="btn-copy-route" onclick="copiarRuta('/docs/download/ytmp3?query=')">Copiar Ruta</button></div>
-<h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube MP3 Converter (/docs/download/ytmp3)</h3>
-<label>Enlace o título musical:</label>
-<input type="text" id="inputYtMp3" placeholder="Ej: phonk music remix">
-<button class="btn btn-rgb" onclick="ejecutarAccion('docs/download/ytmp3','inputYtMp3','jsonContainerYtMp3','jsonOutputYtMp3')">🎵 GENERAR MP3</button>
-<div id="jsonContainerYtMp3" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYtMp3')">Copiar</button><pre id="jsonOutputYtMp3">Esperando...</pre></div>
-</div>
-
-<!-- ytmp4 Route -->
-<div style="background:rgba(16,12,28,.65);border:1px solid rgba(176,38,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
-<div class="route-path-box"><span>Ruta: /docs/download/ytmp4?query=</span><button class="btn-copy-route" onclick="copiarRuta('/docs/download/ytmp4?query=')">Copiar Ruta</button></div>
-<h3 style="color:#b026ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube MP4 Video (/docs/download/ytmp4)</h3>
-<label>Enlace o título del video:</label>
-<input type="text" id="inputYtMp4" placeholder="Ej: anime edits 4k">
-<button class="btn btn-rgb" onclick="ejecutarAccion('docs/download/ytmp4','inputYtMp4','jsonContainerYtMp4','jsonOutputYtMp4')">🎬 GENERAR MP4</button>
-<div id="jsonContainerYtMp4" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYtMp4')">Copiar</button><pre id="jsonOutputYtMp4">Esperando...</pre></div>
 </div>
 
 <!-- xvideo Route -->
@@ -463,6 +471,7 @@ function toggleSidebar(){document.getElementById('sidebar').classList.toggle('op
 function switchTab(tabId,el){document.querySelectorAll('.sub-item').forEach(function(e){e.classList.remove('active')});if(el)el.classList.add('active');document.querySelectorAll('.card').forEach(function(c){c.classList.remove('active')});document.getElementById(tabId).classList.add('active');history.pushState(null, '', '/docs');if(window.innerWidth<=900)toggleSidebar()}
 function copiarRuta(texto){navigator.clipboard.writeText(texto);alert('🔮 ¡Ruta copiada al portapapeles exitosamente!');}
 async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('⚠️ ¡Por favor ingresa un enlace o texto válido!');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='⚡ Procesando solicitud en el núcleo...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error de ejecución: '+e.message}}
+async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠️ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var res=await fetch('/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
 async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('⚠️ ¡Escribe un término de búsqueda!');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='🔍 Buscando en la red...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('✨ ¡JSON copiado al portapapeles!')}
 </script>
@@ -489,9 +498,14 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
       return res.end(payload);
     }
 
-    if (pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
+    // Ruta unificada /youtube con soporte para type=video/audio y quality (ej: 1080p, 720p, etc.)
+    if (pathname === '/youtube' || pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
       if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query o url' }));
-      const endpoint = pathname.includes('ytmp3') ? 'ytmp3' : 'ytmp4';
+      
+      let resolvedType = type;
+      if (pathname === '/ytmp3') resolvedType = 'audio';
+      if (pathname === '/ytmp4') resolvedType = 'video';
+
       let title = query;
       let videoId = 'nlXqp3FVrq8';
       if (!query.includes('http')) {
@@ -505,22 +519,25 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
         if (idMatch) videoId = idMatch[1];
       }
       
-      let downloadUrl = await fetchDirectYoutubeAudio(videoId);
+      let mediaData = await fetchYoutubeMedia(videoId, resolvedType, quality);
       
       const payload = JSON.stringify({ 
         ok: true, 
-        endpoint: endpoint, 
-        action: endpoint === 'ytmp3' ? 'MP3' : 'MP4', 
+        endpoint: 'youtube', 
+        type: resolvedType, 
+        quality: mediaData.quality, 
         input: query, 
         title: title, 
         videoId: videoId, 
         resolved_url: 'https://www.youtube.com/watch?v=' + videoId, 
-        download_url: downloadUrl, 
-        url: downloadUrl, 
+        download_url: mediaData.url, 
+        url: mediaData.url, 
         result: { 
           title: title, 
+          type: resolvedType,
+          quality: mediaData.quality,
           url: 'https://www.youtube.com/watch?v=' + videoId, 
-          download: downloadUrl, 
+          download: mediaData.url, 
           thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' 
         } 
       }, null, 2);
