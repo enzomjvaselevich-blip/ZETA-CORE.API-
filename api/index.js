@@ -103,9 +103,7 @@ async function fetchYoutubeMedia(videoId, type, quality) {
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
           
           if (type === 'audio') {
-            // Buscar formatos de audio puro (mimeType que contenga audio/)
             let audioFormats = allFormats.filter(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
-            // Ordenar por mayor bitrate si existe
             audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
             
             let audioFormat = audioFormats[0] || allFormats.find(f => f.url && f.mimeType && f.mimeType.includes('audio/'));
@@ -389,7 +387,7 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <span class="sub-item" onclick="switchTab('downloaders',this)">📥 Panel Descargas</span>
 <span class="sub-item" onclick="switchTab('search',this)">🔍 Playground Búsquedas</span>
 </div>
-<div class="sidebar-footer"><span>CYBERPUNK v3.6</span><span style="color:#00ff66">● ONLINE</span></div>
+<div class="sidebar-footer"><span>CYBERPUNK v3.7</span><span style="color:#00ff66">● ONLINE</span></div>
 </div>
 <div class="main-content"><div class="card-wrapper">
 <div id="guide" class="card active">
@@ -413,14 +411,18 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <h2>📥 Panel de Descargadores 🎬</h2>
 
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
-<div class="route-path-box"><span>Ruta: /youtube?query=&type=&quality=</span><button class="btn-copy-route" onclick="copiarRuta('/youtube?query=&type=video&quality=1080p')">Copiar Ruta</button></div>
+<div class="route-path-box"><span id="routeTextYoutube">Ruta: /youtube?query=&type=video&quality=1080p</span><button class="btn-copy-route" onclick="copiarRuta(document.getElementById('routeTextYoutube').innerText.replace('Ruta: ', ''))">Copiar Ruta</button></div>
 <h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube Media Engine (/youtube)</h3>
 <label>Enlace o término de búsqueda:</label>
 <input type="text" id="inputYoutube" placeholder="Ej: phonk music o https://youtu.be/...">
 <label>Tipo de multimedia:</label>
-<select id="selectYtType"><option value="video" selected>Video</option><option value="audio">Audio (MP3)</option></select>
+<select id="selectYtType" onchange="actualizarInterfazYoutube()"><option value="video" selected>Video</option><option value="audio">Audio (MP3)</option></select>
+
+<div id="groupQualityYoutube">
 <label>Calidad de Video:</label>
 <select id="selectYtQuality"><option value="1080p" selected>1080p (FHD)</option><option value="720p">720p (HD)</option><option value="480p">480p</option><option value="360p">360p</option></select>
+</div>
+
 <button class="btn btn-rgb" onclick="ejecutarYoutubeCustom()">🚀 PROCESAR YOUTUBE</button>
 <div id="jsonContainerYoutube" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYoutube')">Copiar</button><pre id="jsonOutputYoutube">Esperando...</pre></div>
 </div>
@@ -470,8 +472,21 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 function toggleSidebar(){document.getElementById('sidebar').classList.toggle('open');document.getElementById('overlay').classList.toggle('show')}
 function switchTab(tabId,el){document.querySelectorAll('.sub-item').forEach(function(e){e.classList.remove('active')});if(el)el.classList.add('active');document.querySelectorAll('.card').forEach(function(c){c.classList.remove('active')});document.getElementById(tabId).classList.add('active');history.pushState(null, '', '/docs');if(window.innerWidth<=900)toggleSidebar()}
 function copiarRuta(texto){navigator.clipboard.writeText(texto);alert('🔮 ¡Ruta copiada al portapapeles exitosamente!');}
+function actualizarInterfazYoutube(){
+  var type=document.getElementById('selectYtType').value;
+  var qualityGroup=document.getElementById('groupQualityYoutube');
+  var routeText=document.getElementById('routeTextYoutube');
+  if(type==='audio'){
+    qualityGroup.style.display='none';
+    routeText.innerText='Ruta: /ytmp3?query=';
+  } else {
+    qualityGroup.style.display='block';
+    var quality=document.getElementById('selectYtQuality').value;
+    routeText.innerText='Ruta: /youtube?query=&type=video&quality='+quality;
+  }
+}
 async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('⚠️ ¡Por favor ingresa un enlace o texto válido!');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='⚡ Procesando solicitud en el núcleo...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error de ejecución: '+e.message}}
-async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠️ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var res=await fetch('/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
+async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠️ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality;var res=await fetch(apiUrl);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
 async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('⚠️ ¡Escribe un término de búsqueda!');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='🔍 Buscando en la red...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('✨ ¡JSON copiado al portapapeles!')}
 </script>
