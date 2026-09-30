@@ -1,123 +1,9 @@
 const { URL } = require('url');
-const startTime = Date.now();
-const rateLimitMap = new Map();
-function applyRateLimit(ip, limit = 60, windowMs = 60000) {
-  const now = Date.now();
-  if (rateLimitMap.size > 1000) {
-    for (const [key, value] of rateLimitMap.entries()) {
-      if (now > value.resetTime) rateLimitMap.delete(key);
-    }
-  }
-  const record = rateLimitMap.get(ip) || { count: 0, resetTime: now + windowMs };
-  if (now > record.resetTime) {
-    record.count = 1;
-    record.resetTime = now + windowMs;
-  } else {
-    record.count++;
-  }
-  rateLimitMap.set(ip, record);
-  return record.count <= limit;
-}
-function createCombinedSignal(parentSignal, timeoutMs) {
-  const controller = new AbortController();
-  let timer = null;
-  if (timeoutMs && timeoutMs > 0) {
-    timer = setTimeout(() => {
-      const err = new Error('La solicitud excedió el tiempo límite de espera.');
-      err.statusCode = 504;
-      controller.abort(err);
-    }, timeoutMs);
-  }
-  if (parentSignal) {
-    if (parentSignal.aborted) {
-      controller.abort(parentSignal.reason);
-    } else {
-      parentSignal.addEventListener('abort', () => controller.abort(parentSignal.reason), { once: true });
-    }
-  }
-  return {
-    signal: controller.signal,
-    cleanup: () => { if (timer) clearTimeout(timer); }
-  };
-}
-async function readTextWithLimit(response, maxBytes = 5 * 1024 * 1024) {
-  const clHeader = response.headers.get('content-length');
-  if (clHeader !== null) {
-    const contentLength = parseInt(clHeader, 10);
-    if (isNaN(contentLength) || contentLength < 0 || contentLength > maxBytes) {
-      const err = new Error('El tamaño del contenido remoto supera el límite máximo permitido.');
-      err.statusCode = 413;
-      throw err;
-    }
-  }
-  if (response.body && typeof response.body.getReader === 'function') {
-    const reader = response.body.getReader();
-    const chunks = [];
-    let accumulated = 0;
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        accumulated += value.byteLength || value.length;
-        if (accumulated > maxBytes) {
-          try { await reader.cancel(); } catch (e) {}
-          const err = new Error('El flujo de datos remoto superó el límite de tamaño permitido.');
-          err.statusCode = 413;
-          throw err;
-        }
-        chunks.push(value);
-      }
-    } finally {
-      try { reader.releaseLock(); } catch (e) {}
-    }
-    return Buffer.concat(chunks).toString('utf-8');
-  }
-  if (clHeader === null) {
-    const err = new Error('No es posible verificar de forma segura el tamaño de la respuesta remota.');
-    err.statusCode = 400;
-    throw err;
-  }
-  const text = await response.text();
-  if (Buffer.byteLength(text, 'utf-8') > maxBytes) {
-    const err = new Error('El tamaño del texto remoto superó el límite máximo permitido.');
-    err.statusCode = 413;
-    throw err;
-  }
-  return text;
-}
-function isValidTikTokDomain(hostname) {
-  if (!hostname) return false;
-  const h = hostname.toLowerCase();
-  return h === 'tiktok.com' || h.endsWith('.tiktok.com') || h === 'douyin.com' || h.endsWith('.douyin.com');
-}
-function extractYoutubeVideoId(inputUrl) {
-  try {
-    const u = new URL(inputUrl);
-    if (u.protocol !== 'https:') return null;
-    if (u.port !== '') return null;
-    if (u.username !== '' || u.password !== '') return null;
-    const host = u.hostname.toLowerCase();
-    const validHosts = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be', 'www.youtu.be'];
-    if (!validHosts.includes(host)) return null;
-    let videoId = null;
-    if (host === 'youtu.be' || host === 'www.youtu.be') {
-      const match = u.pathname.match(/^\/([a-zA-Z0-9_-]{11})$/);
-      if (match) videoId = match[1];
-    } else {
-      if (u.pathname === '/watch') {
-        const v = u.searchParams.get('v');
-        if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) videoId = v;
-      } else {
-        const match = u.pathname.match(/^\/(shorts|v|embed)\/([a-zA-Z0-9_-]{11})$/);
-        if (match) videoId = match[2];
-      }
-    }
-    return videoId;
-  } catch (e) {
-    return null;
-  }
-}
-async function fetchRealSearchResults(query, limit, platform, parentSignal) {
+const { randomUUID } = require('node:crypto');
+const secureApi = require('./secure-api');
+
+
+async function fetchRealSearchResults(query, limit, platform) {
   let results = [];
   const searchUrl = platform === 'youtube'
     ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query)
@@ -468,78 +354,63 @@ async function fetchTikTokVideo(initialUrl, parentSignal) {
   throw maxRedirErr;
 }
 module.exports = async function handler(req, res) {
+  const requestId = randomUUID();
   const globalController = new AbortController();
   const globalTimeout = setTimeout(() => {
-    const err = new Error('Tiempo límite total de ejecución agotado.');
-    err.statusCode = 504;
-    globalController.abort(err);
+    globalController.abort(secureApi.apiError(504, 'Se agotó el tiempo total de la solicitud.'));
   }, 8500);
+  const sendJson = (statusCode, payload) => {
+    res.statusCode = statusCode;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.end(JSON.stringify(payload));
+  };
+
   try {
-    const clientIp = req.headers['x-real-ip'] || req.headers['x-vercel-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '127.0.0.1';
-    if (!applyRateLimit(clientIp)) {
-      res.statusCode = 429;
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.end(JSON.stringify({ ok: false, message: 'Límite de peticiones excedido (60/min). Nota: En instancias múltiples de serverless se requiere un backend de Rate Limit distribuido.' }));
-    }
+    const parsedUrl = new URL(req.url || '/', 'https://api.invalid');
+    let pathname = parsedUrl.pathname.replace(/^\/api(?=\/|$)/, '');
+    if (!pathname) pathname = '/';
+
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Strict-Transport-Security', 'max-age=63072000');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('X-Request-Id', requestId);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-      res.statusCode = 405;
       res.setHeader('Allow', 'GET, HEAD');
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.end(JSON.stringify({ ok: false, message: 'Método no permitido. Utiliza GET o HEAD.' }));
+      return sendJson(405, { ok: false, message: 'Método no permitido. Utiliza GET o HEAD.', requestId });
     }
     if (req.method === 'HEAD') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       return res.end();
     }
-    const host = req.headers['x-forwarded-host'] || req.headers.host || 'zeta-core-api.vercel.app';
-    const protocol = req.headers['x-forwarded-proto'] || 'https';
-    const parsedUrl = new URL(req.url, `${protocol}://${host}`);
-    let pathname = parsedUrl.pathname.replace(/^\/api/, '');
-    if (!pathname) pathname = '/';
+
     const rawQuery = parsedUrl.searchParams.get('query') || parsedUrl.searchParams.get('url') || '';
     if (rawQuery.length > 500) {
-      res.statusCode = 400;
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.end(JSON.stringify({ ok: false, message: 'La longitud de la consulta excede el máximo permitido (500 caracteres).' }));
+      return sendJson(400, { ok: false, message: 'La longitud de la consulta excede el máximo permitido (500 caracteres).', requestId });
     }
     const query = rawQuery.trim();
-    let type = 'video';
-    if (parsedUrl.searchParams.has('type')) {
-      const rawType = parsedUrl.searchParams.get('type').toLowerCase();
-      if (!['video', 'audio'].includes(rawType)) {
-        res.statusCode = 400;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        return res.end(JSON.stringify({ ok: false, message: 'El parámetro "type" es inválido. Valores permitidos: "video", "audio".' }));
-      }
-      type = rawType;
+    const type = (parsedUrl.searchParams.get('type') || 'video').toLowerCase();
+    if (!['video', 'audio'].includes(type)) {
+      return sendJson(400, { ok: false, message: 'El parámetro type debe ser video o audio.', requestId });
     }
-    let quality = '720p';
-    if (parsedUrl.searchParams.has('quality')) {
-      const rawQuality = parsedUrl.searchParams.get('quality').toLowerCase();
-      if (!['1080p', '720p', '480p', '360p'].includes(rawQuality)) {
-        res.statusCode = 400;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        return res.end(JSON.stringify({ ok: false, message: 'El parámetro "quality" es inválido. Valores permitidos: "1080p", "720p", "480p", "360p".' }));
-      }
-      quality = rawQuality;
+    const quality = (parsedUrl.searchParams.get('quality') || '720p').toLowerCase();
+    if (!['1080p', '720p', '480p', '360p'].includes(quality)) {
+      return sendJson(400, { ok: false, message: 'El parámetro quality debe ser 1080p, 720p, 480p o 360p.', requestId });
     }
-    let limit = 5;
-    if (parsedUrl.searchParams.has('limit')) {
-      const rawLimit = parsedUrl.searchParams.get('limit');
-      if (!/^\d+$/.test(rawLimit)) {
-        res.statusCode = 400;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        return res.end(JSON.stringify({ ok: false, message: 'El parámetro "limit" debe ser un número entero válido.' }));
-      }
-      const parsedLimit = parseInt(rawLimit, 10);
-      if (parsedLimit < 1 || parsedLimit > 20) {
-        res.statusCode = 400;
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        return res.end(JSON.stringify({ ok: false, message: 'El parámetro "limit" debe estar entre 1 y 20.' }));
-      }
-      limit = parsedLimit;
+    const rawLimit = parsedUrl.searchParams.get('limit');
+    if (rawLimit !== null && !/^\d+$/.test(rawLimit)) {
+      return sendJson(400, { ok: false, message: 'El parámetro limit debe ser un entero entre 1 y 20.', requestId });
     }
+    const limit = rawLimit === null ? 5 : Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+      return sendJson(400, { ok: false, message: 'El parámetro limit debe estar entre 1 y 20.', requestId });
+    }
+
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
     if (pathname === '/' || pathname === '') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(`<!DOCTYPE html>
@@ -570,7 +441,6 @@ p{color:#b8b2d1;font-size:15px;margin-bottom:30px;line-height:1.6;font-weight:60
 </html>`);
     }
     if (pathname === '/docs') {
-      const uptimeMinutes = Math.floor((Date.now() - startTime) / 60000);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(`<!DOCTYPE html>
 <html lang="es">
@@ -647,7 +517,8 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div class="creator-tag">By: FlextOFC ✨</div>
 <div class="stats-grid">
 <div class="stat-box"><div class="stat-label">Núcleo API</div><div class="stat-value" style="color:#00ff66">● Activo</div></div>
-<div class="stat-box"><div class="stat-label">Tiempo Instancia</div><div class="stat-value">${uptimeMinutes} min</div></div>
+  <div class="stat-box"><div class="stat-label">Endpoints</div><div class="stat-value">YouTube · TikTok · X</div></div>
+  <div class="stat-box"><div class="stat-label">Protección</div><div class="stat-value">Rate limit compartido</div></div>
 </div></div>
 <div style="text-align:center"><button class="btn btn-rgb" onclick="switchTab('downloaders', document.querySelectorAll('.sub-item')[1])">📄 EXPLORAR DOCUMENTACIÓN</button></div>
 </div>
@@ -728,115 +599,97 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
 </script>
 </body></html>`);
     }
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
+    res.setHeader('Cache-Control', 'no-store');
+    const rateLimit = await secureApi.enforceRateLimit(req);
+    res.setHeader('X-RateLimit-Remaining', String(rateLimit.remaining));
+    if (!rateLimit.success) {
+      res.setHeader('Retry-After', '60');
+      return sendJson(429, { ok: false, message: 'Límite de solicitudes excedido. Intenta de nuevo en un minuto.', requestId });
+    }
+
+    const parentSignal = globalController.signal;
     if (pathname === '/tiktok') {
-      if (!query) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta el parámetro url' }));
-      }
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro url.', requestId });
       try {
-        const data = await fetchTikTokVideo(query, globalController.signal);
-        return res.end(JSON.stringify(data, null, 2));
-      } catch (err) {
-        res.statusCode = err.statusCode || 500;
-        return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: err.message }));
+        return sendJson(200, await secureApi.fetchTikTokVideo(query, parentSignal));
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
+        return sendJson(error.statusCode || 502, { creator: 'Jxmpier207', status: false, message: secureApi.publicErrorMessage(error), requestId });
       }
     }
     if (pathname === '/ytsearch' || pathname === '/ttsearch') {
-      if (!query) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ ok: false, message: 'Falta el parámetro query' }));
-      }
-      const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query.', requestId });
       try {
-        const results = await fetchRealSearchResults(query, limit, platform, globalController.signal);
-        if (results.length === 0) {
-          res.statusCode = 404;
-          return res.end(JSON.stringify({ ok: false, message: 'No se encontraron resultados para la búsqueda solicitada.' }));
-        }
-        return res.end(JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2));
-      } catch (searchErr) {
-        res.statusCode = searchErr.statusCode || 502;
-        return res.end(JSON.stringify({ ok: false, message: searchErr.message }));
+        const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
+        const results = await secureApi.fetchRealSearchResults(query, limit, platform, parentSignal);
+        if (!results.length) return sendJson(404, { ok: false, message: 'No se encontraron resultados.', requestId });
+        return sendJson(200, { ok: true, source: platform, query, total_results: results.length, results, requestId });
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
+        return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
       }
     }
-    if (pathname === '/youtube' || pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
-      if (!query) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ ok: false, message: 'Falta el parámetro query o url' }));
-      }
-      let resolvedType = type;
-      if (pathname === '/ytmp3' || pathname === '/docs/download/ytmp3') resolvedType = 'audio';
-      if (pathname === '/ytmp4' || pathname === '/docs/download/ytmp4') resolvedType = 'video';
-      let title = query;
-      let videoId = null;
-      if (query.includes('http://') || query.includes('https://')) {
-        videoId = extractYoutubeVideoId(query);
-        if (!videoId) {
-          res.statusCode = 400;
-          return res.end(JSON.stringify({ ok: false, message: 'URL de YouTube no válida. Se requiere HTTPS, puerto estándar y ruta exacta (watch?v=, youtu.be/, shorts/, embed/).' }));
-        }
-      } else {
-        try {
-          const ytResults = await fetchRealSearchResults(query, 1, 'youtube', globalController.signal);
-          if (ytResults[0] && ytResults[0].videoId) {
-            title = ytResults[0].title || query;
-            videoId = ytResults[0].videoId;
-          } else {
-            res.statusCode = 404;
-            return res.end(JSON.stringify({ ok: false, message: 'No se encontró ningún video con ese término de búsqueda.' }));
-          }
-        } catch (searchErr) {
-          res.statusCode = searchErr.statusCode || 502;
-          return res.end(JSON.stringify({ ok: false, message: 'Error al realizar la búsqueda en YouTube: ' + searchErr.message }));
-        }
-      }
+
+    if (['/youtube', '/ytmp3', '/ytmp4', '/docs/download/ytmp3', '/docs/download/ytmp4'].includes(pathname)) {
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el parámetro query o url.', requestId });
       try {
-        let mediaData = await fetchYoutubeMedia(videoId, resolvedType, quality, globalController.signal);
-        return res.end(JSON.stringify({
+        const resolvedType = pathname.endsWith('ytmp3') ? 'audio' : pathname.endsWith('ytmp4') ? 'video' : type;
+        let title = query;
+        let videoId;
+        if (/^https?:\/\//i.test(query)) {
+          videoId = secureApi.extractYoutubeVideoId(query);
+          if (!videoId) return sendJson(400, { ok: false, message: 'La URL de YouTube no es válida; se requiere HTTPS y una ruta reconocida.', requestId });
+        } else if (/^[a-z][a-z\d+.-]*:\/\//i.test(query)) {
+          return sendJson(400, { ok: false, message: 'Solo se aceptan enlaces HTTPS de YouTube.', requestId });
+        } else {
+          const results = await secureApi.fetchRealSearchResults(query, 1, 'youtube', parentSignal);
+          if (!results[0]) return sendJson(404, { ok: false, message: 'No se encontró un video para la búsqueda.', requestId });
+          title = results[0].title || query;
+          videoId = results[0].videoId;
+        }
+        const media = await secureApi.fetchYoutubeMedia(videoId, resolvedType, quality, parentSignal);
+        const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+        return sendJson(200, {
           ok: true,
-          endpoint: 'youtube',
+          endpoint: resolvedType === 'audio' ? 'ytmp3' : 'youtube',
           type: resolvedType,
-          quality: mediaData.quality,
+          quality: media.quality,
           input: query,
-          title: title,
-          videoId: videoId,
-          resolved_url: 'https://www.youtube.com/watch?v=' + videoId,
-          download_url: mediaData.url,
-          url: mediaData.url,
+          title,
+          videoId,
+          resolved_url: videoUrl,
+          download_url: media.url,
+          url: media.url,
           result: {
-            title: title,
+            title,
             type: resolvedType,
-            quality: mediaData.quality,
-            url: 'https://www.youtube.com/watch?v=' + videoId,
-            download: mediaData.url,
-            thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg'
-          }
-        }, null, 2));
-      } catch (mediaErr) {
-        res.statusCode = mediaErr.statusCode || 502;
-        return res.end(JSON.stringify({ ok: false, message: mediaErr.message }));
+            quality: media.quality,
+            url: videoUrl,
+            download: media.url,
+            thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          },
+          requestId,
+        });
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
+        return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
       }
     }
     if (pathname === '/xvideo') {
-      if (!query) {
-        res.statusCode = 400;
-        return res.end(JSON.stringify({ ok: false, message: 'Falta el enlace del tweet' }));
-      }
+      if (!query) return sendJson(400, { ok: false, message: 'Falta el enlace de la publicación.', requestId });
       try {
-        const data = await fetchXVideo(query, globalController.signal);
-        return res.end(JSON.stringify(data, null, 2));
-      } catch (xErr) {
-        res.statusCode = xErr.statusCode || 502;
-        return res.end(JSON.stringify({ ok: false, message: xErr.message }));
+        return sendJson(200, { ...(await secureApi.fetchXVideo(query, parentSignal)), requestId });
+      } catch (error) {
+        console.error(JSON.stringify({ requestId, route: pathname, statusCode: error.statusCode || 502, message: error.message }));
+        return sendJson(error.statusCode || 502, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
       }
     }
-    res.statusCode = 404;
-    res.end(JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + pathname }));
+
+    return sendJson(404, { ok: false, message: 'Endpoint no encontrado.', requestId });
   } catch (error) {
-    console.error('Unhandled Server Error:', error);
-    res.statusCode = error.statusCode || 500;
-    res.end(JSON.stringify({ ok: false, message: error.statusCode ? error.message : 'Error interno del servidor.' }));
+    console.error(JSON.stringify({ requestId, statusCode: error.statusCode || 500, message: error.message }));
+    return sendJson(error.statusCode || 500, { ok: false, message: secureApi.publicErrorMessage(error), requestId });
   } finally {
     clearTimeout(globalTimeout);
   }
