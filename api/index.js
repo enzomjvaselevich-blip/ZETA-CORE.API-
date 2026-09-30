@@ -1,15 +1,11 @@
 const { URL } = require('url');
-
 const startTime = Date.now();
-
 const rateLimitMap = new Map();
 function applyRateLimit(ip, limit = 60, windowMs = 60000) {
   const now = Date.now();
-  if (rateLimitMap.size > 500) {
+  if (rateLimitMap.size > 1000) {
     for (const [key, value] of rateLimitMap.entries()) {
-      if (now > value.resetTime) {
-        rateLimitMap.delete(key);
-      }
+      if (now > value.resetTime) rateLimitMap.delete(key);
     }
   }
   const record = rateLimitMap.get(ip) || { count: 0, resetTime: now + windowMs };
@@ -22,96 +18,125 @@ function applyRateLimit(ip, limit = 60, windowMs = 60000) {
   rateLimitMap.set(ip, record);
   return record.count <= limit;
 }
-
-async function readTextWithLimit(response, maxBytes = 5 * 1024 * 1024) {
-  const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
-  if (contentLength > maxBytes) {
-    throw new Error('La respuesta del servidor remoto superó el límite de tamaño permitido.');
+function createCombinedSignal(parentSignal, timeoutMs) {
+  const controller = new AbortController();
+  let timer = null;
+  if (timeoutMs && timeoutMs > 0) {
+    timer = setTimeout(() => {
+      const err = new Error('La solicitud excedió el tiempo límite de espera.');
+      err.statusCode = 504;
+      controller.abort(err);
+    }, timeoutMs);
   }
-
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      controller.abort(parentSignal.reason);
+    } else {
+      parentSignal.addEventListener('abort', () => controller.abort(parentSignal.reason), { once: true });
+    }
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => { if (timer) clearTimeout(timer); }
+  };
+}
+async function readTextWithLimit(response, maxBytes = 5 * 1024 * 1024) {
+  const clHeader = response.headers.get('content-length');
+  if (clHeader !== null) {
+    const contentLength = parseInt(clHeader, 10);
+    if (isNaN(contentLength) || contentLength < 0 || contentLength > maxBytes) {
+      const err = new Error('El tamaño del contenido remoto supera el límite máximo permitido.');
+      err.statusCode = 413;
+      throw err;
+    }
+  }
   if (response.body && typeof response.body.getReader === 'function') {
     const reader = response.body.getReader();
     const chunks = [];
     let accumulated = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      accumulated += value.byteLength || value.length;
-      if (accumulated > maxBytes) {
-        try { await reader.cancel(); } catch (e) {}
-        throw new Error('La respuesta del servidor remoto superó el límite de tamaño permitido.');
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        accumulated += value.byteLength || value.length;
+        if (accumulated > maxBytes) {
+          try { await reader.cancel(); } catch (e) {}
+          const err = new Error('El flujo de datos remoto superó el límite de tamaño permitido.');
+          err.statusCode = 413;
+          throw err;
+        }
+        chunks.push(value);
       }
-      chunks.push(value);
+    } finally {
+      try { reader.releaseLock(); } catch (e) {}
     }
     return Buffer.concat(chunks).toString('utf-8');
   }
-
+  if (clHeader === null) {
+    const err = new Error('No es posible verificar de forma segura el tamaño de la respuesta remota.');
+    err.statusCode = 400;
+    throw err;
+  }
   const text = await response.text();
-  const actualBytes = Buffer.byteLength(text, 'utf-8');
-  if (actualBytes > maxBytes) {
-    throw new Error('La respuesta del servidor remoto superó el límite de tamaño permitido.');
+  if (Buffer.byteLength(text, 'utf-8') > maxBytes) {
+    const err = new Error('El tamaño del texto remoto superó el límite máximo permitido.');
+    err.statusCode = 413;
+    throw err;
   }
   return text;
 }
-
 function isValidTikTokDomain(hostname) {
   if (!hostname) return false;
   const h = hostname.toLowerCase();
   return h === 'tiktok.com' || h.endsWith('.tiktok.com') || h === 'douyin.com' || h.endsWith('.douyin.com');
 }
-
 function extractYoutubeVideoId(inputUrl) {
   try {
     const u = new URL(inputUrl);
+    if (u.protocol !== 'https:') return null;
+    if (u.port !== '') return null;
+    if (u.username !== '' || u.password !== '') return null;
     const host = u.hostname.toLowerCase();
-    const allowedHosts = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtu.be', 'music.youtube.com'];
-    
-    if (!allowedHosts.includes(host)) return null;
-
+    const validHosts = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be', 'www.youtu.be'];
+    if (!validHosts.includes(host)) return null;
     let videoId = null;
-    if (host.includes('youtu.be')) {
-      videoId = u.pathname.slice(1).split('/')[0];
-    } else if (u.pathname === '/watch') {
-      videoId = u.searchParams.get('v');
-    } else if (u.pathname.startsWith('/shorts/') || u.pathname.startsWith('/v/') || u.pathname.startsWith('/embed/')) {
-      const parts = u.pathname.split('/');
-      videoId = parts[2];
+    if (host === 'youtu.be' || host === 'www.youtu.be') {
+      const match = u.pathname.match(/^\/([a-zA-Z0-9_-]{11})$/);
+      if (match) videoId = match[1];
+    } else {
+      if (u.pathname === '/watch') {
+        const v = u.searchParams.get('v');
+        if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) videoId = v;
+      } else {
+        const match = u.pathname.match(/^\/(shorts|v|embed)\/([a-zA-Z0-9_-]{11})$/);
+        if (match) videoId = match[2];
+      }
     }
-
-    if (videoId && /^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-      return videoId;
-    }
-    return null;
+    return videoId;
   } catch (e) {
     return null;
   }
 }
-
-async function fetchRealSearchResults(query, limit, platform) {
+async function fetchRealSearchResults(query, limit, platform, parentSignal) {
   let results = [];
-  const searchUrl = platform === 'youtube' 
-    ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query) 
+  const searchUrl = platform === 'youtube'
+    ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query)
     : 'https://www.tiktok.com/search?q=' + encodeURIComponent(query);
-    
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6000);
-
+  const { signal, cleanup } = createCombinedSignal(parentSignal, 5000);
   try {
-    const response = await fetch(searchUrl, { 
-      signal: controller.signal,
-      headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
-        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' 
-      } 
+    const response = await fetch(searchUrl, {
+      signal: signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+      }
     });
-
     if (!response.ok) {
-      throw new Error(`Servidor de ${platform} respondió con código HTTP ${response.status}`);
+      const err = new Error(`El servicio de ${platform} respondió con un error remoto HTTP ${response.status}`);
+      err.statusCode = 502;
+      throw err;
     }
-    
-    const html = await readTextWithLimit(response, 5 * 1024 * 1024);
-    
+    const html = await readTextWithLimit(response, 4 * 1024 * 1024);
     if (platform === 'youtube') {
       const match = html.match(/var ytInitialData = ({[\s\S]*?});<\/script>/) || html.match(/window\["ytInitialData"\] = ({[\s\S]*?});<\/script>/);
       if (match && match[1]) {
@@ -139,7 +164,6 @@ async function fetchRealSearchResults(query, limit, platform) {
           }
         } catch (parseErr) {}
       }
-      
       if (results.length === 0) {
         const regex = /"videoId":"([a-zA-Z0-9_-]{11})"/g;
         let sm;
@@ -163,34 +187,35 @@ async function fetchRealSearchResults(query, limit, platform) {
         if (results.length >= limit) break;
       }
     }
-
     return results;
   } catch (e) {
-    throw new Error(`Fallo al consultar ${platform}: ${e.message}`);
+    if (e.name === 'AbortError' || e.statusCode === 504) {
+      const err = new Error(`Tiempo de espera agotado al consultar ${platform}.`);
+      err.statusCode = 504;
+      throw err;
+    }
+    if (!e.statusCode) e.statusCode = 502;
+    throw e;
   } finally {
-    clearTimeout(timeout);
+    cleanup();
   }
 }
-
-async function fetchYoutubeMedia(videoId, type, quality) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 6000);
-
+async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
+  const { signal, cleanup } = createCombinedSignal(parentSignal, 5000);
   try {
-    const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
-      signal: controller.signal,
-      headers: { 
+    const response = await fetch('https://www.youtube.com/watch?v=' + videoId, {
+      signal: signal,
+      headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept-Language': 'es-ES,es;q=0.9'
-      } 
+      }
     });
-
     if (!response.ok) {
-      throw new Error(`YouTube devolvió un código de estado HTTP ${response.status}`);
+      const err = new Error(`YouTube respondió con un estado de error HTTP ${response.status}`);
+      err.statusCode = 502;
+      throw err;
     }
-
-    const html = await readTextWithLimit(response, 5 * 1024 * 1024);
-
+    const html = await readTextWithLimit(response, 4 * 1024 * 1024);
     const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/) || html.match(/var ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/);
     if (playerMatch && playerMatch[1]) {
       try {
@@ -198,11 +223,9 @@ async function fetchYoutubeMedia(videoId, type, quality) {
         const streamingData = playerData.streamingData;
         if (streamingData) {
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
-          
           if (type === 'audio') {
             let audioFormats = allFormats.filter(f => f.mimeType && f.mimeType.includes('audio/') && f.url);
             audioFormats.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-            
             let audioFormat = audioFormats[0] || allFormats.find(f => f.url && f.mimeType && f.mimeType.includes('audio/'));
             if (audioFormat && audioFormat.url) {
               return { url: audioFormat.url, quality: 'audio-128kbps', bitrate: audioFormat.bitrate || 128000 };
@@ -213,7 +236,6 @@ async function fetchYoutubeMedia(videoId, type, quality) {
             else if (quality === '480p') targetHeight = 480;
             else if (quality === '360p') targetHeight = 360;
             else if (quality === '720p') targetHeight = 720;
-
             let videoFormat = allFormats.find(f => f.height === targetHeight && f.url && f.mimeType.includes('video/'));
             if (!videoFormat) {
               videoFormat = allFormats.find(f => f.url && f.mimeType.includes('video/'));
@@ -225,55 +247,70 @@ async function fetchYoutubeMedia(videoId, type, quality) {
         }
       } catch (err) {}
     }
+    const notFoundErr = new Error("No se pudo extraer el enlace directo de descarga desde el contenido de YouTube.");
+    notFoundErr.statusCode = 404;
+    throw notFoundErr;
   } catch (e) {
-    throw new Error(`Error obteniendo media de YouTube: ${e.message}`);
+    if (e.name === 'AbortError' || e.statusCode === 504) {
+      const err = new Error("Tiempo de espera agotado al comunicarse con YouTube.");
+      err.statusCode = 504;
+      throw err;
+    }
+    if (!e.statusCode) e.statusCode = 502;
+    throw e;
   } finally {
-    clearTimeout(timeout);
+    cleanup();
   }
-  
-  throw new Error("No se pudo extraer el enlace de descarga multimedia de YouTube.");
 }
-
-async function fetchXVideo(url) {
-  const result = { ok: false, endpoint: 'xvideo', input: url, tweet_id: null, videos: [], thumbnail: null, text: null };
+async function fetchXVideo(inputUrl, parentSignal) {
+  let tweetId = null;
   try {
-    const idMatch = url.match(/(?:twitter\.com|x\.com)\/(?:i\/status|[^\/]+\/status)\/(\d+)/i) || url.match(/status\/(\d+)/i) || url.match(/(\d{15,20})/);
-    if (!idMatch) {
-      result.message = 'No se pudo extraer el ID del tweet de la URL';
-      return result;
+    const u = new URL(inputUrl);
+    if (u.protocol !== 'https:') {
+      const err = new Error('Solo se aceptan URLs con protocolo HTTPS.');
+      err.statusCode = 400;
+      throw err;
     }
-    const tweetId = idMatch[1];
-    result.tweet_id = tweetId;
-    const headers = { 
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 
-      'Accept-Language': 'en-US,en;q=0.9,es;q=0.8' 
-    };
-    let html = '';
-    const tryUrls = [ 'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en', 'https://x.com/i/status/' + tweetId ];
-    
-    for (let i = 0; i < tryUrls.length; i++) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3500);
-      try {
-        const response = await fetch(tryUrls[i], { headers, signal: controller.signal });
-        if (response.ok) {
-          html = await readTextWithLimit(response, 3 * 1024 * 1024);
-          if (html.length > 300) break;
-        }
-      } catch (e) {
-      } finally {
-        clearTimeout(timeout);
-      }
+    const host = u.hostname.toLowerCase();
+    const validXHosts = ['twitter.com', 'www.twitter.com', 'x.com', 'www.x.com'];
+    if (!validXHosts.includes(host)) {
+      const err = new Error('Dominio no permitido. Debe ser x.com o twitter.com.');
+      err.statusCode = 400;
+      throw err;
     }
-    
-    if (!html || html.length < 200) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3500);
-      try {
-        const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers, signal: controller.signal });
-        if (fxRes.ok) {
-          const textResp = await readTextWithLimit(fxRes, 2 * 1024 * 1024);
+    const match = u.pathname.match(/(?:status|i\/status)\/(\d{15,20})/);
+    if (match) tweetId = match[1];
+  } catch (e) {
+    if (e.statusCode) throw e;
+    const err = new Error('Estructura de URL de X/Twitter inválida.');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!tweetId) {
+    const err = new Error('No se pudo extraer un ID de tweet válido desde la URL proporcionada.');
+    err.statusCode = 400;
+    throw err;
+  }
+  const result = { ok: true, endpoint: 'xvideo', input: inputUrl, tweet_id: tweetId, videos: [], thumbnail: null, text: null };
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,es;q=0.8'
+  };
+  let lastError = null;
+  const tryUrls = ['https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en', 'https://api.fxtwitter.com/status/' + tweetId];
+  for (let i = 0; i < tryUrls.length; i++) {
+    if (parentSignal && parentSignal.aborted) {
+      const err = new Error('Límite de tiempo global alcanzado para la solicitud.');
+      err.statusCode = 504;
+      throw err;
+    }
+    const { signal, cleanup } = createCombinedSignal(parentSignal, 3000);
+    try {
+      const response = await fetch(tryUrls[i], { headers, signal });
+      if (response.ok) {
+        const textResp = await readTextWithLimit(response, 2 * 1024 * 1024);
+        if (tryUrls[i].includes('fxtwitter')) {
           const fxData = JSON.parse(textResp);
           if (fxData.tweet) {
             result.text = fxData.tweet.text || null;
@@ -281,109 +318,116 @@ async function fetchXVideo(url) {
             const vids = fxData.tweet.media?.videos || [];
             for (let v = 0; v < vids.length; v++) {
               if (vids[v].url) result.videos.push({ url: vids[v].url, quality: vids[v].quality || 'unknown', type: 'video/mp4' });
-              if (vids[v].variants) {
-                for (let k = 0; k < vids[v].variants.length; k++) {
-                  const variant = vids[v].variants[k];
-                  if (variant.url && variant.content_type === 'video/mp4') {
-                    result.videos.push({ url: variant.url, quality: variant.quality || (variant.bitrate ? Math.round(variant.bitrate / 1000) + 'k' : 'unknown'), bitrate: variant.bitrate || null, type: 'video/mp4' });
-                  }
-                }
-              }
+            }
+          }
+        } else {
+          const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
+          const found = {};
+          let m;
+          while ((m = mp4Regex.exec(textResp)) !== null) {
+            let clean = m[0].replace(/\\u0026/g, '&').replace(/\\"/g, '').replace(/\\/g, '');
+            if (!found[clean] && clean.includes('video.twimg.com')) {
+              found[clean] = true;
+              result.videos.push({ url: clean, quality: clean.includes('720') ? '720p' : clean.includes('360') ? '360p' : clean.includes('480') ? '480p' : 'unknown', type: 'video/mp4' });
             }
           }
         }
-      } catch (e) {
-      } finally {
-        clearTimeout(timeout);
-      }
-    }
-    
-    if (result.videos.length === 0 && html) {
-      const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
-      const found = {};
-      let m;
-      while ((m = mp4Regex.exec(html)) !== null) {
-        let clean = m[0].replace(/\\u0026/g, '&').replace(/\\"/g, '').replace(/\\/g, '');
-        if (!found[clean] && clean.includes('video.twimg.com')) {
-          found[clean] = true;
-          result.videos.push({ url: clean, quality: clean.includes('720') ? '720p' : clean.includes('360') ? '360p' : clean.includes('480') ? '480p' : 'unknown', type: 'video/mp4' });
+        if (result.videos.length > 0) {
+          cleanup();
+          break;
         }
       }
+    } catch (e) {
+      lastError = e;
+    } finally {
+      cleanup();
     }
-    if (result.videos.length > 0) {
-      result.ok = true;
-      result.total_videos = result.videos.length;
-      result.best = result.videos[0].url;
-    } else {
-      result.message = 'No se encontraron videos en este tweet';
-    }
-  } catch (e) {
-    result.message = 'Error en scraper: ' + e.message;
   }
-  return result;
+  if (result.videos.length > 0) {
+    result.total_videos = result.videos.length;
+    result.best = result.videos[0].url;
+    return result;
+  }
+  if (lastError && (lastError.name === 'AbortError' || lastError.statusCode === 504)) {
+    const err = new Error('Tiempo de espera agotado al consultar los servidores de X/Twitter.');
+    err.statusCode = 504;
+    throw err;
+  }
+  if (lastError && lastError.statusCode && lastError.statusCode !== 404) {
+    throw lastError;
+  }
+  const notFoundErr = new Error('No se encontraron videos disponibles en el tweet indicado.');
+  notFoundErr.statusCode = 404;
+  throw notFoundErr;
 }
-
-async function fetchTikTokVideo(initialUrl) {
+async function fetchTikTokVideo(initialUrl, parentSignal) {
   let currentUrl = initialUrl;
   let redirects = 0;
   const maxRedirects = 5;
-
   while (redirects < maxRedirects) {
     let parsedUrl;
     try {
       parsedUrl = new URL(currentUrl);
     } catch (err) {
-      throw new Error('La URL proporcionada no es válida.');
+      const e = new Error('La URL proporcionada no es válida.');
+      e.statusCode = 400;
+      throw e;
     }
-
-    if (parsedUrl.protocol !== 'https:' || !isValidTikTokDomain(parsedUrl.hostname)) {
-      throw new Error('Bloqueo de seguridad: Solo se permiten conexiones HTTPS hacia dominios oficiales de TikTok.');
+    if (parsedUrl.protocol !== 'https:' || !isValidTikTokDomain(parsedUrl.hostname) || parsedUrl.port !== '' || parsedUrl.username !== '' || parsedUrl.password !== '') {
+      const e = new Error('Bloqueo de seguridad: Solo se permiten conexiones HTTPS directas a dominios oficiales de TikTok.');
+      e.statusCode = 400;
+      throw e;
     }
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
-
+    const { signal, cleanup } = createCombinedSignal(parentSignal, 4500);
     try {
-      const response = await fetch(currentUrl, { 
-        signal: controller.signal,
+      const response = await fetch(currentUrl, {
+        signal: signal,
         redirect: 'manual',
-        headers: { 
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 
-          'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' 
-        } 
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+        }
       });
-
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         const location = response.headers.get('location');
-        if (!location) throw new Error('Redirección recibida sin encabezado Location.');
+        if (!location) {
+          const e = new Error('Redirección remota sin encabezado Location válido.');
+          e.statusCode = 502;
+          throw e;
+        }
         currentUrl = new URL(location, currentUrl).href;
         redirects++;
         continue;
       }
-
       if (!response.ok) {
-        throw new Error(`Servidor de TikTok respondió con estado HTTP ${response.status}`);
+        const e = new Error(`El servidor de TikTok respondió con estado HTTP ${response.status}`);
+        e.statusCode = 502;
+        throw e;
       }
-
-      const html = await readTextWithLimit(response, 5 * 1024 * 1024);
-
+      const html = await readTextWithLimit(response, 4 * 1024 * 1024);
       let vData = null;
       const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
       if (univMatch) {
-        const univ = JSON.parse(univMatch[1]);
-        vData = univ.__DEFAULT_SCOPE__['webapp.video-detail']?.itemInfo?.itemStruct;
+        try {
+          const univ = JSON.parse(univMatch[1]);
+          vData = univ.__DEFAULT_SCOPE__['webapp.video-detail']?.itemInfo?.itemStruct;
+        } catch (pErr) {}
       } else {
         const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
         if (sigiMatch) {
-          const sigi = JSON.parse(sigiMatch[1]);
-          const itemId = Object.keys(sigi.ItemModule)[0];
-          vData = sigi.ItemModule[itemId];
+          try {
+            const sigi = JSON.parse(sigiMatch[1]);
+            const itemId = Object.keys(sigi.ItemModule)[0];
+            vData = sigi.ItemModule[itemId];
+          } catch (pErr) {}
         }
       }
-
-      if (!vData) throw new Error("No se pudo extraer la información del video de TikTok.");
-
+      if (!vData) {
+        const e = new Error("No se encontraron metadatos de video válidos en el contenido de TikTok.");
+        e.statusCode = 404;
+        throw e;
+      }
       return {
         creator: "Jxmpier207",
         status: true,
@@ -394,9 +438,6 @@ async function fetchTikTokVideo(initialUrl) {
           title: vData.desc || "",
           cover: vData.video?.cover || "",
           duration: vData.video?.duration || 0,
-          size: "",
-          hd_size: "",
-          images: [],
           links: {
             hd: vData.video?.playAddr || "",
             sd: vData.video?.playAddr || "",
@@ -407,67 +448,62 @@ async function fetchTikTokVideo(initialUrl) {
             username: vData.author?.uniqueId || "",
             nickname: vData.author?.nickname || "",
             avatar: vData.author?.avatarLarger || ""
-          },
-          music: {
-            title: vData.music?.title || "",
-            author: vData.music?.authorName || "",
-            cover: vData.music?.coverLarge || ""
-          },
-          stats: {
-            views: vData.stats?.playCount || 0,
-            likes: vData.stats?.diggCount || 0,
-            comments: vData.stats?.commentCount || 0,
-            shares: vData.stats?.shareCount || 0,
-            downloads: vData.stats?.downloadCount || 0
           }
         }
       };
+    } catch (e) {
+      if (e.name === 'AbortError' || e.statusCode === 504) {
+        const err = new Error('Tiempo de espera agotado al conectar con TikTok.');
+        err.statusCode = 504;
+        throw err;
+      }
+      if (!e.statusCode) e.statusCode = 502;
+      throw e;
     } finally {
-      clearTimeout(timeout);
+      cleanup();
     }
   }
-
-  throw new Error('Se superó el límite máximo de redirecciones.');
+  const maxRedirErr = new Error('Se superó el límite máximo de redirecciones permitidas.');
+  maxRedirErr.statusCode = 400;
+  throw maxRedirErr;
 }
-
 module.exports = async function handler(req, res) {
+  const globalController = new AbortController();
+  const globalTimeout = setTimeout(() => {
+    const err = new Error('Tiempo límite total de ejecución agotado.');
+    err.statusCode = 504;
+    globalController.abort(err);
+  }, 8500);
   try {
-    const clientIp = req.headers['x-real-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '127.0.0.1';
+    const clientIp = req.headers['x-real-ip'] || req.headers['x-vercel-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '127.0.0.1';
     if (!applyRateLimit(clientIp)) {
       res.statusCode = 429;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.end(JSON.stringify({ ok: false, message: 'Límite de peticiones excedido (60/min). Intenta de nuevo en un minuto.' }));
+      return res.end(JSON.stringify({ ok: false, message: 'Límite de peticiones excedido (60/min). Nota: En instancias múltiples de serverless se requiere un backend de Rate Limit distribuido.' }));
     }
-
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       res.statusCode = 405;
       res.setHeader('Allow', 'GET, HEAD');
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       return res.end(JSON.stringify({ ok: false, message: 'Método no permitido. Utiliza GET o HEAD.' }));
     }
-
     if (req.method === 'HEAD') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       return res.end();
     }
-
     const host = req.headers['x-forwarded-host'] || req.headers.host || 'zeta-core-api.vercel.app';
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const parsedUrl = new URL(req.url, `${protocol}://${host}`);
-    
     let pathname = parsedUrl.pathname.replace(/^\/api/, '');
     if (!pathname) pathname = '/';
-
     const rawQuery = parsedUrl.searchParams.get('query') || parsedUrl.searchParams.get('url') || '';
-    
     if (rawQuery.length > 500) {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       return res.end(JSON.stringify({ ok: false, message: 'La longitud de la consulta excede el máximo permitido (500 caracteres).' }));
     }
     const query = rawQuery.trim();
-
     let type = 'video';
     if (parsedUrl.searchParams.has('type')) {
       const rawType = parsedUrl.searchParams.get('type').toLowerCase();
@@ -478,7 +514,6 @@ module.exports = async function handler(req, res) {
       }
       type = rawType;
     }
-
     let quality = '720p';
     if (parsedUrl.searchParams.has('quality')) {
       const rawQuality = parsedUrl.searchParams.get('quality').toLowerCase();
@@ -489,7 +524,6 @@ module.exports = async function handler(req, res) {
       }
       quality = rawQuality;
     }
-
     let limit = 5;
     if (parsedUrl.searchParams.has('limit')) {
       const rawLimit = parsedUrl.searchParams.get('limit');
@@ -506,7 +540,6 @@ module.exports = async function handler(req, res) {
       }
       limit = parsedLimit;
     }
-
     if (pathname === '/' || pathname === '') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(`<!DOCTYPE html>
@@ -519,8 +552,7 @@ module.exports = async function handler(req, res) {
 <style>
 @keyframes rgbGlow{0%{border-color:#00f0ff;box-shadow:0 0 30px rgba(0,240,255,.5),inset 0 0 20px rgba(0,240,255,.2)}33%{border-color:#b026ff;box-shadow:0 0 30px rgba(176,38,255,.5),inset 0 0 20px rgba(176,38,255,.2)}66%{border-color:#00ff66;box-shadow:0 0 30px rgba(0,255,102,.5),inset 0 0 20px rgba(0,255,102,.2)}100%{border-color:#00f0ff;box-shadow:0 0 30px rgba(0,240,255,.5),inset 0 0 20px rgba(0,240,255,.2)}}
 @keyframes rgbText{0%{color:#00f0ff;text-shadow:0 0 12px rgba(0,240,255,.8)}33%{color:#b026ff;text-shadow:0 0 12px rgba(176,38,255,.8)}66%{color:#00ff66;text-shadow:0 0 12px rgba(0,255,102,.8)}100%{color:#00f0ff;text-shadow:0 0 12px rgba(0,240,255,.8)}}
-body{margin:0;padding:0;width:100vw;height:100vh;display:flex;justify-content:center;align-items:center;font-family:'Rajdhani',sans-serif;overflow:hidden;
-background:linear-gradient(rgba(5,3,10,0.75),rgba(5,3,10,0.85)), url('https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?q=80&w=1920&auto=format&fit=crop') no-repeat center center fixed;background-size:cover;}
+body{margin:0;padding:0;width:100vw;height:100vh;display:flex;justify-content:center;align-items:center;font-family:'Rajdhani',sans-serif;overflow:hidden;background:linear-gradient(rgba(5,3,10,0.75),rgba(5,3,10,0.85)), url('https://images.unsplash.com/photo-1607604276583-eef5d076aa5f?q=80&w=1920&auto=format&fit=crop') no-repeat center center fixed;background-size:cover;}
 .welcome-card{background:rgba(10,8,18,0.85);backdrop-filter:blur(16px);border:2px solid #00f0ff;border-radius:28px;padding:45px 35px;max-width:480px;width:90%;text-align:center;box-shadow:0 25px 60px rgba(0,0,0,.9);animation:rgbGlow 6s infinite alternate}
 h1{font-family:'Orbitron',sans-serif;font-size:30px;font-weight:900;animation:rgbText 5s infinite;margin-bottom:15px;letter-spacing:2px}
 p{color:#b8b2d1;font-size:15px;margin-bottom:30px;line-height:1.6;font-weight:600}
@@ -537,7 +569,6 @@ p{color:#b8b2d1;font-size:15px;margin-bottom:30px;line-height:1.6;font-weight:60
 </body>
 </html>`);
     }
-
     if (pathname === '/docs') {
       const uptimeMinutes = Math.floor((Date.now() - startTime) / 60000);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -620,10 +651,8 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 </div></div>
 <div style="text-align:center"><button class="btn btn-rgb" onclick="switchTab('downloaders', document.querySelectorAll('.sub-item')[1])">📄 EXPLORAR DOCUMENTACIÓN</button></div>
 </div>
-
 <div id="downloaders" class="card">
 <h2>📥 Panel de Descargadores 🎬</h2>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span id="routeTextYoutube">Ruta: /youtube?query=&type=video&quality=1080p</span><button class="btn-copy-route" onclick="copiarRuta(document.getElementById('routeTextYoutube').innerText.replace('Ruta: ', ''))">Copiar Ruta</button></div>
 <h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube Media Engine (/youtube)</h3>
@@ -631,16 +660,13 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <input type="text" id="inputYoutube" placeholder="Ej: phonk music o https://youtu.be/...">
 <label>Tipo de multimedia:</label>
 <select id="selectYtType" onchange="actualizarInterfazYoutube()"><option value="video" selected>Video</option><option value="audio">Audio (MP3)</option></select>
-
 <div id="groupQualityYoutube">
 <label>Calidad de Video:</label>
 <select id="selectYtQuality"><option value="1080p" selected>1080p (FHD)</option><option value="720p">720p (HD)</option><option value="480p">480p</option><option value="360p">360p</option></select>
 </div>
-
 <button class="btn btn-rgb" onclick="ejecutarYoutubeCustom()">🚀 PROCESAR YOUTUBE</button>
 <div id="jsonContainerYoutube" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYoutube')">Copiar</button><pre id="jsonOutputYoutube">Esperando...</pre></div>
 </div>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(255,50,100,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span>Ruta: /tiktok?url=</span><button class="btn-copy-route" onclick="copiarRuta('/tiktok?url=')">Copiar Ruta</button></div>
 <h3 style="color:#ff3264;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">TikTok Video Extractor (/tiktok)</h3>
@@ -649,7 +675,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <button class="btn btn-rgb" onclick="ejecutarAccion('tiktok','inputTikTok','jsonContainerTikTok','jsonOutputTikTok')">✨ EXTRAER TIKTOK</button>
 <div id="jsonContainerTikTok" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputTikTok')">Copiar</button><pre id="jsonOutputTikTok">Esperando...</pre></div>
 </div>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,255,102,.35);padding:18px;border-radius:16px">
 <div class="route-path-box"><span>Ruta: /xvideo?url=</span><button class="btn-copy-route" onclick="copiarRuta('/xvideo?url=')">Copiar Ruta</button></div>
 <h3 style="color:#00ff66;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">X / Twitter Video Extractor (/xvideo)</h3>
@@ -659,10 +684,8 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div id="jsonContainerXVideo" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputXVideo')">Copiar</button><pre id="jsonOutputXVideo">Esperando...</pre></div>
 </div>
 </div>
-
 <div id="search" class="card">
 <h2>🔍 Playground de Búsquedas 🔎</h2>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(0,240,255,.35);padding:18px;border-radius:16px;margin-bottom:18px">
 <div class="route-path-box"><span>Ruta: /ytsearch?query=&limit=</span><button class="btn-copy-route" onclick="copiarRuta('/ytsearch?query=&limit=')">Copiar Ruta</button></div>
 <h3 style="color:#00f0ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">YouTube Search Engine (/ytsearch)</h3>
@@ -671,7 +694,6 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <button class="btn btn-rgb" onclick="ejecutarBusqueda('ytsearch')">🚀 BUSCAR EN YOUTUBE</button>
 <div id="jsonContainerYt" class="json-box"><button class="btn-copy" onclick="copiarJson('jsonOutputYt')">Copiar</button><pre id="jsonOutputYt">Esperando...</pre></div>
 </div>
-
 <div style="background:rgba(16,12,28,.65);border:1px solid rgba(176,38,255,.35);padding:18px;border-radius:16px">
 <div class="route-path-box"><span>Ruta: /ttsearch?query=&limit=</span><button class="btn-copy-route" onclick="copiarRuta('/ttsearch?query=&limit=')">Copiar Ruta</button></div>
 <h3 style="color:#b026ff;margin-top:0;font-size:16px;font-family:'Orbitron',sans-serif">TikTok Search Engine (/ttsearch)</h3>
@@ -699,74 +721,64 @@ function actualizarInterfazYoutube(){
     routeText.innerText='Ruta: /youtube?query=&type=video&quality='+quality;
   }
 }
-async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('⚠️ ¡Por favor ingresa un enlace o texto válido!');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='⚡ Procesando solicitud en el núcleo...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error de ejecución: '+e.message}}
-async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠️️ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality;var res=await fetch(apiUrl);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
+async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('⚠️️ ¡Por favor ingresa un enlace o texto válido!');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='⚡ Procesando solicitud en el núcleo...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error de ejecución: '+e.message}}
+async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality;var res=await fetch(apiUrl);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
 async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('⚠ ¡Escribe un término de búsqueda!');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='🔍 Buscando en la red...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('✨ ¡JSON copiado al portapapeles!')}
 </script>
 </body></html>`);
     }
-
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-
     if (pathname === '/tiktok') {
       if (!query) {
         res.statusCode = 400;
         return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta el parámetro url' }));
       }
       try {
-        const data = await fetchTikTokVideo(query);
+        const data = await fetchTikTokVideo(query, globalController.signal);
         return res.end(JSON.stringify(data, null, 2));
       } catch (err) {
-        res.statusCode = 400;
+        res.statusCode = err.statusCode || 500;
         return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: err.message }));
       }
     }
-
     if (pathname === '/ytsearch' || pathname === '/ttsearch') {
       if (!query) {
         res.statusCode = 400;
         return res.end(JSON.stringify({ ok: false, message: 'Falta el parámetro query' }));
       }
       const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
-      
       try {
-        const results = await fetchRealSearchResults(query, limit, platform);
-        
+        const results = await fetchRealSearchResults(query, limit, platform, globalController.signal);
         if (results.length === 0) {
           res.statusCode = 404;
           return res.end(JSON.stringify({ ok: false, message: 'No se encontraron resultados para la búsqueda solicitada.' }));
         }
-
         return res.end(JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2));
       } catch (searchErr) {
-        res.statusCode = 502;
+        res.statusCode = searchErr.statusCode || 502;
         return res.end(JSON.stringify({ ok: false, message: searchErr.message }));
       }
     }
-
     if (pathname === '/youtube' || pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
       if (!query) {
         res.statusCode = 400;
         return res.end(JSON.stringify({ ok: false, message: 'Falta el parámetro query o url' }));
       }
-      
       let resolvedType = type;
       if (pathname === '/ytmp3' || pathname === '/docs/download/ytmp3') resolvedType = 'audio';
       if (pathname === '/ytmp4' || pathname === '/docs/download/ytmp4') resolvedType = 'video';
-
       let title = query;
       let videoId = null;
-
       if (query.includes('http://') || query.includes('https://')) {
         videoId = extractYoutubeVideoId(query);
         if (!videoId) {
           res.statusCode = 400;
-          return res.end(JSON.stringify({ ok: false, message: 'URL de YouTube no válida. Se requiere una ruta o formato de video válido (watch?v=, youtu.be/, shorts/, embed/).' }));
+          return res.end(JSON.stringify({ ok: false, message: 'URL de YouTube no válida. Se requiere HTTPS, puerto estándar y ruta exacta (watch?v=, youtu.be/, shorts/, embed/).' }));
         }
       } else {
         try {
-          const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
+          const ytResults = await fetchRealSearchResults(query, 1, 'youtube', globalController.signal);
           if (ytResults[0] && ytResults[0].videoId) {
             title = ytResults[0].title || query;
             videoId = ytResults[0].videoId;
@@ -775,53 +787,57 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
             return res.end(JSON.stringify({ ok: false, message: 'No se encontró ningún video con ese término de búsqueda.' }));
           }
         } catch (searchErr) {
-          res.statusCode = 502;
+          res.statusCode = searchErr.statusCode || 502;
           return res.end(JSON.stringify({ ok: false, message: 'Error al realizar la búsqueda en YouTube: ' + searchErr.message }));
         }
       }
-
       try {
-        let mediaData = await fetchYoutubeMedia(videoId, resolvedType, quality);
-        
-        return res.end(JSON.stringify({ 
-          ok: true, 
-          endpoint: 'youtube', 
-          type: resolvedType, 
-          quality: mediaData.quality, 
-          input: query, 
-          title: title, 
-          videoId: videoId, 
-          resolved_url: 'https://www.youtube.com/watch?v=' + videoId, 
-          download_url: mediaData.url, 
-          url: mediaData.url, 
-          result: { 
-            title: title, 
+        let mediaData = await fetchYoutubeMedia(videoId, resolvedType, quality, globalController.signal);
+        return res.end(JSON.stringify({
+          ok: true,
+          endpoint: 'youtube',
+          type: resolvedType,
+          quality: mediaData.quality,
+          input: query,
+          title: title,
+          videoId: videoId,
+          resolved_url: 'https://www.youtube.com/watch?v=' + videoId,
+          download_url: mediaData.url,
+          url: mediaData.url,
+          result: {
+            title: title,
             type: resolvedType,
             quality: mediaData.quality,
-            url: 'https://www.youtube.com/watch?v=' + videoId, 
-            download: mediaData.url, 
-            thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' 
-          } 
+            url: 'https://www.youtube.com/watch?v=' + videoId,
+            download: mediaData.url,
+            thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg'
+          }
         }, null, 2));
       } catch (mediaErr) {
-        res.statusCode = 502;
+        res.statusCode = mediaErr.statusCode || 502;
         return res.end(JSON.stringify({ ok: false, message: mediaErr.message }));
       }
     }
-
     if (pathname === '/xvideo') {
       if (!query) {
         res.statusCode = 400;
         return res.end(JSON.stringify({ ok: false, message: 'Falta el enlace del tweet' }));
       }
-      const data = await fetchXVideo(query);
-      return res.end(JSON.stringify(data, null, 2));
+      try {
+        const data = await fetchXVideo(query, globalController.signal);
+        return res.end(JSON.stringify(data, null, 2));
+      } catch (xErr) {
+        res.statusCode = xErr.statusCode || 502;
+        return res.end(JSON.stringify({ ok: false, message: xErr.message }));
+      }
     }
-
     res.statusCode = 404;
     res.end(JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + pathname }));
   } catch (error) {
-    res.statusCode = 500;
-    res.end(JSON.stringify({ ok: false, error: 'Error interno del servidor: ' + error.message }));
+    console.error('Unhandled Server Error:', error);
+    res.statusCode = error.statusCode || 500;
+    res.end(JSON.stringify({ ok: false, message: error.statusCode ? error.message : 'Error interno del servidor.' }));
+  } finally {
+    clearTimeout(globalTimeout);
   }
 };
