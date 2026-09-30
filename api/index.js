@@ -187,10 +187,10 @@ async function fetchTikTokVideo(url) {
     const html = await response.text();
     totalBytesReceived += html.length;
     let vData = null;
-    const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)</);
+    const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
     if (univMatch) {
       const univ = JSON.parse(univMatch[1]);
-      vData = univ.__DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct;
+      vData = univ.__DEFAULT_SCOPE__['webapp.video-detail']?.itemInfo?.itemStruct;
     } else {
       const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
       if (sigiMatch) {
