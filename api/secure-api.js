@@ -316,28 +316,15 @@ function getYoutubeFormatUrl(format) {
   }
 }
 
-async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
-  const { text } = await fetchTextSafe(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, {
-    allowedHosts: ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'],
-    parentSignal,
-    timeoutMs: 4500,
-  });
-  const match = text.match(/(?:ytInitialPlayerResponse|var ytInitialPlayerResponse)\s*=\s*({[\s\S]*?})\s*;?\s*<\/script>/);
-  if (!match) throw apiError(502, 'YouTube no proporcionó metadatos de reproducción compatibles.');
-  const playerData = parseJson(match[1]);
-  const formats = [
-    ...(playerData.streamingData?.adaptiveFormats || []),
-    ...(playerData.streamingData?.formats || []),
-  ];
+function selectYoutubeMediaFormat(formats, type, quality) {
   const available = formats
     .map((format) => ({ format, url: getYoutubeFormatUrl(format) }))
     .filter((item) => item.url);
 
   if (type === 'audio') {
-    const candidates = available
-      .filter(({ format }) => format.mimeType?.startsWith('audio/'))
-      .sort((a, b) => (b.format.bitrate || 0) - (a.format.bitrate || 0));
-    const selected = candidates[0];
+    const selected = available
+      .filter(({ format }) => format.mime_type?.startsWith('audio/'))
+      .sort((a, b) => (b.format.bitrate || 0) - (a.format.bitrate || 0))[0];
     if (selected) {
       return {
         url: selected.url,
@@ -347,9 +334,11 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     }
   } else {
     const requestedHeight = Number.parseInt(quality, 10) || 720;
-    const candidates = available.filter(({ format }) => format.mimeType?.startsWith('video/'));
+    const candidates = available.filter(({ format }) => format.mime_type?.startsWith('video/'));
     const selected = candidates.find(({ format }) => format.height === requestedHeight) ||
-      candidates.sort((a, b) => Math.abs((a.format.height || 0) - requestedHeight) - Math.abs((b.format.height || 0) - requestedHeight))[0];
+      candidates.filter(({ format }) => format.height <= requestedHeight)
+        .sort((a, b) => (b.format.height || 0) - (a.format.height || 0))[0] ||
+      candidates.sort((a, b) => (a.format.height || 0) - (b.format.height || 0))[0];
     if (selected) {
       return {
         url: selected.url,
@@ -358,7 +347,65 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       };
     }
   }
-  throw apiError(502, 'No se encontró un enlace directo de medios compatible.');
+  throw apiError(502, 'YOUTUBE_FORMAT_UNAVAILABLE', 'No hay un enlace multimedia compatible disponible para este video.');
+}
+
+async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
+  if (parentSignal?.aborted) throw apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
+
+  const controller = new AbortController();
+  const timeoutError = apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
+  const abortFromParent = () => controller.abort(parentSignal.reason || timeoutError);
+  const timer = setTimeout(() => controller.abort(timeoutError), 6500);
+  if (parentSignal) parentSignal.addEventListener('abort', abortFromParent, { once: true });
+  const fetchWithTimeout = (input, init = {}) => {
+    let requestUrl;
+    try {
+      requestUrl = new URL(input instanceof URL ? input.href : typeof input === 'string' ? input : input.url);
+    } catch {
+      throw apiError(502, 'YOUTUBE_UPSTREAM_BLOCKED', 'YouTube intentó consultar un destino no permitido.');
+    }
+    if (
+      requestUrl.protocol !== 'https:' || requestUrl.username || requestUrl.password || requestUrl.port ||
+      !['youtube.com', 'www.youtube.com'].includes(requestUrl.hostname.toLowerCase())
+    ) {
+      throw apiError(502, 'YOUTUBE_UPSTREAM_BLOCKED', 'YouTube intentó consultar un destino no permitido.');
+    }
+
+    const requestController = new AbortController();
+    const abortRequest = (signal) => requestController.abort(signal.reason);
+    const abortFromDeadline = () => abortRequest(controller.signal);
+    const abortFromRequest = () => abortRequest(init.signal);
+    if (parentSignal?.aborted) abortFromParent();
+    if (controller.signal.aborted) abortFromDeadline();
+    else controller.signal.addEventListener('abort', abortFromDeadline, { once: true });
+    if (init.signal?.aborted) abortFromRequest();
+    else init.signal?.addEventListener('abort', abortFromRequest, { once: true });
+    return fetch(input, { ...init, signal: requestController.signal }).finally(() => {
+      controller.signal.removeEventListener('abort', abortFromDeadline);
+      init.signal?.removeEventListener('abort', abortFromRequest);
+    });
+  };
+
+  try {
+    const { Innertube } = await import('youtubei.js');
+    const youtube = await Innertube.create({ fetch: fetchWithTimeout });
+    const playerData = await youtube.getBasicInfo(videoId, { client: 'IOS' });
+    const formats = [
+      ...(playerData.streaming_data?.formats || []),
+      ...(playerData.streaming_data?.adaptive_formats || []),
+    ];
+    return selectYoutubeMediaFormat(formats, type, quality);
+  } catch (error) {
+    if (error.statusCode) throw error;
+    if (parentSignal?.aborted || controller.signal.aborted) {
+      throw apiError(504, 'REQUEST_TIMEOUT', 'YouTube tardó demasiado en responder.');
+    }
+    throw apiError(502, 'YOUTUBE_UPSTREAM_FAILED', 'YouTube no pudo proporcionar los formatos multimedia en este momento.');
+  } finally {
+    clearTimeout(timer);
+    if (parentSignal) parentSignal.removeEventListener('abort', abortFromParent);
+  }
 }
 
 function validTikTokUrl(input) {
@@ -583,5 +630,6 @@ module.exports = {
   fetchTikTokVideo,
   fetchXVideo,
   fetchYoutubeMedia,
+  selectYoutubeMediaFormat,
   publicErrorMessage,
 };

@@ -36,6 +36,32 @@ test('acepta únicamente formatos HTTPS reconocidos de YouTube', () => {
   assert.equal(secureApi.extractYoutubeVideoId('https://youtu.be/dQw4w9WgXcQ/extra'), null);
 });
 
+test('elige formatos directos válidos de YouTube según calidad y tipo', () => {
+  const formats = [
+    { mime_type: 'video/mp4', height: 360, bitrate: 700000, url: 'https://rr1.googlevideo.com/videoplayback?itag=18' },
+    { mime_type: 'video/mp4', height: 720, bitrate: 1800000, url: 'https://rr1.googlevideo.com/videoplayback?itag=22' },
+    { mime_type: 'audio/mp4', bitrate: 128000, url: 'https://rr1.googlevideo.com/videoplayback?itag=140' },
+    { mime_type: 'video/mp4', height: 1080, bitrate: 4000000, url: 'https://attacker.example/video.mp4' },
+  ];
+
+  assert.deepEqual(secureApi.selectYoutubeMediaFormat(formats, 'video', '720p'), {
+    url: formats[1].url,
+    quality: '720p',
+    bitrate: 1800000,
+  });
+  assert.deepEqual(secureApi.selectYoutubeMediaFormat(formats, 'video', '1080p'), {
+    url: formats[1].url,
+    quality: '720p',
+    bitrate: 1800000,
+  });
+  assert.deepEqual(secureApi.selectYoutubeMediaFormat(formats, 'audio', '720p'), {
+    url: formats[2].url,
+    quality: 'audio-128kbps',
+    bitrate: 128000,
+  });
+  assert.throws(() => secureApi.selectYoutubeMediaFormat([], 'audio', '720p'), { statusCode: 502 });
+});
+
 test('valida estrictamente la ruta y el ID de X', () => {
   assert.equal(secureApi.extractTweetId('https://x.com/example/status/123456789012345'), '123456789012345');
   assert.equal(secureApi.extractTweetId('https://twitter.com/i/status/123456789012345'), '123456789012345');
