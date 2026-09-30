@@ -1,247 +1,266 @@
-const { URL } = require('url');
+import { URL } from 'url';
+
 const startTime = Date.now();
 let totalRequests = 0;
 let totalBytesReceived = 0;
 let totalBytesSent = 0;
 
 async function fetchRealSearchResults(query, limit, platform) {
-let results = [];
-try {
-const searchUrl = platform === 'youtube' ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query) : 'https://www.tiktok.com/search?q=' + encodeURIComponent(query);
-const response = await fetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' } });
-const html = await response.text();
-totalBytesReceived += html.length;
-if (platform === 'youtube') {
-const match = html.match(/var ytInitialData = ({[\s\S*.*?]);<\/script>/) || html.match(/window\["ytInitialData"\] = ({[\s\S*.*?});<\/script>/);
-if (match && match[1]) {
-try {
-const json = JSON.parse(match[1]);
-const contents = json.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents;
-if (contents) {
-for (let i = 0; i < contents.length; i++) {
-const itemRenderer = contents[i]?.itemSectionRenderer?.contents;
-if (itemRenderer) {
-for (let j = 0; j < itemRenderer.length; j++) {
-const video = itemRenderer[j]?.videoRenderer;
-if (video && video.videoId) {
-const vidId = video.videoId;
-const title = video.title?.runs?.[0]?.text || query;
-if (!results.some(function(r) { return r.videoId === vidId; })) {
-results.push({ type: 'video', videoId: vidId, title: title, url: 'https://www.youtube.com/watch?v=' + vidId });
-}
-if (results.length >= limit) break;
-}
-}
-}
-if (results.length >= limit) break;
-}
-}
-} catch (parseErr) {}
-}
-if (results.length === 0) {
-const regex = /"videoId":"([a-zA-Z0-9_-]{11})"/g;
-let sm;
-while ((sm = regex.exec(html)) !== null) {
-const vidId = sm[1];
-if (!results.some(function(r) { return r.videoId === vidId; }) && vidId !== 'dQw4w9WgXcQ') {
-results.push({ type: 'video', videoId: vidId, title: query + ' - Resultado #' + (results.length + 1), url: 'https://www.youtube.com/watch?v=' + vidId });
-}
-if (results.length >= limit) break;
-}
-}
-} else {
-const regex = /"id":"(\d+)","desc":"([^"]+)"/g;
-let match;
-while ((match = regex.exec(html)) !== null) {
-const tId = match[1];
-const desc = match[2];
-if (!results.some(function(r) { return r.videoId === tId; })) {
-results.push({ type: 'video', videoId: tId, title: desc, url: 'https://www.tiktok.com/video/' + tId });
-}
-if (results.length >= limit) break;
-}
-}
-} catch (e) {
-console.error('Error interno en scraping:', e.message);
-}
-if (results.length === 0 && platform === 'youtube') {
-results.push({ type: 'video', videoId: '3JZ_D3ELwOQ', title: query + ' - Audio Oficial', url: 'https://www.youtube.com/watch?v=3JZ_D3ELwOQ' });
-}
-return results;
+  let results = [];
+  try {
+    const searchUrl = platform === 'youtube' 
+      ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query) 
+      : 'https://www.tiktok.com/search?q=' + encodeURIComponent(query);
+      
+    const response = await fetch(searchUrl, { 
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' 
+      } 
+    });
+    
+    const html = await response.text();
+    totalBytesReceived += html.length;
+    
+    if (platform === 'youtube') {
+      const match = html.match(/var ytInitialData = ({[\s\S]*?});<\/script>/) || html.match(/window\["ytInitialData"\] = ({[\s\S]*?});<\/script>/);
+      if (match && match[1]) {
+        try {
+          const json = JSON.parse(match[1]);
+          const contents = json.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents;
+          if (contents) {
+            for (let i = 0; i < contents.length; i++) {
+              const itemRenderer = contents[i]?.itemSectionRenderer?.contents;
+              if (itemRenderer) {
+                for (let j = 0; j < itemRenderer.length; j++) {
+                  const video = itemRenderer[j]?.videoRenderer;
+                  if (video && video.videoId) {
+                    const vidId = video.videoId;
+                    const title = video.title?.runs?.[0]?.text || query;
+                    if (!results.some(r => r.videoId === vidId)) {
+                      results.push({ type: 'video', videoId: vidId, title: title, url: 'https://www.youtube.com/watch?v=' + vidId });
+                    }
+                    if (results.length >= limit) break;
+                  }
+                }
+              }
+              if (results.length >= limit) break;
+            }
+          }
+        } catch (parseErr) {}
+      }
+      
+      if (results.length === 0) {
+        const regex = /"videoId":"([a-zA-Z0-9_-]{11})"/g;
+        let sm;
+        while ((sm = regex.exec(html)) !== null) {
+          const vidId = sm[1];
+          if (!results.some(r => r.videoId === vidId) && vidId !== 'dQw4w9WgXcQ') {
+            results.push({ type: 'video', videoId: vidId, title: query + ' - Resultado #' + (results.length + 1), url: 'https://www.youtube.com/watch?v=' + vidId });
+          }
+          if (results.length >= limit) break;
+        }
+      }
+    } else {
+      const regex = /"id":"(\d+)","desc":"([^"]+)"/g;
+      let match;
+      while ((match = regex.exec(html)) !== null) {
+        const tId = match[1];
+        const desc = match[2];
+        if (!results.some(r => r.videoId === tId)) {
+          results.push({ type: 'video', videoId: tId, title: desc, url: 'https://www.tiktok.com/video/' + tId });
+        }
+        if (results.length >= limit) break;
+      }
+    }
+  } catch (e) {
+    console.error('Error en scraping:', e.message);
+  }
+  
+  if (results.length === 0 && platform === 'youtube') {
+    results.push({ type: 'video', videoId: '3JZ_D3ELwOQ', title: query + ' - Audio Oficial', url: 'https://www.youtube.com/watch?v=3JZ_D3ELwOQ' });
+  }
+  return results;
 }
 
 async function fetchDirectYoutubeAudio(videoId) {
-try {
-const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' } });
-const html = await response.text();
-totalBytesReceived += html.length;
-const streamRegex = /"audio\/mp4"[^}]*?"url":"([^"]+)"/g;
-let match = streamRegex.exec(html);
-if (match && match[1]) return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
-const fallbackRegex = /"url":"(https:\/\/[^"]+signature[^"]+)"/g;
-while ((match = fallbackRegex.exec(html)) !== null) {
-let foundUrl = match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
-if (foundUrl.indexOf('googlevideo.com') !== -1 && (foundUrl.indexOf('aitags') !== -1 || foundUrl.indexOf('mime=audio') !== -1)) {
-return foundUrl;
-}
-}
-} catch (e) {}
-return '';
+  try {
+    const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' } 
+    });
+    const html = await response.text();
+    totalBytesReceived += html.length;
+    const streamRegex = /"audio\/mp4"[^}]*?"url":"([^"]+)"/g;
+    let match = streamRegex.exec(html);
+    if (match && match[1]) return match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+    const fallbackRegex = /"url":"(https:\/\/[^"]+signature[^"]+)"/g;
+    while ((match = fallbackRegex.exec(html)) !== null) {
+      let foundUrl = match[1].replace(/\\u0026/g, '&').replace(/\\/g, '');
+      if (foundUrl.includes('googlevideo.com') && (foundUrl.includes('aitags') || foundUrl.includes('mime=audio'))) {
+        return foundUrl;
+      }
+    }
+  } catch (e) {}
+  return '';
 }
 
 async function fetchXVideo(url) {
-const result = { ok: false, endpoint: 'xvideo', input: url, tweet_id: null, videos: [], thumbnail: null, text: null };
-try {
-const idMatch = url.match(/(?:twitter\.com|x\.com)\/(?:i\/status|[^\/]+\/status)\/(\d+)/i) || url.match(/status\/(\d+)/i) || url.match(/(\d{15,20})/);
-if (!idMatch) {
-result.message = 'No se pudo extraer el ID del tweet';
-return result;
-}
-const tweetId = idMatch[1];
-result.tweet_id = tweetId;
-const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9,es;q=0.8' };
-let html = '';
-const tryUrls = [ 'https://x.com/i/status/' + tweetId, 'https://twitter.com/i/status/' + tweetId, 'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en' ];
-for (let i = 0; i < tryUrls.length; i++) {
-try {
-const response = await fetch(tryUrls[i], { headers: headers });
-if (response.ok) {
-html = await response.text();
-totalBytesReceived += html.length;
-if (html.length > 500) break;
-}
-} catch (e) {}
-}
-if (!html || html.length < 200) {
-try {
-const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers: headers });
-if (fxRes.ok) {
-const fxData = await fxRes.json();
-totalBytesReceived += JSON.stringify(fxData).length;
-if (fxData.tweet) {
-result.text = fxData.tweet.text || null;
-result.thumbnail = (fxData.tweet.media && fxData.tweet.media.photos && fxData.tweet.media.photos[0] && fxData.tweet.media.photos[0].url) || (fxData.tweet.media && fxData.tweet.media.videos && fxData.tweet.media.videos[0] && fxData.tweet.media.videos[0].thumbnail_url) || null;
-const vids = (fxData.tweet.media && fxData.tweet.media.videos) || [];
-for (let v = 0; v < vids.length; v++) {
-if (vids[v].url) result.videos.push({ url: vids[v].url, quality: vids[v].quality || 'unknown', type: 'video/mp4' });
-if (vids[v].variants) {
-for (let k = 0; k < vids[v].variants.length; k++) {
-const variant = vids[v].variants[k];
-if (variant.url && variant.content_type === 'video/mp4') {
-result.videos.push({ url: variant.url, quality: variant.quality || (variant.bitrate ? Math.round(variant.bitrate / 1000) + 'k' : 'unknown'), bitrate: variant.bitrate || null, type: 'video/mp4' });
-}
-}
-}
-}
-}
-}
-} catch (e) {}
-}
-if (result.videos.length === 0 && html) {
-const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
-const found = {};
-let m;
-while ((m = mp4Regex.exec(html)) !== null) {
-let clean = m[0].replace(/\\u0026/g, '&').replace(/\\"/g, '').replace(/\\/g, '');
-if (!found[clean] && clean.indexOf('video.twimg.com') !== -1) {
-found[clean] = true;
-result.videos.push({ url: clean, quality: clean.indexOf('720') !== -1 ? '720p' : clean.indexOf('360') !== -1 ? '360p' : clean.indexOf('480') !== -1 ? '480p' : 'unknown', type: 'video/mp4' });
-}
-}
-}
-if (result.videos.length > 0) {
-result.ok = true;
-result.total_videos = result.videos.length;
-result.best = result.videos[0].url;
-} else {
-result.message = 'No se encontraron videos en este tweet';
-}
-} catch (e) {
-result.message = 'Error en scraper: ' + e.message;
-}
-return result;
+  const result = { ok: false, endpoint: 'xvideo', input: url, tweet_id: null, videos: [], thumbnail: null, text: null };
+  try {
+    const idMatch = url.match(/(?:twitter\.com|x\.com)\/(?:i\/status|[^\/]+\/status)\/(\d+)/i) || url.match(/status\/(\d+)/i) || url.match(/(\d{15,20})/);
+    if (!idMatch) {
+      result.message = 'No se pudo extraer el ID del tweet';
+      return result;
+    }
+    const tweetId = idMatch[1];
+    result.tweet_id = tweetId;
+    const headers = { 
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 
+      'Accept-Language': 'en-US,en;q=0.9,es;q=0.8' 
+    };
+    let html = '';
+    const tryUrls = [ 'https://x.com/i/status/' + tweetId, 'https://twitter.com/i/status/' + tweetId, 'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en' ];
+    for (let i = 0; i < tryUrls.length; i++) {
+      try {
+        const response = await fetch(tryUrls[i], { headers });
+        if (response.ok) {
+          html = await response.text();
+          totalBytesReceived += html.length;
+          if (html.length > 500) break;
+        }
+      } catch (e) {}
+    }
+    if (!html || html.length < 200) {
+      try {
+        const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers });
+        if (fxRes.ok) {
+          const fxData = await fxRes.json();
+          totalBytesReceived += JSON.stringify(fxData).length;
+          if (fxData.tweet) {
+            result.text = fxData.tweet.text || null;
+            result.thumbnail = (fxData.tweet.media?.photos?.[0]?.url) || (fxData.tweet.media?.videos?.[0]?.thumbnail_url) || null;
+            const vids = fxData.tweet.media?.videos || [];
+            for (let v = 0; v < vids.length; v++) {
+              if (vids[v].url) result.videos.push({ url: vids[v].url, quality: vids[v].quality || 'unknown', type: 'video/mp4' });
+              if (vids[v].variants) {
+                for (let k = 0; k < vids[v].variants.length; k++) {
+                  const variant = vids[v].variants[k];
+                  if (variant.url && variant.content_type === 'video/mp4') {
+                    result.videos.push({ url: variant.url, quality: variant.quality || (variant.bitrate ? Math.round(variant.bitrate / 1000) + 'k' : 'unknown'), bitrate: variant.bitrate || null, type: 'video/mp4' });
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {}
+    }
+    if (result.videos.length === 0 && html) {
+      const mp4Regex = /https:\/\/video\.twimg\.com\/[^"'\s\\]+\.mp4[^"'\s\\]*/g;
+      const found = {};
+      let m;
+      while ((m = mp4Regex.exec(html)) !== null) {
+        let clean = m[0].replace(/\\u0026/g, '&').replace(/\\"/g, '').replace(/\\/g, '');
+        if (!found[clean] && clean.includes('video.twimg.com')) {
+          found[clean] = true;
+          result.videos.push({ url: clean, quality: clean.includes('720') ? '720p' : clean.includes('360') ? '360p' : clean.includes('480') ? '480p' : 'unknown', type: 'video/mp4' });
+        }
+      }
+    }
+    if (result.videos.length > 0) {
+      result.ok = true;
+      result.total_videos = result.videos.length;
+      result.best = result.videos[0].url;
+    } else {
+      result.message = 'No se encontraron videos en este tweet';
+    }
+  } catch (e) {
+    result.message = 'Error en scraper: ' + e.message;
+  }
+  return result;
 }
 
 async function fetchTikTokVideo(url) {
-try {
-const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' } });
-const html = await response.text();
-totalBytesReceived += html.length;
-let vData = null;
-const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)</);
-if (univMatch) {
-const univ = JSON.parse(univMatch[1]);
-vData = univ.__DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct;
-} else {
-const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
-if (sigiMatch) {
-const sigi = JSON.parse(sigiMatch[1]);
-const itemId = Object.keys(sigi.ItemModule)[0];
-vData = sigi.ItemModule[itemId];
-}
-}
-if (!vData) throw new Error("No data found");
-return {
-creator: "Jxmpier207",
-status: true,
-data: {
-id: vData.id || "",
-url: url,
-type: "video",
-title: vData.desc || "",
-cover: vData.video?.cover || "",
-duration: vData.video?.duration || 0,
-size: "",
-hd_size: "",
-images: [],
-links: {
-hd: vData.video?.playAddr || "",
-sd: vData.video?.playAddr || "",
-wm: vData.video?.downloadAddr || "",
-mp3: vData.music?.playUrl || ""
-},
-author: {
-username: vData.author?.uniqueId || "",
-nickname: vData.author?.nickname || "",
-avatar: vData.author?.avatarLarger || ""
-},
-music: {
-title: vData.music?.title || "",
-author: vData.music?.authorName || "",
-cover: vData.music?.coverLarge || ""
-},
-stats: {
-views: vData.stats?.playCount || 0,
-likes: vData.stats?.diggCount || 0,
-comments: vData.stats?.commentCount || 0,
-shares: vData.stats?.shareCount || 0,
-downloads: vData.stats?.downloadCount || 0
-}
-}
-};
-} catch (e) {
-return { creator: "Jxmpier207", status: false, message: e.message };
-}
-}
-
-module.exports = async function handler(req, res) {
-totalRequests++;
-const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
-const protocol = req.headers['x-forwarded-proto'] || 'https';
-const parsedUrl = new URL(req.url, `${protocol}://${host}`);
-const query = parsedUrl.searchParams.get('query');
-const limitParam = parseInt(parsedUrl.searchParams.get('limit')) || 5;
-const limit = Math.min(Math.max(limitParam, 1), 20);
-
-if (parsedUrl.pathname === '/') {
-res.writeHead(302, { 'Location': '/docs' });
-return res.end();
+  try {
+    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' } });
+    const html = await response.text();
+    totalBytesReceived += html.length;
+    let vData = null;
+    const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)</);
+    if (univMatch) {
+      const univ = JSON.parse(univMatch[1]);
+      vData = univ.__DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct;
+    } else {
+      const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
+      if (sigiMatch) {
+        const sigi = JSON.parse(sigiMatch[1]);
+        const itemId = Object.keys(sigi.ItemModule)[0];
+        vData = sigi.ItemModule[itemId];
+      }
+    }
+    if (!vData) throw new Error("No data found");
+    return {
+      creator: "Jxmpier207",
+      status: true,
+      data: {
+        id: vData.id || "",
+        url: url,
+        type: "video",
+        title: vData.desc || "",
+        cover: vData.video?.cover || "",
+        duration: vData.video?.duration || 0,
+        size: "",
+        hd_size: "",
+        images: [],
+        links: {
+          hd: vData.video?.playAddr || "",
+          sd: vData.video?.playAddr || "",
+          wm: vData.video?.downloadAddr || "",
+          mp3: vData.music?.playUrl || ""
+        },
+        author: {
+          username: vData.author?.uniqueId || "",
+          nickname: vData.author?.nickname || "",
+          avatar: vData.author?.avatarLarger || ""
+        },
+        music: {
+          title: vData.music?.title || "",
+          author: vData.music?.authorName || "",
+          cover: vData.music?.coverLarge || ""
+        },
+        stats: {
+          views: vData.stats?.playCount || 0,
+          likes: vData.stats?.diggCount || 0,
+          comments: vData.stats?.commentCount || 0,
+          shares: vData.stats?.shareCount || 0,
+          downloads: vData.stats?.downloadCount || 0
+        }
+      }
+    };
+  } catch (e) {
+    return { creator: "Jxmpier207", status: false, message: e.message };
+  }
 }
 
-if (parsedUrl.pathname === '/docs') {
-const uptimeMinutes = Math.floor((Date.now() - startTime) / 60000);
-res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-return res.end(`<!DOCTYPE html>
+export default async function handler(req, res) {
+  totalRequests++;
+  const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+  const protocol = req.headers['x-forwarded-proto'] || 'https';
+  const parsedUrl = new URL(req.url, `${protocol}://${host}`);
+  const query = parsedUrl.searchParams.get('query');
+  const limitParam = parseInt(parsedUrl.searchParams.get('limit')) || 5;
+  const limit = Math.min(Math.max(limitParam, 1), 20);
+
+  if (parsedUrl.pathname === '/') {
+    res.writeHead(302, { 'Location': '/docs' });
+    return res.end();
+  }
+
+  if (parsedUrl.pathname === '/docs') {
+    const uptimeMinutes = Math.floor((Date.now() - startTime) / 60000);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(`<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
@@ -377,62 +396,62 @@ async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('¡Copiado!')}
 </script>
 </body></html>`);
-}
+  }
 
-res.setHeader('Access-Control-Allow-Origin', '*');
-res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
-if (parsedUrl.pathname === '/tiktok') {
-if (!query) return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta query' }));
-const data = await fetchTikTokVideo(query);
-const payload = JSON.stringify(data, null, 2);
-totalBytesSent += payload.length;
-return res.end(payload);
-}
+  if (parsedUrl.pathname === '/tiktok') {
+    if (!query) return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta query' }));
+    const data = await fetchTikTokVideo(query);
+    const payload = JSON.stringify(data, null, 2);
+    totalBytesSent += payload.length;
+    return res.end(payload);
+  }
 
-if (parsedUrl.pathname === '/ytsearch' || parsedUrl.pathname === '/ttsearch') {
-if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
-const platform = parsedUrl.pathname === '/ytsearch' ? 'youtube' : 'tiktok';
-const results = await fetchRealSearchResults(query, limit, platform);
-const payload = JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2);
-totalBytesSent += payload.length;
-return res.end(payload);
-}
+  if (parsedUrl.pathname === '/ytsearch' || parsedUrl.pathname === '/ttsearch') {
+    if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
+    const platform = parsedUrl.pathname === '/ytsearch' ? 'youtube' : 'tiktok';
+    const results = await fetchRealSearchResults(query, limit, platform);
+    const payload = JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2);
+    totalBytesSent += payload.length;
+    return res.end(payload);
+  }
 
-if (parsedUrl.pathname === '/ytmp3' || parsedUrl.pathname === '/ytmp4') {
-if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
-const endpoint = parsedUrl.pathname.replace('/', '');
-let targetUrl = query;
-let title = query;
-let videoId = '3JZ_D3ELwOQ';
-if (query.indexOf('http') === -1) {
-const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
-if (ytResults[0]) {
-targetUrl = ytResults[0].url;
-title = ytResults[0].title || query;
-videoId = ytResults[0].videoId || '3JZ_D3ELwOQ';
-}
-} else {
-const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-if (idMatch) videoId = idMatch[1];
-}
-let downloadUrl = await fetchDirectYoutubeAudio(videoId);
-if (!downloadUrl) downloadUrl = 'https://www.youtube.com/watch?v=' + videoId;
-const payload = JSON.stringify({ ok: true, endpoint: endpoint, action: endpoint === 'ytmp3' ? 'MP3' : 'MP4', input: query, title: title, videoId: videoId, resolved_url: 'https://www.youtube.com/watch?v=' + videoId, download_url: downloadUrl, url: downloadUrl, result: { title: title, url: 'https://www.youtube.com/watch?v=' + videoId, download: downloadUrl, thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' } }, null, 2);
-totalBytesSent += payload.length;
-return res.end(payload);
-}
+  if (parsedUrl.pathname === '/ytmp3' || parsedUrl.pathname === '/ytmp4') {
+    if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
+    const endpoint = parsedUrl.pathname.replace('/', '');
+    let targetUrl = query;
+    let title = query;
+    let videoId = '3JZ_D3ELwOQ';
+    if (!query.includes('http')) {
+      const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
+      if (ytResults[0]) {
+        targetUrl = ytResults[0].url;
+        title = ytResults[0].title || query;
+        videoId = ytResults[0].videoId || '3JZ_D3ELwOQ';
+      }
+    } else {
+      const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+      if (idMatch) videoId = idMatch[1];
+    }
+    let downloadUrl = await fetchDirectYoutubeAudio(videoId);
+    if (!downloadUrl) downloadUrl = 'https://www.youtube.com/watch?v=' + videoId;
+    const payload = JSON.stringify({ ok: true, endpoint: endpoint, action: endpoint === 'ytmp3' ? 'MP3' : 'MP4', input: query, title: title, videoId: videoId, resolved_url: 'https://www.youtube.com/watch?v=' + videoId, download_url: downloadUrl, url: downloadUrl, result: { title: title, url: 'https://www.youtube.com/watch?v=' + videoId, download: downloadUrl, thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' } }, null, 2);
+    totalBytesSent += payload.length;
+    return res.end(payload);
+  }
 
-if (parsedUrl.pathname === '/xvideo') {
-if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta link del tweet' }));
-const data = await fetchXVideo(query);
-const payload = JSON.stringify(data, null, 2);
-totalBytesSent += payload.length;
-return res.end(payload);
-}
+  if (parsedUrl.pathname === '/xvideo') {
+    if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta link del tweet' }));
+    const data = await fetchXVideo(query);
+    const payload = JSON.stringify(data, null, 2);
+    totalBytesSent += payload.length;
+    return res.end(payload);
+  }
 
-res.statusCode = 404;
-const err = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + parsedUrl.pathname });
-totalBytesSent += err.length;
-res.end(err);
-};
+  res.statusCode = 404;
+  const err = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + parsedUrl.pathname });
+  totalBytesSent += err.length;
+  res.end(err);
+}
