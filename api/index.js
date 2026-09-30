@@ -1,14 +1,17 @@
 const { URL } = require('url');
 
 const startTime = Date.now();
-let totalRequests = 0;
-let totalBytesReceived = 0;
-let totalBytesSent = 0;
 
-// Rate Limiter en memoria (60 peticiones/minuto por dirección IP)
 const rateLimitMap = new Map();
 function applyRateLimit(ip, limit = 60, windowMs = 60000) {
   const now = Date.now();
+  if (rateLimitMap.size > 500) {
+    for (const [key, value] of rateLimitMap.entries()) {
+      if (now > value.resetTime) {
+        rateLimitMap.delete(key);
+      }
+    }
+  }
   const record = rateLimitMap.get(ip) || { count: 0, resetTime: now + windowMs };
   if (now > record.resetTime) {
     record.count = 1;
@@ -20,7 +23,6 @@ function applyRateLimit(ip, limit = 60, windowMs = 60000) {
   return record.count <= limit;
 }
 
-// Función helper para restringir y consumir el cuerpo de respuestas remotas por tamaño de bytes
 async function readTextWithLimit(response, maxBytes = 5 * 1024 * 1024) {
   const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
   if (contentLength > maxBytes) {
@@ -53,20 +55,39 @@ async function readTextWithLimit(response, maxBytes = 5 * 1024 * 1024) {
   return text;
 }
 
-// Validadores estrictos de dominio por objeto URL
 function isValidTikTokDomain(hostname) {
   if (!hostname) return false;
   const h = hostname.toLowerCase();
   return h === 'tiktok.com' || h.endsWith('.tiktok.com') || h === 'douyin.com' || h.endsWith('.douyin.com');
 }
 
-function isValidYoutubeDomain(hostname) {
-  if (!hostname) return false;
-  const h = hostname.toLowerCase();
-  return h === 'youtube.com' || h.endsWith('.youtube.com') || h === 'youtu.be' || h.endsWith('.youtu.be');
+function extractYoutubeVideoId(inputUrl) {
+  try {
+    const u = new URL(inputUrl);
+    const host = u.hostname.toLowerCase();
+    const allowedHosts = ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtu.be', 'music.youtube.com'];
+    
+    if (!allowedHosts.includes(host)) return null;
+
+    let videoId = null;
+    if (host.includes('youtu.be')) {
+      videoId = u.pathname.slice(1).split('/')[0];
+    } else if (u.pathname === '/watch') {
+      videoId = u.searchParams.get('v');
+    } else if (u.pathname.startsWith('/shorts/') || u.pathname.startsWith('/v/') || u.pathname.startsWith('/embed/')) {
+      const parts = u.pathname.split('/');
+      videoId = parts[2];
+    }
+
+    if (videoId && /^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+      return videoId;
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
 }
 
-// Scraper de búsquedas en tiempo real
 async function fetchRealSearchResults(query, limit, platform) {
   let results = [];
   const searchUrl = platform === 'youtube' 
@@ -74,7 +95,7 @@ async function fetchRealSearchResults(query, limit, platform) {
     : 'https://www.tiktok.com/search?q=' + encodeURIComponent(query);
     
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7000);
+  const timeout = setTimeout(() => controller.abort(), 6000);
 
   try {
     const response = await fetch(searchUrl, { 
@@ -90,7 +111,6 @@ async function fetchRealSearchResults(query, limit, platform) {
     }
     
     const html = await readTextWithLimit(response, 5 * 1024 * 1024);
-    totalBytesReceived += Buffer.byteLength(html, 'utf-8');
     
     if (platform === 'youtube') {
       const match = html.match(/var ytInitialData = ({[\s\S]*?});<\/script>/) || html.match(/window\["ytInitialData"\] = ({[\s\S]*?});<\/script>/);
@@ -143,19 +163,18 @@ async function fetchRealSearchResults(query, limit, platform) {
         if (results.length >= limit) break;
       }
     }
+
+    return results;
   } catch (e) {
-    console.error('Error durante el scraping de búsqueda:', e.message);
+    throw new Error(`Fallo al consultar ${platform}: ${e.message}`);
   } finally {
     clearTimeout(timeout);
   }
-  
-  return results;
 }
 
-// Extractor multimedia de YouTube
 async function fetchYoutubeMedia(videoId, type, quality) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 7000);
+  const timeout = setTimeout(() => controller.abort(), 6000);
 
   try {
     const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
@@ -171,7 +190,6 @@ async function fetchYoutubeMedia(videoId, type, quality) {
     }
 
     const html = await readTextWithLimit(response, 5 * 1024 * 1024);
-    totalBytesReceived += Buffer.byteLength(html, 'utf-8');
 
     const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/) || html.match(/var ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/);
     if (playerMatch && playerMatch[1]) {
@@ -208,7 +226,7 @@ async function fetchYoutubeMedia(videoId, type, quality) {
       } catch (err) {}
     }
   } catch (e) {
-    console.error('Error obteniendo media de YouTube:', e.message);
+    throw new Error(`Error obteniendo media de YouTube: ${e.message}`);
   } finally {
     clearTimeout(timeout);
   }
@@ -216,7 +234,6 @@ async function fetchYoutubeMedia(videoId, type, quality) {
   throw new Error("No se pudo extraer el enlace de descarga multimedia de YouTube.");
 }
 
-// Extractor de publicaciones de X / Twitter
 async function fetchXVideo(url) {
   const result = { ok: false, endpoint: 'xvideo', input: url, tweet_id: null, videos: [], thumbnail: null, text: null };
   try {
@@ -233,20 +250,18 @@ async function fetchXVideo(url) {
       'Accept-Language': 'en-US,en;q=0.9,es;q=0.8' 
     };
     let html = '';
-    const tryUrls = [ 'https://x.com/i/status/' + tweetId, 'https://twitter.com/i/status/' + tweetId, 'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en' ];
+    const tryUrls = [ 'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en', 'https://x.com/i/status/' + tweetId ];
     
     for (let i = 0; i < tryUrls.length; i++) {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
+      const timeout = setTimeout(() => controller.abort(), 3500);
       try {
         const response = await fetch(tryUrls[i], { headers, signal: controller.signal });
         if (response.ok) {
           html = await readTextWithLimit(response, 3 * 1024 * 1024);
-          totalBytesReceived += Buffer.byteLength(html, 'utf-8');
-          if (html.length > 500) break;
+          if (html.length > 300) break;
         }
       } catch (e) {
-        console.error('Fallo en endpoint X:', e.message);
       } finally {
         clearTimeout(timeout);
       }
@@ -254,13 +269,12 @@ async function fetchXVideo(url) {
     
     if (!html || html.length < 200) {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
+      const timeout = setTimeout(() => controller.abort(), 3500);
       try {
         const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers, signal: controller.signal });
         if (fxRes.ok) {
           const textResp = await readTextWithLimit(fxRes, 2 * 1024 * 1024);
           const fxData = JSON.parse(textResp);
-          totalBytesReceived += Buffer.byteLength(textResp, 'utf-8');
           if (fxData.tweet) {
             result.text = fxData.tweet.text || null;
             result.thumbnail = (fxData.tweet.media?.photos?.[0]?.url) || (fxData.tweet.media?.videos?.[0]?.thumbnail_url) || null;
@@ -279,7 +293,6 @@ async function fetchXVideo(url) {
           }
         }
       } catch (e) {
-        console.error('Error con API de respaldo de X:', e.message);
       } finally {
         clearTimeout(timeout);
       }
@@ -305,13 +318,11 @@ async function fetchXVideo(url) {
       result.message = 'No se encontraron videos en este tweet';
     }
   } catch (e) {
-    console.error('Error en scraper de X:', e.message);
     result.message = 'Error en scraper: ' + e.message;
   }
   return result;
 }
 
-// Extractor de videos de TikTok
 async function fetchTikTokVideo(initialUrl) {
   let currentUrl = initialUrl;
   let redirects = 0;
@@ -326,11 +337,11 @@ async function fetchTikTokVideo(initialUrl) {
     }
 
     if (parsedUrl.protocol !== 'https:' || !isValidTikTokDomain(parsedUrl.hostname)) {
-      throw new Error('Bloqueo de seguridad: Solo se permiten conexiones HTTPS hacia dominios de TikTok.');
+      throw new Error('Bloqueo de seguridad: Solo se permiten conexiones HTTPS hacia dominios oficiales de TikTok.');
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 7000);
+    const timeout = setTimeout(() => controller.abort(), 6000);
 
     try {
       const response = await fetch(currentUrl, { 
@@ -356,7 +367,6 @@ async function fetchTikTokVideo(initialUrl) {
       }
 
       const html = await readTextWithLimit(response, 5 * 1024 * 1024);
-      totalBytesReceived += Buffer.byteLength(html, 'utf-8');
 
       let vData = null;
       const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
@@ -420,37 +430,28 @@ async function fetchTikTokVideo(initialUrl) {
   throw new Error('Se superó el límite máximo de redirecciones.');
 }
 
-// Handler principal del servidor
 module.exports = async function handler(req, res) {
   try {
-    // 1. Control de IP y Rate Limiting
-    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '127.0.0.1';
+    const clientIp = req.headers['x-real-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '127.0.0.1';
     if (!applyRateLimit(clientIp)) {
       res.statusCode = 429;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      const errPayload = JSON.stringify({ ok: false, message: 'Límite de peticiones excedido. Intenta de nuevo en un minuto.' });
-      totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-      return res.end(errPayload);
+      return res.end(JSON.stringify({ ok: false, message: 'Límite de peticiones excedido (60/min). Intenta de nuevo en un minuto.' }));
     }
 
-    // 2. Restricción estricta de métodos HTTP
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       res.statusCode = 405;
       res.setHeader('Allow', 'GET, HEAD');
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      const errPayload = JSON.stringify({ ok: false, message: 'Método no permitido. Utiliza GET o HEAD.' });
-      totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-      return res.end(errPayload);
+      return res.end(JSON.stringify({ ok: false, message: 'Método no permitido. Utiliza GET o HEAD.' }));
     }
 
-    // 3. Respuesta inmediata a solicitudes HEAD sin ejecutar scraping ni llamadas externas
     if (req.method === 'HEAD') {
       res.statusCode = 200;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       return res.end();
     }
 
-    totalRequests++;
     const host = req.headers['x-forwarded-host'] || req.headers.host || 'zeta-core-api.vercel.app';
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const parsedUrl = new URL(req.url, `${protocol}://${host}`);
@@ -460,30 +461,51 @@ module.exports = async function handler(req, res) {
 
     const rawQuery = parsedUrl.searchParams.get('query') || parsedUrl.searchParams.get('url') || '';
     
-    // 4. Acotar longitud máxima de la consulta
     if (rawQuery.length > 500) {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      const errPayload = JSON.stringify({ ok: false, message: 'La longitud de la consulta excede el máximo permitido (500 caracteres).' });
-      totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-      return res.end(errPayload);
+      return res.end(JSON.stringify({ ok: false, message: 'La longitud de la consulta excede el máximo permitido (500 caracteres).' }));
     }
     const query = rawQuery.trim();
 
-    // 5. Validación estricta del parámetro type
-    let typeParam = (parsedUrl.searchParams.get('type') || 'video').toLowerCase();
-    const validTypes = ['video', 'audio'];
-    if (!validTypes.includes(typeParam)) typeParam = 'video';
-    const type = typeParam;
+    let type = 'video';
+    if (parsedUrl.searchParams.has('type')) {
+      const rawType = parsedUrl.searchParams.get('type').toLowerCase();
+      if (!['video', 'audio'].includes(rawType)) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        return res.end(JSON.stringify({ ok: false, message: 'El parámetro "type" es inválido. Valores permitidos: "video", "audio".' }));
+      }
+      type = rawType;
+    }
 
-    // 6. Validación estricta del parámetro quality
-    let qualityParam = (parsedUrl.searchParams.get('quality') || '720p').toLowerCase();
-    const validQualities = ['1080p', '720p', '480p', '360p'];
-    if (!validQualities.includes(qualityParam)) qualityParam = '720p';
-    const quality = qualityParam;
+    let quality = '720p';
+    if (parsedUrl.searchParams.has('quality')) {
+      const rawQuality = parsedUrl.searchParams.get('quality').toLowerCase();
+      if (!['1080p', '720p', '480p', '360p'].includes(rawQuality)) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        return res.end(JSON.stringify({ ok: false, message: 'El parámetro "quality" es inválido. Valores permitidos: "1080p", "720p", "480p", "360p".' }));
+      }
+      quality = rawQuality;
+    }
 
-    const limitParam = parseInt(parsedUrl.searchParams.get('limit'), 10) || 5;
-    const limit = Math.min(Math.max(limitParam, 1), 20);
+    let limit = 5;
+    if (parsedUrl.searchParams.has('limit')) {
+      const rawLimit = parsedUrl.searchParams.get('limit');
+      if (!/^\d+$/.test(rawLimit)) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        return res.end(JSON.stringify({ ok: false, message: 'El parámetro "limit" debe ser un número entero válido.' }));
+      }
+      const parsedLimit = parseInt(rawLimit, 10);
+      if (parsedLimit < 1 || parsedLimit > 20) {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        return res.end(JSON.stringify({ ok: false, message: 'El parámetro "limit" debe estar entre 1 y 20.' }));
+      }
+      limit = parsedLimit;
+    }
 
     if (pathname === '/' || pathname === '') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -583,7 +605,7 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <span class="sub-item" onclick="switchTab('downloaders',this)">📥 Panel Descargas</span>
 <span class="sub-item" onclick="switchTab('search',this)">🔍 Playground Búsquedas</span>
 </div>
-<div class="sidebar-footer"><span>CYBERPUNK v3.7</span><span style="color:#00ff66">● ONLINE</span></div>
+<div class="sidebar-footer"><span>CYBERPUNK v3.8</span><span style="color:#00ff66">● ONLINE</span></div>
 </div>
 <div class="main-content"><div class="card-wrapper">
 <div id="guide" class="card active">
@@ -594,11 +616,7 @@ pre{color:#00ff66;font-size:12px;overflow-x:auto;max-height:220px;margin:0;white
 <div class="creator-tag">By: FlextOFC ✨</div>
 <div class="stats-grid">
 <div class="stat-box"><div class="stat-label">Núcleo API</div><div class="stat-value" style="color:#00ff66">● Activo</div></div>
-<div class="stat-box"><div class="stat-label">Tiempo Activo</div><div class="stat-value">${uptimeMinutes} min</div></div>
-<div class="stat-box"><div class="stat-label">Peticiones</div><div class="stat-value">${totalRequests}</div></div>
-<div class="stat-box"><div class="stat-label">Latencia</div><div class="stat-value">~12ms</div></div>
-<div class="stat-box"><div class="stat-label">Bajada Data</div><div class="stat-value">${(totalBytesReceived/1024).toFixed(2)} KB</div></div>
-<div class="stat-box"><div class="stat-label">Subida Data</div><div class="stat-value">${(totalBytesSent/1024).toFixed(2)} KB</div></div>
+<div class="stat-box"><div class="stat-label">Tiempo Instancia</div><div class="stat-value">${uptimeMinutes} min</div></div>
 </div></div>
 <div style="text-align:center"><button class="btn btn-rgb" onclick="switchTab('downloaders', document.querySelectorAll('.sub-item')[1])">📄 EXPLORAR DOCUMENTACIÓN</button></div>
 </div>
@@ -682,117 +700,90 @@ function actualizarInterfazYoutube(){
   }
 }
 async function ejecutarAccion(endpoint,inputId,containerId,outputId){var val=document.getElementById(inputId).value.trim();if(!val){alert('⚠️ ¡Por favor ingresa un enlace o texto válido!');return}var container=document.getElementById(containerId);var output=document.getElementById(outputId);container.style.display='block';output.innerText='⚡ Procesando solicitud en el núcleo...';try{var res=await fetch('/'+endpoint+'?url='+encodeURIComponent(val));var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error de ejecución: '+e.message}}
-async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠️ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality;var res=await fetch(apiUrl);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
-async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('⚠️ ¡Escribe un término de búsqueda!');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='🔍 Buscando en la red...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
+async function ejecutarYoutubeCustom(){var val=document.getElementById('inputYoutube').value.trim();var type=document.getElementById('selectYtType').value;var quality=document.getElementById('selectYtQuality').value;if(!val){alert('⚠️️ ¡Ingresa un término o enlace!');return}var container=document.getElementById('jsonContainerYoutube');var output=document.getElementById('jsonOutputYoutube');container.style.display='block';output.innerText='⚡ Extrayendo multimedia de YouTube...';try{var apiUrl=type==='audio'?'/ytmp3?query='+encodeURIComponent(val):'/youtube?query='+encodeURIComponent(val)+'&type='+type+'&quality='+quality;var res=await fetch(apiUrl);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
+async function ejecutarBusqueda(endpoint){var isYt=endpoint==='ytsearch';var val=document.getElementById(isYt?'inputYt':'inputTt').value.trim();var limit=document.getElementById(isYt?'limitYt':'limitTt').value;if(!val){alert('⚠ ¡Escribe un término de búsqueda!');return}var container=document.getElementById(isYt?'jsonContainerYt':'jsonContainerTt');var output=document.getElementById(isYt?'jsonOutputYt':'jsonOutputTt');container.style.display='block';output.innerText='🔍 Buscando en la red...';try{var res=await fetch('/'+endpoint+'?query='+encodeURIComponent(val)+'&limit='+limit);var data=await res.json();output.innerText=JSON.stringify(data,null,2)}catch(e){output.innerText='❌ Error: '+e.message}}
 function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id).innerText);alert('✨ ¡JSON copiado al portapapeles!')}
 </script>
 </body></html>`);
     }
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
     if (pathname === '/tiktok') {
       if (!query) {
         res.statusCode = 400;
-        const errPayload = JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta el parámetro url' });
-        totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-        return res.end(errPayload);
+        return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta el parámetro url' }));
       }
       try {
         const data = await fetchTikTokVideo(query);
-        const payload = JSON.stringify(data, null, 2);
-        totalBytesSent += Buffer.byteLength(payload, 'utf-8');
-        return res.end(payload);
+        return res.end(JSON.stringify(data, null, 2));
       } catch (err) {
         res.statusCode = 400;
-        const errPayload = JSON.stringify({ creator: "Jxmpier207", status: false, message: err.message });
-        totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-        return res.end(errPayload);
+        return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: err.message }));
       }
     }
 
     if (pathname === '/ytsearch' || pathname === '/ttsearch') {
       if (!query) {
         res.statusCode = 400;
-        const errPayload = JSON.stringify({ ok: false, message: 'Falta el parámetro query' });
-        totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-        return res.end(errPayload);
+        return res.end(JSON.stringify({ ok: false, message: 'Falta el parámetro query' }));
       }
       const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
-      const results = await fetchRealSearchResults(query, limit, platform);
       
-      if (results.length === 0) {
-        res.statusCode = 404;
-        const errPayload = JSON.stringify({ ok: false, message: 'No se encontraron resultados para la búsqueda solicitada.' });
-        totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-        return res.end(errPayload);
-      }
+      try {
+        const results = await fetchRealSearchResults(query, limit, platform);
+        
+        if (results.length === 0) {
+          res.statusCode = 404;
+          return res.end(JSON.stringify({ ok: false, message: 'No se encontraron resultados para la búsqueda solicitada.' }));
+        }
 
-      const payload = JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2);
-      totalBytesSent += Buffer.byteLength(payload, 'utf-8');
-      return res.end(payload);
+        return res.end(JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2));
+      } catch (searchErr) {
+        res.statusCode = 502;
+        return res.end(JSON.stringify({ ok: false, message: searchErr.message }));
+      }
     }
 
     if (pathname === '/youtube' || pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
       if (!query) {
         res.statusCode = 400;
-        const errPayload = JSON.stringify({ ok: false, message: 'Falta el parámetro query o url' });
-        totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-        return res.end(errPayload);
+        return res.end(JSON.stringify({ ok: false, message: 'Falta el parámetro query o url' }));
       }
       
       let resolvedType = type;
-      if (pathname === '/ytmp3') resolvedType = 'audio';
-      if (pathname === '/ytmp4') resolvedType = 'video';
+      if (pathname === '/ytmp3' || pathname === '/docs/download/ytmp3') resolvedType = 'audio';
+      if (pathname === '/ytmp4' || pathname === '/docs/download/ytmp4') resolvedType = 'video';
 
       let title = query;
       let videoId = null;
 
-      // 7. Parseo estricto y validación de URL de YouTube
       if (query.includes('http://') || query.includes('https://')) {
-        try {
-          const parsedYtUrl = new URL(query);
-          if (!isValidYoutubeDomain(parsedYtUrl.hostname)) {
-            res.statusCode = 400;
-            const errPayload = JSON.stringify({ ok: false, message: 'Dominio de URL no válido para YouTube. Solo se permiten youtube.com y youtu.be' });
-            totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-            return res.end(errPayload);
-          }
-          const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-          if (idMatch) {
-            videoId = idMatch[1];
-          }
-        } catch (e) {
+        videoId = extractYoutubeVideoId(query);
+        if (!videoId) {
           res.statusCode = 400;
-          const errPayload = JSON.stringify({ ok: false, message: 'URL de YouTube malformada.' });
-          totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-          return res.end(errPayload);
+          return res.end(JSON.stringify({ ok: false, message: 'URL de YouTube no válida. Se requiere una ruta o formato de video válido (watch?v=, youtu.be/, shorts/, embed/).' }));
         }
       } else {
-        const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
-        if (ytResults[0] && ytResults[0].videoId) {
-          title = ytResults[0].title || query;
-          videoId = ytResults[0].videoId;
-        } else {
-          res.statusCode = 404;
-          const errPayload = JSON.stringify({ ok: false, message: 'No se encontró ningún video con ese término de búsqueda.' });
-          totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-          return res.end(errPayload);
+        try {
+          const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
+          if (ytResults[0] && ytResults[0].videoId) {
+            title = ytResults[0].title || query;
+            videoId = ytResults[0].videoId;
+          } else {
+            res.statusCode = 404;
+            return res.end(JSON.stringify({ ok: false, message: 'No se encontró ningún video con ese término de búsqueda.' }));
+          }
+        } catch (searchErr) {
+          res.statusCode = 502;
+          return res.end(JSON.stringify({ ok: false, message: 'Error al realizar la búsqueda en YouTube: ' + searchErr.message }));
         }
       }
 
-      if (!videoId) {
-        res.statusCode = 400;
-        const errPayload = JSON.stringify({ ok: false, message: 'No se pudo extraer un ID de video válido de YouTube.' });
-        totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-        return res.end(errPayload);
-      }
-      
       try {
         let mediaData = await fetchYoutubeMedia(videoId, resolvedType, quality);
         
-        const payload = JSON.stringify({ 
+        return res.end(JSON.stringify({ 
           ok: true, 
           endpoint: 'youtube', 
           type: resolvedType, 
@@ -811,39 +802,26 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
             download: mediaData.url, 
             thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' 
           } 
-        }, null, 2);
-        
-        totalBytesSent += Buffer.byteLength(payload, 'utf-8');
-        return res.end(payload);
+        }, null, 2));
       } catch (mediaErr) {
         res.statusCode = 502;
-        const errPayload = JSON.stringify({ ok: false, message: mediaErr.message });
-        totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-        return res.end(errPayload);
+        return res.end(JSON.stringify({ ok: false, message: mediaErr.message }));
       }
     }
 
     if (pathname === '/xvideo') {
       if (!query) {
         res.statusCode = 400;
-        const errPayload = JSON.stringify({ ok: false, message: 'Falta link del tweet' });
-        totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-        return res.end(errPayload);
+        return res.end(JSON.stringify({ ok: false, message: 'Falta el enlace del tweet' }));
       }
       const data = await fetchXVideo(query);
-      const payload = JSON.stringify(data, null, 2);
-      totalBytesSent += Buffer.byteLength(payload, 'utf-8');
-      return res.end(payload);
+      return res.end(JSON.stringify(data, null, 2));
     }
 
     res.statusCode = 404;
-    const errPayload = JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + pathname });
-    totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-    res.end(errPayload);
+    res.end(JSON.stringify({ ok: false, message: 'Endpoint no encontrado: ' + pathname }));
   } catch (error) {
     res.statusCode = 500;
-    const errPayload = JSON.stringify({ ok: false, error: 'Error interno del servidor' });
-    totalBytesSent += Buffer.byteLength(errPayload, 'utf-8');
-    res.end(errPayload);
+    res.end(JSON.stringify({ ok: false, error: 'Error interno del servidor: ' + error.message }));
   }
 };
