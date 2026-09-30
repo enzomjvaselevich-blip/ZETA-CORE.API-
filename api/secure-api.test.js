@@ -59,7 +59,17 @@ test('elige formatos directos válidos de YouTube según calidad y tipo', () => 
     quality: 'audio-128kbps',
     bitrate: 128000,
   });
-  assert.throws(() => secureApi.selectYoutubeMediaFormat([], 'audio', '720p'), { statusCode: 502 });
+  assert.throws(() => secureApi.selectYoutubeMediaFormat([], 'audio', '720p'), {
+    statusCode: 502,
+    code: 'YOUTUBE_FORMAT_UNAVAILABLE',
+  });
+});
+
+test('explica claramente cuando YouTube no expone un formato de audio', () => {
+  const error = secureApi.apiError(502, 'No hay un enlace multimedia directo compatible disponible.', {
+    code: 'YOUTUBE_FORMAT_UNAVAILABLE',
+  });
+  assert.match(secureApi.publicErrorMessage(error), /no ofreció un enlace directo de audio/);
 });
 
 test('valida estrictamente la ruta y el ID de X', () => {
