@@ -12,12 +12,17 @@ async function fetchRealSearchResults(query, limit, platform) {
       ? 'https://www.youtube.com/results?search_query=' + encodeURIComponent(query) 
       : 'https://www.tiktok.com/search?q=' + encodeURIComponent(query);
       
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 7000);
+
     const response = await fetch(searchUrl, { 
+      signal: controller.signal,
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
         'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' 
       } 
     });
+    clearTimeout(timeout);
     
     const html = await response.text();
     totalBytesReceived += html.length;
@@ -77,20 +82,23 @@ async function fetchRealSearchResults(query, limit, platform) {
     console.error('Error en scraping:', e.message);
   }
   
-  if (results.length === 0 && platform === 'youtube') {
-    results.push({ type: 'video', videoId: 'nlXqp3FVrq8', title: query + ' - Audio Oficial', url: 'https://www.youtube.com/watch?v=nlXqp3FVrq8' });
-  }
   return results;
 }
 
 async function fetchYoutubeMedia(videoId, type, quality) {
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 7000);
+
     const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
+      signal: controller.signal,
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept-Language': 'es-ES,es;q=0.9'
       } 
     });
+    clearTimeout(timeout);
+
     const html = await response.text();
     totalBytesReceived += html.length;
 
@@ -130,8 +138,7 @@ async function fetchYoutubeMedia(videoId, type, quality) {
     }
   } catch (e) {}
   
-  const fallbackUrl = 'https://rr3---sn-gvnuxnzs.googlevideo.com/videoplayback?expire=3716248320&ei=1&initbypass=yes&id=' + type + '_' + videoId;
-  return { url: fallbackUrl, quality: type === 'audio' ? 'audio-128kbps' : (quality || 'default'), bitrate: null };
+  throw new Error("No se pudo extraer el enlace de descarga multimedia de YouTube de forma segura.");
 }
 
 async function fetchXVideo(url) {
@@ -153,7 +160,10 @@ async function fetchXVideo(url) {
     const tryUrls = [ 'https://x.com/i/status/' + tweetId, 'https://twitter.com/i/status/' + tweetId, 'https://cdn.syndication.twimg.com/tweet-result?id=' + tweetId + '&lang=en' ];
     for (let i = 0; i < tryUrls.length; i++) {
       try {
-        const response = await fetch(tryUrls[i], { headers });
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        const response = await fetch(tryUrls[i], { headers, signal: controller.signal });
+        clearTimeout(timeout);
         if (response.ok) {
           html = await response.text();
           totalBytesReceived += html.length;
@@ -163,7 +173,10 @@ async function fetchXVideo(url) {
     }
     if (!html || html.length < 200) {
       try {
-        const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers });
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        const fxRes = await fetch('https://api.fxtwitter.com/status/' + tweetId, { headers, signal: controller.signal });
+        clearTimeout(timeout);
         if (fxRes.ok) {
           const fxData = await fxRes.json();
           totalBytesReceived += JSON.stringify(fxData).length;
@@ -212,65 +225,92 @@ async function fetchXVideo(url) {
 }
 
 async function fetchTikTokVideo(url) {
+  // Validación de seguridad SSRF estricta antes de conectar
+  let parsedInputUrl;
   try {
-    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' } });
-    const html = await response.text();
-    totalBytesReceived += html.length;
-    let vData = null;
-    const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
-    if (univMatch) {
-      const univ = JSON.parse(univMatch[1]);
-      vData = univ.__DEFAULT_SCOPE__['webapp.video-detail']?.itemInfo?.itemStruct;
-    } else {
-      const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
-      if (sigiMatch) {
-        const sigi = JSON.parse(sigiMatch[1]);
-        const itemId = Object.keys(sigi.ItemModule)[0];
-        vData = sigi.ItemModule[itemId];
+    parsedInputUrl = new URL(url);
+  } catch (err) {
+    throw new Error('La URL proporcionada no es válida.');
+  }
+
+  if (parsedInputUrl.protocol !== 'https:' || (!parsedInputUrl.hostname.endsWith('tiktok.com') && !parsedInputUrl.hostname.endsWith('douyin.com'))) {
+    throw new Error('Seguridad bloqueada: Solo se permiten conexiones HTTPS a dominios oficiales de TikTok.');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+
+  const response = await fetch(url, { 
+    signal: controller.signal,
+    redirect: 'follow',
+    headers: { 
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', 
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 
+      'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' 
+    } 
+  });
+  clearTimeout(timeout);
+
+  // Validación post-redirección anti-SSRF avanzado
+  const finalParsedUrl = new URL(response.url);
+  if (finalParsedUrl.protocol !== 'https:' || (!finalParsedUrl.hostname.endsWith('tiktok.com') && !finalParsedUrl.hostname.endsWith('douyin.com'))) {
+    throw new Error('Seguridad bloqueada: La redirección apuntó a un dominio externo no autorizado.');
+  }
+
+  const html = await response.text();
+  totalBytesReceived += html.length;
+  let vData = null;
+  const univMatch = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
+  if (univMatch) {
+    const univ = JSON.parse(univMatch[1]);
+    vData = univ.__DEFAULT_SCOPE__['webapp.video-detail']?.itemInfo?.itemStruct;
+  } else {
+    const sigiMatch = html.match(/window\['SIGI_STATE'\]=(.*?);window\['SIGI_RETRY'\]/);
+    if (sigiMatch) {
+      const sigi = JSON.parse(sigiMatch[1]);
+      const itemId = Object.keys(sigi.ItemModule)[0];
+      vData = sigi.ItemModule[itemId];
+    }
+  }
+  if (!vData) throw new Error("No se pudo extraer la información interna del video de TikTok.");
+  return {
+    creator: "Jxmpier207",
+    status: true,
+    data: {
+      id: vData.id || "",
+      url: url,
+      type: "video",
+      title: vData.desc || "",
+      cover: vData.video?.cover || "",
+      duration: vData.video?.duration || 0,
+      size: "",
+      hd_size: "",
+      images: [],
+      links: {
+        hd: vData.video?.playAddr || "",
+        sd: vData.video?.playAddr || "",
+        wm: vData.video?.downloadAddr || "",
+        mp3: vData.music?.playUrl || ""
+      },
+      author: {
+        username: vData.author?.uniqueId || "",
+        nickname: vData.author?.nickname || "",
+        avatar: vData.author?.avatarLarger || ""
+      },
+      music: {
+        title: vData.music?.title || "",
+        author: vData.music?.authorName || "",
+        cover: vData.music?.coverLarge || ""
+      },
+      stats: {
+        views: vData.stats?.playCount || 0,
+        likes: vData.stats?.diggCount || 0,
+        comments: vData.stats?.commentCount || 0,
+        shares: vData.stats?.shareCount || 0,
+        downloads: vData.stats?.downloadCount || 0
       }
     }
-    if (!vData) throw new Error("No data found");
-    return {
-      creator: "Jxmpier207",
-      status: true,
-      data: {
-        id: vData.id || "",
-        url: url,
-        type: "video",
-        title: vData.desc || "",
-        cover: vData.video?.cover || "",
-        duration: vData.video?.duration || 0,
-        size: "",
-        hd_size: "",
-        images: [],
-        links: {
-          hd: vData.video?.playAddr || "",
-          sd: vData.video?.playAddr || "",
-          wm: vData.video?.downloadAddr || "",
-          mp3: vData.music?.playUrl || ""
-        },
-        author: {
-          username: vData.author?.uniqueId || "",
-          nickname: vData.author?.nickname || "",
-          avatar: vData.author?.avatarLarger || ""
-        },
-        music: {
-          title: vData.music?.title || "",
-          author: vData.music?.authorName || "",
-          cover: vData.music?.coverLarge || ""
-        },
-        stats: {
-          views: vData.stats?.playCount || 0,
-          likes: vData.stats?.diggCount || 0,
-          comments: vData.stats?.commentCount || 0,
-          shares: vData.stats?.shareCount || 0,
-          downloads: vData.stats?.downloadCount || 0
-        }
-      }
-    };
-  } catch (e) {
-    return { creator: "Jxmpier207", status: false, message: e.message };
-  }
+  };
 }
 
 module.exports = async function handler(req, res) {
@@ -313,7 +353,7 @@ p{color:#b8b2d1;font-size:15px;margin-bottom:30px;line-height:1.6;font-weight:60
 <body>
 <div class="welcome-card">
   <h1>⚡ ZETA-CORE.API ⚡</h1>
-  <p>🔮 Núcleo backend de alto rendimiento activado con tecnología de punta y seguridad cuántica. ¡Bienvenido al sistema principal, usuario! ✨</p>
+  <p>🔮 Núcleo backend de alto rendimiento activado con seguridad reforzada. ¡Bienvenido al sistema principal, usuario! ✨</p>
   <a href="/docs" class="btn-doc">🚀 DOCUMENTACIÓN 🔮</a>
 </div>
 </body>
@@ -497,24 +537,54 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
 
     if (pathname === '/tiktok') {
-      if (!query) return res.end(JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta query' }));
-      const data = await fetchTikTokVideo(query);
-      const payload = JSON.stringify(data, null, 2);
-      totalBytesSent += payload.length;
-      return res.end(payload);
+      if (!query) {
+        res.statusCode = 400;
+        const errPayload = JSON.stringify({ creator: "Jxmpier207", status: false, message: 'Falta el parámetro url' });
+        totalBytesSent += errPayload.length;
+        return res.end(errPayload);
+      }
+      try {
+        const data = await fetchTikTokVideo(query);
+        const payload = JSON.stringify(data, null, 2);
+        totalBytesSent += payload.length;
+        return res.end(payload);
+      } catch (err) {
+        res.statusCode = 400;
+        const errPayload = JSON.stringify({ creator: "Jxmpier207", status: false, message: err.message });
+        totalBytesSent += errPayload.length;
+        return res.end(errPayload);
+      }
     }
 
     if (pathname === '/ytsearch' || pathname === '/ttsearch') {
-      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query' }));
+      if (!query) {
+        res.statusCode = 400;
+        const errPayload = JSON.stringify({ ok: false, message: 'Falta el parámetro query' });
+        totalBytesSent += errPayload.length;
+        return res.end(errPayload);
+      }
       const platform = pathname === '/ytsearch' ? 'youtube' : 'tiktok';
       const results = await fetchRealSearchResults(query, limit, platform);
+      
+      if (results.length === 0) {
+        res.statusCode = 404;
+        const errPayload = JSON.stringify({ ok: false, message: 'No se encontraron resultados para la búsqueda solicitada.' });
+        totalBytesSent += errPayload.length;
+        return res.end(errPayload);
+      }
+
       const payload = JSON.stringify({ ok: true, source: platform, query: query, total_results: results.length, results: results }, null, 2);
       totalBytesSent += payload.length;
       return res.end(payload);
     }
 
     if (pathname === '/youtube' || pathname === '/ytmp3' || pathname === '/ytmp4' || pathname === '/docs/download/ytmp3' || pathname === '/docs/download/ytmp4') {
-      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta query o url' }));
+      if (!query) {
+        res.statusCode = 400;
+        const errPayload = JSON.stringify({ ok: false, message: 'Falta query o url' });
+        totalBytesSent += errPayload.length;
+        return res.end(errPayload);
+      }
       
       let resolvedType = type;
       if (pathname === '/ytmp3') resolvedType = 'audio';
@@ -526,42 +596,59 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
         const ytResults = await fetchRealSearchResults(query, 1, 'youtube');
         if (ytResults[0]) {
           title = ytResults[0].title || query;
-          videoId = ytResults[0].videoId || 'nlXqp3FVrq8';
+          videoId = ytResults[0].videoId || videoId;
+        } else {
+          res.statusCode = 404;
+          const errPayload = JSON.stringify({ ok: false, message: 'No se encontró ningún video con ese término de búsqueda.' });
+          totalBytesSent += errPayload.length;
+          return res.end(errPayload);
         }
       } else {
         const idMatch = query.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
         if (idMatch) videoId = idMatch[1];
       }
       
-      let mediaData = await fetchYoutubeMedia(videoId, resolvedType, quality);
-      
-      const payload = JSON.stringify({ 
-        ok: true, 
-        endpoint: 'youtube', 
-        type: resolvedType, 
-        quality: mediaData.quality, 
-        input: query, 
-        title: title, 
-        videoId: videoId, 
-        resolved_url: 'https://www.youtube.com/watch?v=' + videoId, 
-        download_url: mediaData.url, 
-        url: mediaData.url, 
-        result: { 
+      try {
+        let mediaData = await fetchYoutubeMedia(videoId, resolvedType, quality);
+        
+        const payload = JSON.stringify({ 
+          ok: true, 
+          endpoint: 'youtube', 
+          type: resolvedType, 
+          quality: mediaData.quality, 
+          input: query, 
           title: title, 
-          type: resolvedType,
-          quality: mediaData.quality,
-          url: 'https://www.youtube.com/watch?v=' + videoId, 
-          download: mediaData.url, 
-          thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' 
-        } 
-      }, null, 2);
-      
-      totalBytesSent += payload.length;
-      return res.end(payload);
+          videoId: videoId, 
+          resolved_url: 'https://www.youtube.com/watch?v=' + videoId, 
+          download_url: mediaData.url, 
+          url: mediaData.url, 
+          result: { 
+            title: title, 
+            type: resolvedType,
+            quality: mediaData.quality,
+            url: 'https://www.youtube.com/watch?v=' + videoId, 
+            download: mediaData.url, 
+            thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' 
+          } 
+        }, null, 2);
+        
+        totalBytesSent += payload.length;
+        return res.end(payload);
+      } catch (mediaErr) {
+        res.statusCode = 502;
+        const errPayload = JSON.stringify({ ok: false, message: mediaErr.message });
+        totalBytesSent += errPayload.length;
+        return res.end(errPayload);
+      }
     }
 
     if (pathname === '/xvideo') {
-      if (!query) return res.end(JSON.stringify({ ok: false, message: 'Falta link del tweet' }));
+      if (!query) {
+        res.statusCode = 400;
+        const errPayload = JSON.stringify({ ok: false, message: 'Falta link del tweet' });
+        totalBytesSent += errPayload.length;
+        return res.end(errPayload);
+      }
       const data = await fetchXVideo(query);
       const payload = JSON.stringify(data, null, 2);
       totalBytesSent += payload.length;
@@ -574,6 +661,8 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
     res.end(err);
   } catch (error) {
     res.statusCode = 500;
-    res.end(JSON.stringify({ ok: false, error: error.message }));
+    const errPayload = JSON.stringify({ ok: false, error: error.message });
+    totalBytesSent += errPayload.length;
+    res.end(errPayload);
   }
 };
