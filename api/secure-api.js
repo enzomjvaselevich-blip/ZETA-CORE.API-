@@ -306,10 +306,10 @@ async function fetchRealSearchResults(query, limit, platform, parentSignal) {
   return results;
 }
 
-function getYoutubeFormatUrl(format) {
-  if (!format?.url || typeof format.url !== 'string') return null;
+function sanitizeGoogleVideoUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
   try {
-    const url = new URL(format.url);
+    const url = new URL(rawUrl);
     if (url.protocol !== 'https:' || !(url.hostname === 'googlevideo.com' || url.hostname.endsWith('.googlevideo.com'))) return null;
     return url.href;
   } catch {
@@ -317,10 +317,24 @@ function getYoutubeFormatUrl(format) {
   }
 }
 
-function selectYoutubeMediaFormat(formats, type, quality) {
-  const available = formats
-    .map((format) => ({ format, url: getYoutubeFormatUrl(format) }))
-    .filter((item) => item.url);
+async function resolveYoutubeFormatUrl(format, player) {
+  // Plain formats already expose a direct url; ciphered ones need the player to decipher them.
+  if (format.url) return sanitizeGoogleVideoUrl(format.url);
+  if (!format.signature_cipher && !format.cipher) return null;
+  if (!player) return null;
+  try {
+    const decipheredUrl = await format.decipher(player);
+    return sanitizeGoogleVideoUrl(decipheredUrl);
+  } catch {
+    return null;
+  }
+}
+
+async function selectYoutubeMediaFormat(formats, type, quality, player) {
+  const resolved = await Promise.all(
+    formats.map(async (format) => ({ format, url: await resolveYoutubeFormatUrl(format, player) })),
+  );
+  const available = resolved.filter((item) => item.url);
 
   if (type === 'audio') {
     const selected = available
@@ -404,7 +418,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
           ...(playerData.streaming_data?.formats || []),
           ...(playerData.streaming_data?.adaptive_formats || []),
         ];
-        return selectYoutubeMediaFormat(formats, type, quality);
+        return await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
       } catch (error) {
         if (error.code !== 'YOUTUBE_FORMAT_UNAVAILABLE') throw error;
         lastFormatError = error;

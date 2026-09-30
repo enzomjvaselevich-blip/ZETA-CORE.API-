@@ -36,7 +36,7 @@ test('acepta únicamente formatos HTTPS reconocidos de YouTube', () => {
   assert.equal(secureApi.extractYoutubeVideoId('https://youtu.be/dQw4w9WgXcQ/extra'), null);
 });
 
-test('elige formatos directos válidos de YouTube según calidad y tipo', () => {
+test('elige formatos directos válidos de YouTube según calidad y tipo', async () => {
   const formats = [
     { mime_type: 'video/mp4', height: 360, bitrate: 700000, url: 'https://rr1.googlevideo.com/videoplayback?itag=18' },
     { mime_type: 'video/mp4', height: 720, bitrate: 1800000, url: 'https://rr1.googlevideo.com/videoplayback?itag=22' },
@@ -44,22 +44,45 @@ test('elige formatos directos válidos de YouTube según calidad y tipo', () => 
     { mime_type: 'video/mp4', height: 1080, bitrate: 4000000, url: 'https://attacker.example/video.mp4' },
   ];
 
-  assert.deepEqual(secureApi.selectYoutubeMediaFormat(formats, 'video', '720p'), {
+  assert.deepEqual(await secureApi.selectYoutubeMediaFormat(formats, 'video', '720p'), {
     url: formats[1].url,
     quality: '720p',
     bitrate: 1800000,
   });
-  assert.deepEqual(secureApi.selectYoutubeMediaFormat(formats, 'video', '1080p'), {
+  assert.deepEqual(await secureApi.selectYoutubeMediaFormat(formats, 'video', '1080p'), {
     url: formats[1].url,
     quality: '720p',
     bitrate: 1800000,
   });
-  assert.deepEqual(secureApi.selectYoutubeMediaFormat(formats, 'audio', '720p'), {
+  assert.deepEqual(await secureApi.selectYoutubeMediaFormat(formats, 'audio', '720p'), {
     url: formats[2].url,
     quality: 'audio-128kbps',
     bitrate: 128000,
   });
-  assert.throws(() => secureApi.selectYoutubeMediaFormat([], 'audio', '720p'), {
+  await assert.rejects(() => secureApi.selectYoutubeMediaFormat([], 'audio', '720p'), {
+    statusCode: 502,
+    code: 'YOUTUBE_FORMAT_UNAVAILABLE',
+  });
+});
+
+test('descifra formatos con signature_cipher usando el reproductor', async () => {
+  const fakePlayer = {};
+  const formats = [
+    {
+      mime_type: 'audio/mp4',
+      bitrate: 128000,
+      signature_cipher: 'fake-cipher',
+      decipher: async (player) => (player === fakePlayer ? 'https://rr2.googlevideo.com/videoplayback?itag=140&sig=ok' : null),
+    },
+  ];
+
+  assert.deepEqual(await secureApi.selectYoutubeMediaFormat(formats, 'audio', '720p', fakePlayer), {
+    url: 'https://rr2.googlevideo.com/videoplayback?itag=140&sig=ok',
+    quality: 'audio-128kbps',
+    bitrate: 128000,
+  });
+
+  await assert.rejects(() => secureApi.selectYoutubeMediaFormat(formats, 'audio', '720p'), {
     statusCode: 502,
     code: 'YOUTUBE_FORMAT_UNAVAILABLE',
   });
