@@ -86,7 +86,10 @@ async function fetchRealSearchResults(query, limit, platform) {
 async function fetchDirectYoutubeAudio(videoId) {
   try {
     const response = await fetch('https://www.youtube.com/watch?v=' + videoId, { 
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' } 
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'es-ES,es;q=0.9'
+      } 
     });
     const html = await response.text();
     totalBytesReceived += html.length;
@@ -99,7 +102,6 @@ async function fetchDirectYoutubeAudio(videoId) {
         if (streamingData) {
           const allFormats = [...(streamingData.adaptiveFormats || []), ...(streamingData.formats || [])];
           
-          // Buscar explícitamente formato de audio puro o contenedor con audio
           let audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/mp4') && f.url);
           if (!audioFormat) {
             audioFormat = allFormats.find(f => f.mimeType && f.mimeType.includes('audio/webm') && f.url);
@@ -115,7 +117,6 @@ async function fetchDirectYoutubeAudio(videoId) {
       } catch (err) {}
     }
 
-    // Respaldo por expresiones regulares para extraer enlaces directos de audio de googlevideo
     const streamRegex = /"audio\/(?:mp4|webm)"[^}]*?"url":"([^"]+)"/g;
     let match = streamRegex.exec(html);
     if (match && match[1]) {
@@ -130,6 +131,7 @@ async function fetchDirectYoutubeAudio(videoId) {
       }
     }
   } catch (e) {}
+  
   return '';
 }
 
@@ -468,7 +470,6 @@ function copiarJson(id){navigator.clipboard.writeText(document.getElementById(id
         if (idMatch) videoId = idMatch[1];
       }
       let downloadUrl = await fetchDirectYoutubeAudio(videoId);
-      if (!downloadUrl) downloadUrl = 'https://www.youtube.com/watch?v=' + videoId;
       const payload = JSON.stringify({ ok: true, endpoint: endpoint, action: endpoint === 'ytmp3' ? 'MP3' : 'MP4', input: query, title: title, videoId: videoId, resolved_url: 'https://www.youtube.com/watch?v=' + videoId, download_url: downloadUrl, url: downloadUrl, result: { title: title, url: 'https://www.youtube.com/watch?v=' + videoId, download: downloadUrl, thumbnail: 'https://i.ytimg.com/vi/' + videoId + '/hqdefault.jpg' } }, null, 2);
       totalBytesSent += payload.length;
       return res.end(payload);
