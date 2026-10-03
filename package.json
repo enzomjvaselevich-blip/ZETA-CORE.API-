@@ -1,4 +1,7 @@
 {
+  "name": "zeta-core-api",
+  "version": "1.0.0",
+  "type": "commonjs",
   "dependencies": {
     "@upstash/ratelimit": "^2.2.0",
     "@upstash/redis": "^1.39.0",
