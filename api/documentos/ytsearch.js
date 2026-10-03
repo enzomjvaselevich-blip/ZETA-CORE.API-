@@ -1,34 +1,25 @@
-async function searchYoutube(query, limit = 5, signal) {
-  const body = {
-    context: { client: { clientName: "WEB", clientVersion: "2.20240101.00.00" } },
-    query
-  };
-  const res = await fetch("https://www.youtube.com/youtubei/v1/search?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal
-  });
-  const data = await res.json();
-  const contents = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
-  let videos = [];
-  for (let c of contents) {
-    const vr = c.videoRenderer;
-    if (vr) {
-      videos.push({
-        videoId: vr.videoId,
-        id: vr.videoId,
-        title: vr.title?.runs?.[0]?.text || "",
-        url: `https://www.youtube.com/watch?v=${vr.videoId}`,
-        thumbnail: `https://i.ytimg.com/vi/${vr.videoId}/hqdefault.jpg`,
-        timestamp: vr.lengthText?.simpleText || "",
-        duration: vr.lengthText?.simpleText || "",
-        views: vr.viewCountText?.simpleText || "",
-        author: vr.ownerText?.runs?.[0]?.text || ""
-      });
-      if (videos.length >= limit) break;
-    }
-  }
-  return videos;
+let ytInstance = null;
+async function getYT() {
+  if (ytInstance) return ytInstance;
+  const { Innertube } = require('youtubei.js');
+  ytInstance = await Innertube.create({ generate_session: false });
+  return ytInstance;
+}
+
+async function searchYoutube(query, limit = 5) {
+  const yt = await getYT();
+  const res = await yt.search(query, { type: 'video' });
+  const videos = (res.results || res.videos || []).filter(v => v.id || v.video_id).slice(0, limit);
+  return videos.map(v => ({
+    videoId: v.id || v.video_id,
+    id: v.id || v.video_id,
+    title: v.title?.text || v.title || "",
+    url: `https://www.youtube.com/watch?v=${v.id || v.video_id}`,
+    thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+    timestamp: v.duration?.text || "",
+    duration: v.duration?.text || "",
+    views: v.view_count?.text || "",
+    author: v.author?.name || ""
+  }));
 }
 module.exports = { searchYoutube };
