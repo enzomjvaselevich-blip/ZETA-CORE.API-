@@ -1,16 +1,9 @@
 {
-  "name": "zeta-core-api",
-  "version": "1.0.0",
-  "type": "commonjs",
-  "main": "api/index.js",
-  "scripts": {
-    "start": "node index.js",
-    "test": "node --test"
-  },
   "dependencies": {
     "@upstash/ratelimit": "^2.2.0",
     "@upstash/redis": "^1.39.0",
-    "express": "^4.19.2",
+    "axios": "^1.7.2",
+    "cheerio": "^1.0.0",
     "youtubei.js": "^18.1.0"
   }
 }
