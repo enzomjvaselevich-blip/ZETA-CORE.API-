@@ -1,14 +1,17 @@
-// /ytsearch — Buscador de YouTube por scraping puro.
-//
-// Cómo funciona: se pide la página pública de resultados
-// https://www.youtube.com/results?search_query=... y se extrae el bloque
-// JSON `ytInitialData` que YouTube incrusta en un <script> del propio HTML.
-// No se llama a ninguna API externa ni de pago: es la misma página que ve
-// un navegador normal, solo que la leemos como texto.
-const secureApi = require('../secure-api');
-
-async function searchYoutube(query, limit, parentSignal) {
-  return secureApi.fetchRealSearchResults(query, limit, 'youtube', parentSignal);
+const yts = require('yt-search');
+async function searchYoutube(query, limit = 5, signal) {
+  const res = await yts(query);
+  const videos = res.videos.slice(0, limit).map(v => ({
+    videoId: v.videoId,
+    id: v.videoId,
+    title: v.title,
+    url: v.url,
+    thumbnail: v.thumbnail,
+    timestamp: v.timestamp,
+    duration: v.duration,
+    views: v.views,
+    author: v.author.name
+  }));
+  return videos;
 }
-
 module.exports = { searchYoutube };
