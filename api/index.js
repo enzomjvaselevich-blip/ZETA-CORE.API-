@@ -55,6 +55,7 @@ return sendJson(500,{ok:false,message:'Error interno: Modulo youtubei.js no enco
 }
 const yt=await Innertube.create({generate_session:false});
 let videoId=query;
+let searchMeta=null;
 const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
 if(match){
 videoId=match[1];
@@ -63,6 +64,9 @@ const search=await yt.search(query,{type:'video'});
 const firstVideo=search.videos?.[0];
 if(!firstVideo)return sendJson(404,{ok:false,message:'No se encontraron resultados para la busqueda: '+query});
 videoId=firstVideo.id;
+const vistasTexto=String(firstVideo.view_count?.text||firstVideo.view_count||'').replace(/[^0-9]/g,'');
+const partesDur=String(firstVideo.duration?.text||'').split(':').map(Number).filter(n=>!Number.isNaN(n));
+searchMeta={titulo:firstVideo.title?.text||firstVideo.title||'',canal:firstVideo.author?.name||'',visitas:Number(vistasTexto)||0,duracion:partesDur.length>=2?partesDur.reduce((a,b)=>a*60+b,0):0};
 }
 if(pathname==='/ytsearch'){
 const search=await yt.search(query,{type:'video'});
@@ -81,8 +85,8 @@ return sendJson(200,{ok:true,source:'youtube',query,total_resultados:results.len
 const isAudio=pathname==='/ytmp3';
 const media=await secureApi.fetchYoutubeMedia(videoId,isAudio?'audio':'video',qualityParam==='best'?'best':qualityParam);
 const basic=media.basic_info||{};
-const canal=typeof basic.author==='string'&&basic.author?basic.author:'Desconocido';
-const titulo=typeof basic.title==='string'&&basic.title?basic.title:'Desconocido';
+const canal=(typeof basic.author==='string'&&basic.author)?basic.author:(searchMeta?.canal||'Desconocido');
+const titulo=(typeof basic.title==='string'&&basic.title)?basic.title:(searchMeta?.titulo||'Desconocido');
 const link=`https://www.youtube.com/watch?v=${videoId}`;
 return sendJson(200,{
 ok:true,
@@ -90,9 +94,9 @@ tipo:isAudio?'Audio MP3':'Video MP4',
 titulo,
 canal,
 link,
-visitas:Number(basic.view_count)||0,
+visitas:Number(basic.view_count)||searchMeta?.visitas||0,
 likes:Number(basic.like_count)||0,
-duracion_segundos:Number(basic.duration)||0,
+duracion_segundos:Number(basic.duration)||searchMeta?.duracion||0,
 videoId:videoId,
 url_original:link,
 descarga_directa:media.url,
