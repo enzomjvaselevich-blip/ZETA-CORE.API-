@@ -468,37 +468,58 @@ function mapWatchPageFormats(streamingData) {
   ];
 }
 
+const WATCH_PAGE_COOKIES = 'CONSENT=YES+cb.20210328-17-p0.en+FX+678; SOCS=CAI';
+
 async function fetchYoutubeWatchPageMedia(videoId, type, quality, player, parentSignal) {
-  const { text } = await fetchTextSafe(
-    `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=es&bpctr=9999999999&has_verified=1`,
-    {
-      allowedHosts: ['youtube.com', 'www.youtube.com'],
-      parentSignal,
-      timeoutMs: 5000,
-      headers: {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'accept-language': 'es-ES,es;q=0.9,en;q=0.8',
+  const variants = [
+    `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=es&bpctr=9999999999&has_verified=1&ucbcb=1`,
+    `https://m.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=es&bpctr=9999999999&has_verified=1&ucbcb=1`,
+  ];
+  const problemas = [];
+  for (const watchUrl of variants) {
+    let text;
+    try {
+      ({ text } = await fetchTextSafe(watchUrl, {
+        allowedHosts: ['youtube.com', 'www.youtube.com', 'm.youtube.com'],
+        parentSignal,
+        timeoutMs: 5000,
+        headers: {
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'accept-language': 'es-ES,es;q=0.9,en;q=0.8',
+          cookie: WATCH_PAGE_COOKIES,
+        },
+      }));
+    } catch (error) {
+      problemas.push(`fetch: ${String(error.message || error).slice(0, 80)}`);
+      continue;
+    }
+    const playerResponse = extractEmbeddedJson(text, 'ytInitialPlayerResponse');
+    if (!playerResponse) {
+      problemas.push('sin ytInitialPlayerResponse');
+      continue;
+    }
+    if (!playerResponse.streamingData) {
+      problemas.push(`sin streamingData (${playerResponse.playabilityStatus?.status || 'desconocido'})`);
+      continue;
+    }
+    const formats = mapWatchPageFormats(playerResponse.streamingData);
+    const selected = await selectYoutubeMediaFormat(formats, type, quality, player);
+    const details = playerResponse.videoDetails || {};
+    return {
+      ...selected,
+      basic_info: {
+        title: typeof details.title === 'string' ? details.title : undefined,
+        author: typeof details.author === 'string' ? details.author : undefined,
+        view_count: Number(details.viewCount) || 0,
+        like_count: 0,
+        duration: Number(details.lengthSeconds) || 0,
       },
-    },
-  );
-  const playerResponse = extractEmbeddedJson(text, 'ytInitialPlayerResponse');
-  if (!playerResponse?.streamingData) {
-    throw apiError(502, 'La pagina de YouTube no expuso datos de reproduccion.', { code: 'YOUTUBE_WATCHPAGE_EMPTY' });
+    };
   }
-  const formats = mapWatchPageFormats(playerResponse.streamingData);
-  const selected = await selectYoutubeMediaFormat(formats, type, quality, player);
-  const details = playerResponse.videoDetails || {};
-  return {
-    ...selected,
-    basic_info: {
-      title: typeof details.title === 'string' ? details.title : undefined,
-      author: typeof details.author === 'string' ? details.author : undefined,
-      view_count: Number(details.viewCount) || 0,
-      like_count: 0,
-      duration: Number(details.lengthSeconds) || 0,
-    },
-  };
+  const error = apiError(502, 'La pagina de YouTube no expuso datos de reproduccion.', { code: 'YOUTUBE_WATCHPAGE_EMPTY' });
+  error.detalles = problemas;
+  throw error;
 }
 
 async function selectYoutubeMediaFormat(formats, type, quality, player) {
@@ -599,7 +620,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     const ytjs = await import('youtubei.js');
     patchJsEvaluator(ytjs.Platform);
     const youtube = await ytjs.Innertube.create({ fetch: fetchWithTimeout });
-    const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'ANDROID', 'MWEB', 'WEB', 'TV', 'WEB_EMBEDDED', 'TV_EMBEDDED'];
+    const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID', 'MWEB', 'WEB', 'TV'];
     let lastFormatError;
     let lastCause;
     let basicInfo;
@@ -608,6 +629,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       if (controller.signal.aborted || parentSignal?.aborted) {
         throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
       }
+      let clientDiag = { cliente: client };
       try {
         const playerData = await youtube.getBasicInfo(videoId, { client });
         basicInfo = basicInfo || playerData.basic_info;
@@ -615,8 +637,12 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
           ...(playerData.streaming_data?.formats || []),
           ...(playerData.streaming_data?.adaptive_formats || []),
         ];
+        clientDiag.playability = playerData.playability_status?.status || 'UNKNOWN';
+        clientDiag.formatos = formats.length;
+        clientDiag.directos = formats.filter((f) => f.url).length;
         const selected = await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
-        diagnostics.push({ cliente: client, formatos: formats.length, ok: true });
+        clientDiag.ok = true;
+        diagnostics.push(clientDiag);
         return { ...selected, basic_info: basicInfo };
       } catch (error) {
         if (parentSignal?.aborted || controller.signal.aborted) {
@@ -624,7 +650,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
         }
         lastCause = error;
         if (error.code === 'YOUTUBE_FORMAT_UNAVAILABLE') lastFormatError = error;
-        diagnostics.push({ cliente: client, ok: false, error: String(error.message || error).slice(0, 120) });
+        diagnostics.push({ ...clientDiag, ok: false, error: String(error.message || error).slice(0, 120) });
       }
     }
     try {
@@ -635,7 +661,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       if (parentSignal?.aborted || controller.signal.aborted) {
         throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
       }
-      diagnostics.push({ cliente: 'WATCH_PAGE', ok: false, error: String(watchError.message || watchError).slice(0, 120) });
+      diagnostics.push({ cliente: 'WATCH_PAGE', ok: false, error: String(watchError.message || watchError).slice(0, 120), detalle: watchError.detalles });
     }
     const failure = lastFormatError || apiError(502, `YouTube no pudo proporcionar los formatos multimedia en este momento${lastCause?.message ? ` (${String(lastCause.message).slice(0, 140)})` : ''}.`, {
       code: 'YOUTUBE_UPSTREAM_FAILED',
