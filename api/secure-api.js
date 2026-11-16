@@ -401,14 +401,104 @@ function sanitizeGoogleVideoUrl(rawUrl) {
 async function resolveYoutubeFormatUrl(format, player) {
   // Plain formats already expose a direct url; ciphered ones need the player to decipher them.
   if (format.url) return sanitizeGoogleVideoUrl(format.url);
-  if (!format.signature_cipher && !format.cipher) return null;
+  const signatureCipher = format.signature_cipher || format.signatureCipher;
+  const cipher = format.cipher;
+  if (!signatureCipher && !cipher) return null;
   if (!player) return null;
   try {
-    const decipheredUrl = await format.decipher(player);
-    return sanitizeGoogleVideoUrl(decipheredUrl);
+    if (typeof format.decipher === 'function') return sanitizeGoogleVideoUrl(await format.decipher(player));
+    return sanitizeGoogleVideoUrl(await player.decipher(format.url, signatureCipher, cipher));
   } catch {
     return null;
   }
+}
+
+function extractEmbeddedJson(html, marker) {
+  const markerIndex = html.indexOf(marker);
+  if (markerIndex === -1) return null;
+  const braceStart = html.indexOf('{', markerIndex);
+  if (braceStart === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = braceStart; i < html.length; i += 1) {
+    const char = html[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(html.slice(braceStart, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function mapWatchPageFormats(streamingData) {
+  const progressive = Array.isArray(streamingData?.formats) ? streamingData.formats : [];
+  const adaptive = Array.isArray(streamingData?.adaptiveFormats) ? streamingData.adaptiveFormats : [];
+  const progressiveItags = new Set(progressive.map((f) => String(f.itag)));
+  const mapFormat = (f, isProgressive) => {
+    const mime = typeof f.mimeType === 'string' ? f.mimeType : '';
+    return {
+      mime_type: mime,
+      bitrate: Number(f.bitrate) || 0,
+      height: Number(f.height) || 0,
+      quality_label: f.qualityLabel || null,
+      url: typeof f.url === 'string' ? f.url : undefined,
+      signature_cipher: typeof f.signatureCipher === 'string' ? f.signatureCipher : undefined,
+      has_audio: isProgressive || mime.includes('audio/'),
+      has_video: isProgressive || mime.includes('video/'),
+    };
+  };
+  return [
+    ...progressive.map((f) => mapFormat(f, true)),
+    ...adaptive.filter((f) => !progressiveItags.has(String(f.itag))).map((f) => mapFormat(f, false)),
+  ];
+}
+
+async function fetchYoutubeWatchPageMedia(videoId, type, quality, player, parentSignal) {
+  const { text } = await fetchTextSafe(
+    `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&hl=es&bpctr=9999999999&has_verified=1`,
+    {
+      allowedHosts: ['youtube.com', 'www.youtube.com'],
+      parentSignal,
+      timeoutMs: 5000,
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'es-ES,es;q=0.9,en;q=0.8',
+      },
+    },
+  );
+  const playerResponse = extractEmbeddedJson(text, 'ytInitialPlayerResponse');
+  if (!playerResponse?.streamingData) {
+    throw apiError(502, 'La pagina de YouTube no expuso datos de reproduccion.', { code: 'YOUTUBE_WATCHPAGE_EMPTY' });
+  }
+  const formats = mapWatchPageFormats(playerResponse.streamingData);
+  const selected = await selectYoutubeMediaFormat(formats, type, quality, player);
+  const details = playerResponse.videoDetails || {};
+  return {
+    ...selected,
+    basic_info: {
+      title: typeof details.title === 'string' ? details.title : undefined,
+      author: typeof details.author === 'string' ? details.author : undefined,
+      view_count: Number(details.viewCount) || 0,
+      like_count: 0,
+      duration: Number(details.lengthSeconds) || 0,
+    },
+  };
 }
 
 async function selectYoutubeMediaFormat(formats, type, quality, player) {
@@ -474,7 +564,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
   const controller = new AbortController();
   const timeoutError = apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
   const abortFromParent = () => controller.abort(parentSignal.reason || timeoutError);
-  const timer = setTimeout(() => controller.abort(timeoutError), 6500);
+  const timer = setTimeout(() => controller.abort(timeoutError), 24000);
   if (parentSignal) parentSignal.addEventListener('abort', abortFromParent, { once: true });
   const fetchWithTimeout = (input, init = {}) => {
     let requestUrl;
@@ -509,10 +599,11 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     const ytjs = await import('youtubei.js');
     patchJsEvaluator(ytjs.Platform);
     const youtube = await ytjs.Innertube.create({ fetch: fetchWithTimeout });
-    const clients = ['IOS', 'ANDROID_VR', 'TV', 'ANDROID', 'MWEB', 'WEB'];
+    const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'ANDROID', 'MWEB', 'WEB', 'TV', 'WEB_EMBEDDED', 'TV_EMBEDDED'];
     let lastFormatError;
     let lastCause;
     let basicInfo;
+    const diagnostics = [];
     for (const client of clients) {
       if (controller.signal.aborted || parentSignal?.aborted) {
         throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
@@ -525,6 +616,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
           ...(playerData.streaming_data?.adaptive_formats || []),
         ];
         const selected = await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
+        diagnostics.push({ cliente: client, formatos: formats.length, ok: true });
         return { ...selected, basic_info: basicInfo };
       } catch (error) {
         if (parentSignal?.aborted || controller.signal.aborted) {
@@ -532,12 +624,24 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
         }
         lastCause = error;
         if (error.code === 'YOUTUBE_FORMAT_UNAVAILABLE') lastFormatError = error;
+        diagnostics.push({ cliente: client, ok: false, error: String(error.message || error).slice(0, 120) });
       }
     }
-    if (lastFormatError) throw lastFormatError;
-    throw apiError(502, `YouTube no pudo proporcionar los formatos multimedia en este momento${lastCause?.message ? ` (${String(lastCause.message).slice(0, 140)})` : ''}.`, {
+    try {
+      const watchMedia = await fetchYoutubeWatchPageMedia(videoId, type, quality, youtube.session.player, controller.signal);
+      diagnostics.push({ cliente: 'WATCH_PAGE', ok: true });
+      return { ...watchMedia, basic_info: basicInfo?.title ? basicInfo : { ...watchMedia.basic_info, ...basicInfo } };
+    } catch (watchError) {
+      if (parentSignal?.aborted || controller.signal.aborted) {
+        throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
+      }
+      diagnostics.push({ cliente: 'WATCH_PAGE', ok: false, error: String(watchError.message || watchError).slice(0, 120) });
+    }
+    const failure = lastFormatError || apiError(502, `YouTube no pudo proporcionar los formatos multimedia en este momento${lastCause?.message ? ` (${String(lastCause.message).slice(0, 140)})` : ''}.`, {
       code: 'YOUTUBE_UPSTREAM_FAILED',
     });
+    failure.detalles = diagnostics;
+    throw failure;
   } catch (error) {
     if (error.statusCode) throw error;
     if (parentSignal?.aborted || controller.signal.aborted) {
@@ -718,6 +822,7 @@ module.exports = {
   fetchRealSearchResults,
   fetchTikTokVideo,
   fetchYoutubeMedia,
+  fetchYoutubeWatchPageMedia,
   selectYoutubeMediaFormat,
   publicErrorMessage,
 };
