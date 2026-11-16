@@ -579,10 +579,10 @@ function patchJsEvaluator(Platform) {
   jsEvaluatorPatched = true;
 }
 
-let youtubePoTokenCache = null;
+let youtubePoMinterCache = null;
 
-async function acquireYoutubePoToken(youtube) {
-  if (youtubePoTokenCache && youtubePoTokenCache.expiresAt > Date.now()) return youtubePoTokenCache.token;
+async function acquireYoutubePoMinter(youtube) {
+  if (youtubePoMinterCache && youtubePoMinterCache.expiresAt > Date.now()) return youtubePoMinterCache;
   const visitorData = youtube.session.context.client.visitorData;
   if (!visitorData) return null;
   const challengeResponse = await youtube.getAttestationChallenge('ENGAGEMENT_TYPE_UNBOUND');
@@ -619,10 +619,9 @@ async function acquireYoutubePoToken(youtube) {
     { integrityToken: integrityRaw[0], estimatedTtlSecs: integrityRaw[1], mintRefreshThreshold: integrityRaw[2], websafeFallbackToken: integrityRaw[3] },
     webPoSignalOutput,
   );
-  const token = await minter.mintAsWebsafeString(visitorData);
-  if (!token) return null;
-  youtubePoTokenCache = { token, visitorData, expiresAt: Date.now() + 6 * 60 * 60 * 1000 };
-  return token;
+  if (typeof minter?.mintAsWebsafeString !== 'function') return null;
+  youtubePoMinterCache = { minter, visitorData, expiresAt: Date.now() + 6 * 60 * 60 * 1000 };
+  return youtubePoMinterCache;
 }
 
 async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
@@ -712,11 +711,17 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     }
     if (loginRequiredCount > 0) {
       try {
-        const poToken = await acquireYoutubePoToken(youtube);
-        if (poToken) {
+        const minterData = await acquireYoutubePoMinter(youtube);
+        if (minterData) {
           diagnostics.push({ cliente: 'PO_TOKEN', ok: true });
+          const videoToken = await minterData.minter.mintAsWebsafeString(videoId);
           for (const client of ['IOS', 'ANDROID_VR', 'WEB', 'MWEB']) {
-            const media = await attemptClient(client, poToken);
+            const media = await attemptClient(client, videoToken);
+            if (media) return media;
+          }
+          const visitorToken = await minterData.minter.mintAsWebsafeString(minterData.visitorData);
+          for (const client of ['WEB', 'MWEB']) {
+            const media = await attemptClient(client, visitorToken);
             if (media) return media;
           }
         } else {
