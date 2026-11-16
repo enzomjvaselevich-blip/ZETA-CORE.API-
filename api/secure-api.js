@@ -669,7 +669,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       ...(process.env.YOUTUBE_COOKIE ? { cookie: process.env.YOUTUBE_COOKIE } : {}),
       ...(process.env.YOUTUBE_VISITOR_DATA ? { visitor_data: process.env.YOUTUBE_VISITOR_DATA } : {}),
     });
-    const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID', 'MWEB', 'WEB', 'TV', 'YTMUSIC_ANDROID', 'YTSTUDIO_ANDROID'];
+    const clients = ['IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
     const deadline = Date.now() + 21000;
     let lastFormatError;
     let lastCause;
@@ -707,7 +707,19 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
         return null;
       }
     };
-    for (const client of clients) {
+    const attemptInParallel = async (clientList, poToken) => {
+      const results = await Promise.allSettled(clientList.map((client) => attemptClient(client, poToken)));
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) return result.value;
+      }
+      return null;
+    };
+    for (let round = 0; round < 3; round += 1) {
+      if (Date.now() > deadline - 3000) break;
+      const media = await attemptInParallel(clients.slice(0, 5), undefined);
+      if (media) return media;
+    }
+    for (const client of clients.slice(5)) {
       if (Date.now() > deadline - 2500) break;
       const media = await attemptClient(client);
       if (media) return media;
