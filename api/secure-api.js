@@ -418,13 +418,14 @@ async function selectYoutubeMediaFormat(formats, type, quality, player) {
   const available = resolved.filter((item) => item.url);
 
   if (type === 'audio') {
-    const selected = available
-      .filter(({ format }) => format.mime_type?.startsWith('audio/'))
-      .sort((a, b) => (b.format.bitrate || 0) - (a.format.bitrate || 0))[0];
+    const audioOnly = available.filter(({ format }) => format.mime_type?.startsWith('audio/'));
+    const selected = audioOnly.sort((a, b) => (b.format.bitrate || 0) - (a.format.bitrate || 0))[0] ||
+      available.filter(({ format }) => format.has_audio)
+        .sort((a, b) => (b.format.bitrate || 0) - (a.format.bitrate || 0))[0];
     if (selected) {
       return {
         url: selected.url,
-        quality: `audio-${Math.round((selected.format.bitrate || 128000) / 1000)}kbps`,
+        quality: selected.format.quality_label || `audio-${Math.round((selected.format.bitrate || 128000) / 1000)}kbps`,
         bitrate: selected.format.bitrate || null,
       };
     }
@@ -481,13 +482,13 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     try {
       requestUrl = new URL(input instanceof URL ? input.href : typeof input === 'string' ? input : input.url);
     } catch {
-      throw apiError(502, 'YOUTUBE_UPSTREAM_BLOCKED', 'YouTube intentó consultar un destino no permitido.');
+      throw apiError(502, 'YouTube intentó consultar un destino no permitido.', { code: 'YOUTUBE_UPSTREAM_BLOCKED' });
     }
     if (
       requestUrl.protocol !== 'https:' || requestUrl.username || requestUrl.password || requestUrl.port ||
       !['youtube.com', 'www.youtube.com'].includes(requestUrl.hostname.toLowerCase())
     ) {
-      throw apiError(502, 'YOUTUBE_UPSTREAM_BLOCKED', 'YouTube intentó consultar un destino no permitido.');
+      throw apiError(502, 'YouTube intentó consultar un destino no permitido.', { code: 'YOUTUBE_UPSTREAM_BLOCKED' });
     }
 
     const requestController = new AbortController();
@@ -509,11 +510,13 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     const ytjs = await import('youtubei.js');
     patchJsEvaluator(ytjs.Platform);
     const youtube = await ytjs.Innertube.create({ fetch: fetchWithTimeout });
+    const clients = ['IOS', 'ANDROID_VR', 'TV', 'ANDROID', 'MWEB', 'WEB'];
     let lastFormatError;
+    let lastCause;
     let basicInfo;
-    for (const client of ['IOS', 'ANDROID', 'WEB', 'MWEB']) {
+    for (const client of clients) {
       if (controller.signal.aborted || parentSignal?.aborted) {
-        throw apiError(504, 'REQUEST_TIMEOUT', 'YouTube tardó demasiado en responder.');
+        throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
       }
       try {
         const playerData = await youtube.getBasicInfo(videoId, { client });
@@ -525,19 +528,25 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
         const selected = await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
         return { ...selected, basic_info: basicInfo };
       } catch (error) {
-        if (error.code !== 'YOUTUBE_FORMAT_UNAVAILABLE') throw error;
-        lastFormatError = error;
+        if (parentSignal?.aborted || controller.signal.aborted) {
+          throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
+        }
+        lastCause = error;
+        if (error.code === 'YOUTUBE_FORMAT_UNAVAILABLE') lastFormatError = error;
       }
     }
-    throw lastFormatError || apiError(502, 'No hay un enlace multimedia directo compatible disponible para este video.', {
-      code: 'YOUTUBE_FORMAT_UNAVAILABLE',
+    if (lastFormatError) throw lastFormatError;
+    throw apiError(502, `YouTube no pudo proporcionar los formatos multimedia en este momento${lastCause?.message ? ` (${String(lastCause.message).slice(0, 140)})` : ''}.`, {
+      code: 'YOUTUBE_UPSTREAM_FAILED',
     });
   } catch (error) {
     if (error.statusCode) throw error;
     if (parentSignal?.aborted || controller.signal.aborted) {
-      throw apiError(504, 'REQUEST_TIMEOUT', 'YouTube tardó demasiado en responder.');
+      throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
     }
-    throw apiError(502, 'YOUTUBE_UPSTREAM_FAILED', 'YouTube no pudo proporcionar los formatos multimedia en este momento.');
+    throw apiError(502, `YouTube no pudo proporcionar los formatos multimedia en este momento${error?.message ? ` (${String(error.message).slice(0, 140)})` : ''}.`, {
+      code: 'YOUTUBE_UPSTREAM_FAILED',
+    });
   } finally {
     clearTimeout(timer);
     if (parentSignal) parentSignal.removeEventListener('abort', abortFromParent);
