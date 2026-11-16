@@ -669,7 +669,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       ...(process.env.YOUTUBE_COOKIE ? { cookie: process.env.YOUTUBE_COOKIE } : {}),
       ...(process.env.YOUTUBE_VISITOR_DATA ? { visitor_data: process.env.YOUTUBE_VISITOR_DATA } : {}),
     });
-    const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID', 'MWEB', 'WEB', 'TV'];
+    const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID', 'MWEB', 'WEB', 'TV', 'YTMUSIC_ANDROID', 'YTSTUDIO_ANDROID'];
     let lastFormatError;
     let lastCause;
     let basicInfo;
