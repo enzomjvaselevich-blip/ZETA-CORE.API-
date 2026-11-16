@@ -670,6 +670,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       ...(process.env.YOUTUBE_VISITOR_DATA ? { visitor_data: process.env.YOUTUBE_VISITOR_DATA } : {}),
     });
     const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID', 'MWEB', 'WEB', 'TV', 'YTMUSIC_ANDROID', 'YTSTUDIO_ANDROID'];
+    const deadline = Date.now() + 21000;
     let lastFormatError;
     let lastCause;
     let basicInfo;
@@ -707,21 +708,24 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       }
     };
     for (const client of clients) {
+      if (Date.now() > deadline - 2500) break;
       const media = await attemptClient(client);
       if (media) return media;
     }
-    if (loginRequiredCount > 0) {
+    if (loginRequiredCount > 0 && Date.now() < deadline - 9000) {
       try {
         const minterData = await acquireYoutubePoMinter(youtube);
         if (minterData) {
           diagnostics.push({ cliente: 'PO_TOKEN', ok: true });
           const videoToken = await minterData.minter.mintAsWebsafeString(videoId);
           for (const client of ['IOS', 'ANDROID_VR', 'WEB', 'MWEB']) {
+            if (Date.now() > deadline - 2500) break;
             const media = await attemptClient(client, videoToken);
             if (media) return media;
           }
           const visitorToken = await minterData.minter.mintAsWebsafeString(minterData.visitorData);
           for (const client of ['WEB', 'MWEB']) {
+            if (Date.now() > deadline - 2500) break;
             const media = await attemptClient(client, visitorToken);
             if (media) return media;
           }
