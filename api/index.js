@@ -88,11 +88,19 @@ const basic=media.basic_info||{};
 const canal=(typeof basic.author==='string'&&basic.author)?basic.author:(searchMeta?.canal||'Desconocido');
 const titulo=(typeof basic.title==='string'&&basic.title)?basic.title:(searchMeta?.titulo||'Desconocido');
 const link=`https://www.youtube.com/watch?v=${videoId}`;
+let tituloFinal=titulo,canalFinal=canal;
+if(tituloFinal==='Desconocido'||canalFinal==='Desconocido'){
+try{
+const oe=await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(link)}&format=json`,{signal:AbortSignal.timeout(3000)}).then(r=>r.json());
+if(typeof oe.title==='string'&&oe.title)tituloFinal=oe.title;
+if(typeof oe.author_name==='string'&&oe.author_name)canalFinal=oe.author_name;
+}catch(e){}
+}
 return sendJson(200,{
 ok:true,
 tipo:isAudio?'Audio MP3':'Video MP4',
-titulo,
-canal,
+titulo:tituloFinal,
+canal:canalFinal,
 link,
 visitas:Number(basic.view_count)||searchMeta?.visitas||0,
 likes:Number(basic.like_count)||0,

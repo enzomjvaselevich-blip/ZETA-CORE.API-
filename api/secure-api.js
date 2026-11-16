@@ -579,6 +579,25 @@ function patchJsEvaluator(Platform) {
   jsEvaluatorPatched = true;
 }
 
+function normalizeYoutubeCookie(raw) {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value) return '';
+  const lines = value.split('\n');
+  const looksNetscape = lines.some((line) => line.includes('\t') && !line.startsWith('#'));
+  if (!looksNetscape) return value.replace(/\s*\n\s*/g, ' ');
+  const now = Math.floor(Date.now() / 1000);
+  const pairs = [];
+  for (const line of lines) {
+    if (!line || line.startsWith('#')) continue;
+    const fields = line.split('\t').map((f) => f.trim());
+    if (fields.length < 7 || !fields[5] || !fields[6]) continue;
+    const expiry = Number(fields[4]);
+    if (Number.isFinite(expiry) && expiry > 0 && expiry < now) continue;
+    pairs.push(`${fields[5]}=${fields[6]}`);
+  }
+  return pairs.join('; ');
+}
+
 let youtubePoMinterCache = null;
 
 async function acquireYoutubePoMinter(youtube) {
@@ -666,7 +685,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     patchJsEvaluator(ytjs.Platform);
     const youtube = await ytjs.Innertube.create({
       fetch: fetchWithTimeout,
-      ...(process.env.YOUTUBE_COOKIE ? { cookie: process.env.YOUTUBE_COOKIE } : {}),
+      ...(process.env.YOUTUBE_COOKIE ? { cookie: normalizeYoutubeCookie(process.env.YOUTUBE_COOKIE) } : {}),
       ...(process.env.YOUTUBE_VISITOR_DATA ? { visitor_data: process.env.YOUTUBE_VISITOR_DATA } : {}),
     });
     const clients = ['IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
