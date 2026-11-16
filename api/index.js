@@ -117,6 +117,6 @@ return sendJson(200,{ok:true,...(await fetchXVideo(query))});
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
 console.error(error);
-return sendJson(error.statusCode||500,{ok:false,code:error.code||'CRITICAL_ERROR',message:error.message,solucion:"Revisa los logs en Vercel.",...(error.detalles?{detalles:error.detalles}:{})});
+return sendJson(error.statusCode||500,{ok:false,code:error.code||'CRITICAL_ERROR',message:error.message,solucion:error.solucion||"Revisa los logs en Vercel.",...(error.detalles?{detalles:error.detalles}:{})});
 }
 };

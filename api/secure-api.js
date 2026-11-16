@@ -619,11 +619,15 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
   try {
     const ytjs = await import('youtubei.js');
     patchJsEvaluator(ytjs.Platform);
-    const youtube = await ytjs.Innertube.create({ fetch: fetchWithTimeout });
+    const youtube = await ytjs.Innertube.create({
+      fetch: fetchWithTimeout,
+      ...(process.env.YOUTUBE_COOKIE ? { cookie: process.env.YOUTUBE_COOKIE } : {}),
+    });
     const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID', 'MWEB', 'WEB', 'TV'];
     let lastFormatError;
     let lastCause;
     let basicInfo;
+    let loginRequiredCount = 0;
     const diagnostics = [];
     for (const client of clients) {
       if (controller.signal.aborted || parentSignal?.aborted) {
@@ -638,8 +642,10 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
           ...(playerData.streaming_data?.adaptive_formats || []),
         ];
         clientDiag.playability = playerData.playability_status?.status || 'UNKNOWN';
+        if (playerData.playability_status?.reason) clientDiag.razon = String(playerData.playability_status.reason).slice(0, 100);
         clientDiag.formatos = formats.length;
         clientDiag.directos = formats.filter((f) => f.url).length;
+        if (clientDiag.playability === 'LOGIN_REQUIRED') loginRequiredCount += 1;
         const selected = await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
         clientDiag.ok = true;
         diagnostics.push(clientDiag);
@@ -662,6 +668,14 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
         throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
       }
       diagnostics.push({ cliente: 'WATCH_PAGE', ok: false, error: String(watchError.message || watchError).slice(0, 120), detalle: watchError.detalles });
+    }
+    if (loginRequiredCount >= clients.length - 1) {
+      const loginError = apiError(502, 'Este video tiene restriccion de edad o verificacion anti-bot: YouTube exige inicio de sesion para descargarlo.', {
+        code: 'YOUTUBE_LOGIN_REQUIRED',
+      });
+      loginError.solucion = 'Proba con otro video, o configura la variable de entorno YOUTUBE_COOKIE en Vercel con una cookie de sesion de YouTube para desbloquear videos restringidos.';
+      loginError.detalles = diagnostics;
+      throw loginError;
     }
     const failure = lastFormatError || apiError(502, `YouTube no pudo proporcionar los formatos multimedia en este momento${lastCause?.message ? ` (${String(lastCause.message).slice(0, 140)})` : ''}.`, {
       code: 'YOUTUBE_UPSTREAM_FAILED',
