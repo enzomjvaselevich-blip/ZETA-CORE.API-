@@ -667,6 +667,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     const youtube = await ytjs.Innertube.create({
       fetch: fetchWithTimeout,
       ...(process.env.YOUTUBE_COOKIE ? { cookie: process.env.YOUTUBE_COOKIE } : {}),
+      ...(process.env.YOUTUBE_VISITOR_DATA ? { visitor_data: process.env.YOUTUBE_VISITOR_DATA } : {}),
     });
     const clients = ['IOS', 'ANDROID_VR', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID', 'MWEB', 'WEB', 'TV'];
     let lastFormatError;
@@ -748,7 +749,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       const loginError = apiError(502, 'Este video tiene restriccion de edad o verificacion anti-bot: YouTube exige inicio de sesion para descargarlo.', {
         code: 'YOUTUBE_LOGIN_REQUIRED',
       });
-      loginError.solucion = 'Proba con otro video, o configura la variable de entorno YOUTUBE_COOKIE en Vercel con una cookie de sesion de YouTube para desbloquear videos restringidos.';
+      loginError.solucion = 'YouTube exige sesion iniciada para este video desde IPs de servidor. Solucion: en Vercel (Settings > Environment Variables) crea YOUTUBE_COOKIE con la cookie de tu navegador logueado en YouTube (F12 > Network > clic en un pedido a youtube.com > Request Headers > Cookie) y haz redeploy.';
       loginError.detalles = diagnostics;
       throw loginError;
     }
