@@ -458,9 +458,8 @@ function patchJsEvaluator(Platform) {
     ...Platform.shim,
     eval(data, evalArgs) {
       const context = vm.createContext({});
-      vm.runInContext(data.output, context, { timeout: 5000 });
       return vm.runInContext(
-        `process(${JSON.stringify(evalArgs?.n ?? '')}, ${JSON.stringify(evalArgs?.sp ?? '')}, ${JSON.stringify(evalArgs?.sig ?? '')})`,
+        `(function(){\n${data.output}\nreturn process(${JSON.stringify(evalArgs?.n ?? '')}, ${JSON.stringify(evalArgs?.sp ?? '')}, ${JSON.stringify(evalArgs?.sig ?? '')});\n})()`,
         context,
         { timeout: 5000 },
       );
