@@ -127,7 +127,7 @@ return sendJson(200,{ok:true,...(await fetchXVideo(query))});
 }catch(e){return sendJson(502,{ok:false,message:'Modulo X no disponible',error:e.message});}
 }
 if(pathname==='/status'){
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',youtube_cookie_configurada:!!process.env.YOUTUBE_COOKIE,youtube_visitor_data_configurada:!!process.env.YOUTUBE_VISITOR_DATA,endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/status']});
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){

@@ -683,10 +683,12 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
   try {
     const ytjs = await import('youtubei.js');
     patchJsEvaluator(ytjs.Platform);
+    const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
+    const visitorRaw = process.env.YOUTUBE_VISITOR_DATA || process.env.youtube_visitor_data || '';
     const youtube = await ytjs.Innertube.create({
       fetch: fetchWithTimeout,
-      ...(process.env.YOUTUBE_COOKIE ? { cookie: normalizeYoutubeCookie(process.env.YOUTUBE_COOKIE) } : {}),
-      ...(process.env.YOUTUBE_VISITOR_DATA ? { visitor_data: process.env.YOUTUBE_VISITOR_DATA } : {}),
+      ...(cookieRaw ? { cookie: normalizeYoutubeCookie(cookieRaw) } : {}),
+      ...(visitorRaw ? { visitor_data: visitorRaw } : {}),
     });
     const clients = ['IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
     const deadline = Date.now() + 21000;
