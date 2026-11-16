@@ -11,7 +11,8 @@ const SYNDICATION_HOST = 'cdn.syndication.twimg.com';
 
 async function fetchXVideo(inputUrl, parentSignal) {
   const tweetId = secureApi.extractTweetId(inputUrl);
-  const syndicationUrl = `https://${SYNDICATION_HOST}/tweet-result?id=${tweetId}&lang=en`;
+  const token = ((Number(tweetId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+  const syndicationUrl = `https://${SYNDICATION_HOST}/tweet-result?id=${tweetId}&lang=en&token=${token}`;
 
   let response;
   let body;
@@ -53,7 +54,7 @@ async function fetchXVideo(inputUrl, parentSignal) {
     videos,
     total_videos: videos.length,
     best: videos[0].url,
-    thumbnail: tweet.media?.photos?.[0]?.url || tweet.media?.videos?.[0]?.thumbnail_url || null,
+    thumbnail: tweet.media?.photos?.[0]?.url || tweet.photos?.[0]?.url || tweet.media?.videos?.[0]?.thumbnail_url || null,
     text: tweet.text || null,
   };
 }

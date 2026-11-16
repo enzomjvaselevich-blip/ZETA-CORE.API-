@@ -1,6 +1,7 @@
 const { createHash } = require('node:crypto');
 const { Redis } = require('@upstash/redis');
 const { Ratelimit } = require('@upstash/ratelimit');
+const vm = require('node:vm');
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_REDIRECTS = 4;
@@ -250,19 +251,85 @@ function decodeJsonString(value) {
   }
 }
 
+function slugifyTikTokQuery(query) {
+  return String(query)
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+}
+
+function parseTikTokEmbeddedItems(text) {
+  const items = [];
+  const universalMatch = text.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
+  if (universalMatch) {
+    try {
+      const universal = JSON.parse(universalMatch[1]);
+      const scope = universal.__DEFAULT_SCOPE__ || {};
+      const forYouList = scope['webapp.foryou.video']?.itemList;
+      if (Array.isArray(forYouList)) items.push(...forYouList);
+      const searchScope = scope['webapp.search-page'];
+      const searchLists = [
+        searchScope?.data?.itemList,
+        searchScope?.itemList,
+      ];
+      for (const list of searchLists) {
+        if (Array.isArray(list)) items.push(...list);
+      }
+    } catch {}
+  }
+  const sigiMatch = text.match(/window\[['"]SIGI_STATE['"]\]\s*=\s*({[\s\S]*?})\s*;/);
+  if (sigiMatch) {
+    try {
+      const sigi = JSON.parse(sigiMatch[1]);
+      items.push(...Object.values(sigi.ItemModule || {}));
+    } catch {}
+  }
+  const legacyRegex = /"id":"(\d{10,25})","desc":"((?:\\.|[^"\\])*)"/g;
+  let legacyMatch;
+  while ((legacyMatch = legacyRegex.exec(text)) !== null) {
+    items.push({ id: legacyMatch[1], desc: decodeJsonString(legacyMatch[2]) });
+  }
+  return items;
+}
+
+function mapTikTokItemToResult(item) {
+  const videoId = String(item.id || '');
+  if (!/^\d{10,25}$/.test(videoId)) return null;
+  const author = item.author || {};
+  const stats = item.stats || {};
+  const video = item.video || {};
+  return {
+    type: 'video',
+    videoId,
+    title: String(item.desc || '').slice(0, 500),
+    url: author.uniqueId
+      ? `https://www.tiktok.com/@${author.uniqueId}/video/${videoId}`
+      : `https://www.tiktok.com/video/${videoId}`,
+    thumbnail: video.cover || '',
+    duration: Number(video.duration) || 0,
+    author: {
+      username: author.uniqueId || '',
+      nickname: author.nickname || '',
+    },
+    stats: {
+      views: Number(stats.playCount) || 0,
+      likes: Number(stats.diggCount) || 0,
+      comments: Number(stats.commentCount) || 0,
+      shares: Number(stats.shareCount) || 0,
+    },
+  };
+}
+
 async function fetchRealSearchResults(query, limit, platform, parentSignal) {
   const isYoutube = platform === 'youtube';
-  const host = isYoutube ? 'www.youtube.com' : 'www.tiktok.com';
-  const url = isYoutube
-    ? `https://${host}/results?search_query=${encodeURIComponent(query)}`
-    : `https://${host}/search?q=${encodeURIComponent(query)}`;
-  const allowedHosts = isYoutube
-    ? ['youtube.com', 'www.youtube.com']
-    : ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'douyin.com', 'www.douyin.com', 'v.douyin.com'];
-  const { text } = await fetchTextSafe(url, { allowedHosts, parentSignal, timeoutMs: 4500 });
-  const results = [];
-
   if (isYoutube) {
+    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+    const allowedHosts = ['youtube.com', 'www.youtube.com'];
+    const { text } = await fetchTextSafe(url, { allowedHosts, parentSignal, timeoutMs: 4500 });
+    const results = [];
     const match = text.match(/(?:var ytInitialData|window\["ytInitialData"\])\s*=\s*({[\s\S]*?})\s*;?\s*<\/script>/);
     if (match) {
       const data = parseJson(match[1]);
@@ -287,20 +354,34 @@ async function fetchRealSearchResults(query, limit, platform, parentSignal) {
     return results;
   }
 
-  const regex = /"id":"(\d{10,25})","desc":"((?:\\.|[^"\\])*)"/g;
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    const videoId = match[1];
-    if (results.some((result) => result.videoId === videoId)) continue;
-    results.push({
-      type: 'video',
-      videoId,
-      title: String(decodeJsonString(match[2])).slice(0, 500),
-      url: `https://www.tiktok.com/video/${videoId}`,
-    });
+  const allowedHosts = ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'douyin.com', 'www.douyin.com', 'v.douyin.com'];
+  const slug = slugifyTikTokQuery(query);
+  const pages = [];
+  if (slug) pages.push(`https://www.tiktok.com/discover/${encodeURIComponent(slug)}`);
+  pages.push(`https://www.tiktok.com/search?q=${encodeURIComponent(query)}`);
+
+  const results = [];
+  let sawKnownMarkup = false;
+  for (const pageUrl of pages) {
+    let text;
+    try {
+      ({ text } = await fetchTextSafe(pageUrl, { allowedHosts, parentSignal, timeoutMs: 4500 }));
+    } catch (error) {
+      if (error.statusCode === 504) throw error;
+      continue;
+    }
+    if (text.includes('__UNIVERSAL_DATA_FOR_REHYDRATION__') || text.includes('SIGI_STATE')) {
+      sawKnownMarkup = true;
+    }
+    for (const item of parseTikTokEmbeddedItems(text)) {
+      const result = mapTikTokItemToResult(item);
+      if (!result || results.some((existing) => existing.videoId === result.videoId)) continue;
+      results.push(result);
+      if (results.length >= limit) return results;
+    }
     if (results.length >= limit) break;
   }
-  if (!results.length && !text.includes('__UNIVERSAL_DATA_FOR_REHYDRATION__') && !text.includes('SIGI_STATE')) {
+  if (!results.length && !sawKnownMarkup) {
     throw apiError(502, 'TikTok devolvió una página de búsqueda inesperada.');
   }
   return results;
@@ -350,10 +431,12 @@ async function selectYoutubeMediaFormat(formats, type, quality, player) {
   } else {
     const requestedHeight = Number.parseInt(quality, 10) || 720;
     const candidates = available.filter(({ format }) => format.mime_type?.startsWith('video/'));
-    const selected = candidates.find(({ format }) => format.height === requestedHeight) ||
-      candidates.filter(({ format }) => format.height <= requestedHeight)
+    const progressive = candidates.filter(({ format }) => format.has_audio);
+    const pool = progressive.length ? progressive : candidates;
+    const selected = pool.find(({ format }) => format.height === requestedHeight) ||
+      pool.filter(({ format }) => format.height && format.height <= requestedHeight)
         .sort((a, b) => (b.format.height || 0) - (a.format.height || 0))[0] ||
-      candidates.sort((a, b) => (a.format.height || 0) - (b.format.height || 0))[0];
+      pool.sort((a, b) => (a.format.height || 0) - (b.format.height || 0))[0];
     if (selected) {
       return {
         url: selected.url,
@@ -365,6 +448,24 @@ async function selectYoutubeMediaFormat(formats, type, quality, player) {
   throw apiError(502, 'No hay un enlace multimedia directo compatible disponible para este video.', {
     code: 'YOUTUBE_FORMAT_UNAVAILABLE',
   });
+}
+
+let jsEvaluatorPatched = false;
+function patchJsEvaluator(Platform) {
+  if (jsEvaluatorPatched) return;
+  Platform.load({
+    ...Platform.shim,
+    eval(data, evalArgs) {
+      const context = vm.createContext({});
+      vm.runInContext(data.output, context, { timeout: 5000 });
+      return vm.runInContext(
+        `process(${JSON.stringify(evalArgs?.n ?? '')}, ${JSON.stringify(evalArgs?.sp ?? '')}, ${JSON.stringify(evalArgs?.sig ?? '')})`,
+        context,
+        { timeout: 5000 },
+      );
+    },
+  });
+  jsEvaluatorPatched = true;
 }
 
 async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
@@ -405,20 +506,24 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
   };
 
   try {
-    const { Innertube } = await import('youtubei.js');
-    const youtube = await Innertube.create({ fetch: fetchWithTimeout });
+    const ytjs = await import('youtubei.js');
+    patchJsEvaluator(ytjs.Platform);
+    const youtube = await ytjs.Innertube.create({ fetch: fetchWithTimeout });
     let lastFormatError;
+    let basicInfo;
     for (const client of ['IOS', 'ANDROID', 'WEB', 'MWEB']) {
       if (controller.signal.aborted || parentSignal?.aborted) {
         throw apiError(504, 'REQUEST_TIMEOUT', 'YouTube tardó demasiado en responder.');
       }
       try {
         const playerData = await youtube.getBasicInfo(videoId, { client });
+        basicInfo = basicInfo || playerData.basic_info;
         const formats = [
           ...(playerData.streaming_data?.formats || []),
           ...(playerData.streaming_data?.adaptive_formats || []),
         ];
-        return await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
+        const selected = await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
+        return { ...selected, basic_info: basicInfo };
       } catch (error) {
         if (error.code !== 'YOUTUBE_FORMAT_UNAVAILABLE') throw error;
         lastFormatError = error;
@@ -533,6 +638,7 @@ function getVideoVariants(tweet) {
       })),
     ]),
     ...(tweet.extended_entities?.media || []).flatMap((media) => media.video_info?.variants || []),
+    ...(tweet.mediaDetails || []).flatMap((media) => media.video_info?.variants || []),
   ];
   const unique = new Map();
   for (const variant of variants) {
