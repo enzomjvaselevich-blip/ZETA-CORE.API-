@@ -81,16 +81,20 @@ return sendJson(200,{ok:true,source:'youtube',query,total_resultados:results.len
 const isAudio=pathname==='/ytmp3';
 const media=await secureApi.fetchYoutubeMedia(videoId,isAudio?'audio':'video',qualityParam==='best'?'best':qualityParam);
 const basic=media.basic_info||{};
+const canal=typeof basic.author==='string'&&basic.author?basic.author:'Desconocido';
+const titulo=typeof basic.title==='string'&&basic.title?basic.title:'Desconocido';
+const link=`https://www.youtube.com/watch?v=${videoId}`;
 return sendJson(200,{
 ok:true,
 tipo:isAudio?'Audio MP3':'Video MP4',
-titulo:basic.title,
-canal:basic.author||'Desconocido',
-visitas:basic.view_count||0,
-likes:basic.like_count||0,
-duracion_segundos:basic.duration||0,
+titulo,
+canal,
+link,
+visitas:Number(basic.view_count)||0,
+likes:Number(basic.like_count)||0,
+duracion_segundos:Number(basic.duration)||0,
 videoId:videoId,
-url_original:`https://www.youtube.com/watch?v=${videoId}`,
+url_original:link,
 descarga_directa:media.url,
 calidad:media.quality||'Audio/Best',
 miniatura:`https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`
