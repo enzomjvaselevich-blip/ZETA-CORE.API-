@@ -6,7 +6,9 @@
     "@upstash/ratelimit": "^2.2.0",
     "@upstash/redis": "^1.39.0",
     "axios": "^1.7.2",
+    "bgutils-js": "^4.0.3",
     "cheerio": "^1.0.0",
+    "jsdom": "^31.0.1",
     "youtubei.js": "^18.1.0"
   }
 }

@@ -579,6 +579,52 @@ function patchJsEvaluator(Platform) {
   jsEvaluatorPatched = true;
 }
 
+let youtubePoTokenCache = null;
+
+async function acquireYoutubePoToken(youtube) {
+  if (youtubePoTokenCache && youtubePoTokenCache.expiresAt > Date.now()) return youtubePoTokenCache.token;
+  const visitorData = youtube.session.context.client.visitorData;
+  if (!visitorData) return null;
+  const challengeResponse = await youtube.getAttestationChallenge('ENGAGEMENT_TYPE_UNBOUND');
+  const bg = challengeResponse.bg_challenge;
+  const interpreterUrl = bg?.interpreter_url?.private_do_not_access_or_else_trusted_resource_url_wrapped_value || bg?.interpreter_url;
+  if (!bg?.program || !bg?.global_name || !interpreterUrl) return null;
+  const interpreterJavascript = await (await fetch(`https:${interpreterUrl}`, { signal: AbortSignal.timeout(8000) })).text();
+  const { JSDOM } = require('jsdom');
+  const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'https://www.youtube.com/' });
+  global.window = dom.window;
+  global.document = dom.window.document;
+  global.navigator = dom.window.navigator;
+  global.screen = dom.window.screen;
+  global.location = dom.window.location;
+  global.history = dom.window.history;
+  new Function(interpreterJavascript)();
+  const { BotGuardClient } = await import('bgutils-js/botguard');
+  const botguard = await BotGuardClient.create({ program: bg.program, globalName: bg.global_name, globalObject: globalThis });
+  const webPoSignalOutput = [];
+  const botguardResponse = await botguard.snapshot({ webPoSignalOutput });
+  const integrityRaw = await (await fetch('https://jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/GenerateIT', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json+protobuf',
+      'x-goog-api-key': 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw',
+      'x-user-agent': 'grpc-web-javascript/0.1',
+    },
+    body: JSON.stringify([botguardResponse]),
+    signal: AbortSignal.timeout(8000),
+  })).json();
+  if (!Array.isArray(integrityRaw) || !integrityRaw[0]) return null;
+  const { WebPoMinter } = await import('bgutils-js/webpo');
+  const minter = await WebPoMinter.create(
+    { integrityToken: integrityRaw[0], estimatedTtlSecs: integrityRaw[1], mintRefreshThreshold: integrityRaw[2], websafeFallbackToken: integrityRaw[3] },
+    webPoSignalOutput,
+  );
+  const token = await minter.mintAsWebsafeString(visitorData);
+  if (!token) return null;
+  youtubePoTokenCache = { token, visitorData, expiresAt: Date.now() + 6 * 60 * 60 * 1000 };
+  return token;
+}
+
 async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
   if (parentSignal?.aborted) throw apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
 
@@ -629,13 +675,13 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
     let basicInfo;
     let loginRequiredCount = 0;
     const diagnostics = [];
-    for (const client of clients) {
+    const attemptClient = async (client, poToken) => {
       if (controller.signal.aborted || parentSignal?.aborted) {
         throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
       }
-      let clientDiag = { cliente: client };
+      const clientDiag = { cliente: client, ...(poToken ? { po_token: true } : {}) };
       try {
-        const playerData = await youtube.getBasicInfo(videoId, { client });
+        const playerData = await youtube.getBasicInfo(videoId, poToken ? { client, po_token: poToken } : { client });
         basicInfo = basicInfo || playerData.basic_info;
         const formats = [
           ...(playerData.streaming_data?.formats || []),
@@ -657,6 +703,30 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
         lastCause = error;
         if (error.code === 'YOUTUBE_FORMAT_UNAVAILABLE') lastFormatError = error;
         diagnostics.push({ ...clientDiag, ok: false, error: String(error.message || error).slice(0, 120) });
+        return null;
+      }
+    };
+    for (const client of clients) {
+      const media = await attemptClient(client);
+      if (media) return media;
+    }
+    if (loginRequiredCount > 0) {
+      try {
+        const poToken = await acquireYoutubePoToken(youtube);
+        if (poToken) {
+          diagnostics.push({ cliente: 'PO_TOKEN', ok: true });
+          for (const client of ['IOS', 'ANDROID_VR', 'WEB', 'MWEB']) {
+            const media = await attemptClient(client, poToken);
+            if (media) return media;
+          }
+        } else {
+          diagnostics.push({ cliente: 'PO_TOKEN', ok: false, error: 'no se pudo generar' });
+        }
+      } catch (poError) {
+        if (parentSignal?.aborted || controller.signal.aborted || poError.statusCode === 504) {
+          throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
+        }
+        diagnostics.push({ cliente: 'PO_TOKEN', ok: false, error: String(poError.message || poError).slice(0, 120) });
       }
     }
     try {
