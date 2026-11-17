@@ -1225,26 +1225,107 @@ async function acquireYoutubePoMinter(youtube) {
   return youtubePoMinterCache;
 }
 
-let dlProxyCache;
-function getDlProxy() {
-  if (dlProxyCache !== undefined) return dlProxyCache;
+// Lista de proxies de salida (DL_PROXY_URL acepta varios separados por coma).
+// Se re-lee con TTL de 60s: nada de cache permanente sin vencimiento.
+let listaProxiesCache = { proxies: null, leidoAt: 0 };
+function listaProxies() {
+  if (listaProxiesCache.proxies && Date.now() - listaProxiesCache.leidoAt < 60000) return listaProxiesCache.proxies;
   const raw = (process.env.DL_PROXY_URL || process.env.dl_proxy_url || '').trim();
-  dlProxyCache = null;
+  const proxies = [];
   if (raw) {
-    try {
-      const u = new URL(raw);
-      if (u.protocol === 'http:' && u.hostname) {
-        dlProxyCache = {
-          host: u.hostname,
-          port: Number(u.port) || 80,
-          auth: (u.username || u.password)
-            ? 'Basic ' + Buffer.from(decodeURIComponent(u.username) + ':' + decodeURIComponent(u.password)).toString('base64')
-            : null,
-        };
-      }
-    } catch {}
+    for (const parte of raw.split(',')) {
+      const crudo = parte.trim();
+      if (!crudo) continue;
+      try {
+        const u = new URL(crudo);
+        if (u.protocol === 'http:' && u.hostname) {
+          proxies.push({
+            host: u.hostname,
+            port: Number(u.port) || 80,
+            auth: (u.username || u.password)
+              ? 'Basic ' + Buffer.from(decodeURIComponent(u.username) + ':' + decodeURIComponent(u.password)).toString('base64')
+              : null,
+            id: u.hostname + ':' + (Number(u.port) || 80),
+          });
+        }
+      } catch {}
+    }
   }
-  return dlProxyCache;
+  listaProxiesCache = { proxies, leidoAt: Date.now() };
+  return proxies;
+}
+
+// Salud de cada proxy: se verifica con un probe liviano por el tunel CONNECT
+// (max 5s) y se recuerda 60s. Un 403 de googlevideo tambien lo marca bloqueado.
+const TTL_SALUD_PROXY = 60000;
+const saludProxies = new Map();
+
+function marcarProxyBloqueado(proxy) {
+  if (proxy && proxy.id) saludProxies.set(proxy.id, { sano: false, checkedAt: Date.now() });
+}
+
+function marcarProxySano(proxy) {
+  if (proxy && proxy.id) saludProxies.set(proxy.id, { sano: true, checkedAt: Date.now() });
+}
+
+async function verificarSaludProxy(proxy) {
+  try {
+    const { mediaRes, cleanup } = await requestViaProxy(
+      proxy,
+      'https://www.youtube.com/generate_204',
+      { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' }, timeoutMs: 5000 },
+    );
+    const status = mediaRes.statusCode;
+    cleanup();
+    const ok = status >= 200 && status < 400;
+    saludProxies.set(proxy.id, { sano: ok, checkedAt: Date.now() });
+    return ok;
+  } catch {
+    saludProxies.set(proxy.id, { sano: false, checkedAt: Date.now() });
+    return false;
+  }
+}
+
+// Devuelve la lista ordenada: sanos primero, luego sin verificar, bloqueados
+// al final. Refresca perezosamente la salud de los que tienen el TTL vencido.
+async function proxiesSaludables() {
+  const proxies = listaProxies();
+  if (!proxies.length) return [];
+  const ahora = Date.now();
+  const sinChequear = proxies.filter((p) => {
+    const estado = saludProxies.get(p.id);
+    return !estado || ahora - estado.checkedAt > TTL_SALUD_PROXY;
+  });
+  if (sinChequear.length) {
+    await Promise.all(sinChequear.slice(0, 4).map((p) => verificarSaludProxy(p)));
+  }
+  const conSalud = (p) => {
+    const estado = saludProxies.get(p.id);
+    return { ...p, sano: estado ? estado.sano : undefined };
+  };
+  const sanos = proxies.filter((p) => {
+    const estado = saludProxies.get(p.id);
+    return estado && estado.sano && ahora - estado.checkedAt <= TTL_SALUD_PROXY;
+  });
+  const desconocidos = proxies.filter((p) => !saludProxies.get(p.id));
+  const bloqueados = proxies.filter((p) => {
+    const estado = saludProxies.get(p.id);
+    return estado && !estado.sano;
+  });
+  return [...sanos, ...desconocidos, ...bloqueados].map(conSalud);
+}
+
+function estadoSaludProxies() {
+  const proxies = listaProxies();
+  const ahora = Date.now();
+  return proxies.map((p) => {
+    const estado = saludProxies.get(p.id);
+    return {
+      proxy: p.id,
+      sano: estado ? estado.sano : null,
+      verificado_hace_s: estado ? Math.round((ahora - estado.checkedAt) / 1000) : null,
+    };
+  });
 }
 
 function headersToPlainObject(headers) {
@@ -1349,7 +1430,8 @@ async function fetchViaProxy(proxy, targetUrl, { method, headers, body, signal, 
   }
 }
 
-function makeStableFetch() {
+function makeStableFetch(opciones = {}) {
+  const sinProxyFijo = !!opciones.sinProxy;
   return async (input, init = {}) => {
     let requestUrl;
     try {
@@ -1374,11 +1456,24 @@ function makeStableFetch() {
       outer.addEventListener('abort', () => controller.abort(outer.reason), { once: true });
     }
     try {
-      const proxy = getDlProxy();
+      if (sinProxyFijo) {
+        // Camino directo desde la IP de salida de Vercel (ultimo candidato de
+        // /dl): la URL firmada queda amarrada a esa IP, y probe/stream de ese
+        // candidato tambien salen sin proxy.
+        return await fetch(input, { ...init, signal: controller.signal });
+      }
+      const proxiesOrdenados = await proxiesSaludables();
+      const proxy = proxiesOrdenados[0] || null;
       if (proxy) {
+        if (proxy.sano === false) {
+          // Todos los proxies estan marcados bloqueados: fallar rapido en lugar
+          // de perder 20s contra una IP bloqueada.
+          throw apiError(502, 'Todos los proxies de salida estan bloqueados por el proveedor en este momento.', { code: 'IP_BLOQUEADA' });
+        }
         // Con DL_PROXY_URL configurada, TODO el trafico del player sale por el
-        // proxy: asi la URL firmada de googlevideo queda amarrada a la IP del
-        // proxy, la misma IP por la que descarga probeMedia/streamMedia.
+        // primer proxy SANO: asi la URL firmada de googlevideo queda amarrada a
+        // la IP del proxy, la misma IP por la que descarga probeMedia/streamMedia.
+        // Si el proxy actual se bloquea, la proxima llamada rota al siguiente sano.
         const method = (init.method || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase();
         const headers = headersToPlainObject(init.headers || (input instanceof Request ? input.headers : undefined));
         let body = init.body != null ? init.body : null;
@@ -1403,10 +1498,10 @@ function makeStableFetch() {
   };
 }
 
-const youtubeInstanceCache = { conCookie: null, sinCookie: null };
+const youtubeInstanceCache = { conCookie: null, sinCookie: null, conCookieDirecto: null, sinCookieDirecto: null };
 
-async function getYoutubeInstance(usarCookie) {
-  const key = usarCookie ? 'conCookie' : 'sinCookie';
+async function getYoutubeInstance(usarCookie, sinProxy = false) {
+  const key = (usarCookie ? 'conCookie' : 'sinCookie') + (sinProxy ? 'Directo' : '');
   const cached = youtubeInstanceCache[key];
   if (cached && cached.expiresAt > Date.now()) return cached.instance;
   const ytjs = await import('youtubei.js');
@@ -1414,7 +1509,7 @@ async function getYoutubeInstance(usarCookie) {
   const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
   const visitorRaw = process.env.YOUTUBE_VISITOR_DATA || process.env.youtube_visitor_data || '';
   const instance = await ytjs.Innertube.create({
-    fetch: makeStableFetch(),
+    fetch: makeStableFetch({ sinProxy }),
     ...(usarCookie && cookieRaw ? { cookie: normalizeYoutubeCookie(cookieRaw) } : {}),
     ...(usarCookie && visitorRaw ? { visitor_data: visitorRaw } : {}),
   });
@@ -1437,7 +1532,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
   const timer = setTimeout(() => controller.abort(timeoutError), 24000);
   if (parentSignal) parentSignal.addEventListener('abort', abortFromParent, { once: true });
   try {
-    const youtube = options.youtube || await getYoutubeInstance(options.cookie !== false);
+    const youtube = options.youtube || await getYoutubeInstance(options.cookie !== false, !!options.sinProxy);
     const clients = ['IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
     const deadline = Date.now() + 21000;
     let lastFormatError;
@@ -1849,6 +1944,11 @@ module.exports = {
   fetchTikTokVideo,
   obtenerDiagnosticoTikTok,
   normalizeYoutubeCookie,
+  listaProxies,
+  proxiesSaludables,
+  marcarProxyBloqueado,
+  marcarProxySano,
+  estadoSaludProxies,
   getYoutubeInstance,
   fetchYoutubeMedia,
   fetchYoutubeWatchPageMedia,

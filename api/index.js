@@ -30,6 +30,19 @@ const DL_KINDS=['audio','video','tiktok','x','instagram','facebook'];
 // Cache de la resolucion del player de YouTube para /dl: los enlaces de
 // googlevideo duran ~6h; guardarlos 30 min evita re-resolver en cada pedido.
 const dlMediaCache=new Map();
+// Memoria del cliente que paso el probe por videoId|kind (TTL 6h): la proxima
+// resolucion prueba ESE cliente primero en vez de arrancar del candidato 1.
+const dlClienteCache=new Map();
+function proxyDeStream(options){
+if(options.sinProxy)return null;
+if(options.proxy!==undefined&&options.proxy!==null)return options.proxy;
+if(secureApi&&typeof secureApi.listaProxies==='function'){
+const lista=secureApi.listaProxies();
+return lista[0]||null;
+}
+const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
+return proxyRaw?parseDlProxy(proxyRaw.split(',')[0].trim()):null;
+}
 const IP_BLOCKED_MESSAGE='El hosting (Vercel) está bloqueado por YouTube/TikTok para descargas. La descarga debe hacerse desde una IP residencial.';
 
 function parseDlProxy(raw){
@@ -114,9 +127,9 @@ if(extra.contentRange)res.setHeader('Content-Range',extra.contentRange);
 if(options.filename)res.setHeader('Content-Disposition','attachment; filename="'+String(options.filename).replace(/[^a-zA-Z0-9._-]/g,'_')+'"');
 };
 const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
-const proxy=options.sinProxy?null:(proxyRaw?parseDlProxy(proxyRaw):null);
+const proxy=proxyDeStream(options);
 if(proxyRaw&&!proxy&&!options.sinProxy){
-return sendJson(500,{ok:false,error:'PROXY_INVALIDO',message:'DL_PROXY_URL no es una URL de proxy valida. Formato esperado: http://usuario:pass@host:puerto'});
+return sendJson(500,{ok:false,error:'PROXY_INVALIDO',message:'DL_PROXY_URL no es una URL de proxy valida. Formato esperado: http://usuario:pass@host:puerto (se permiten varios separados por coma).'});
 }
 if(proxy){
 let destino=mediaUrl;
@@ -328,7 +341,7 @@ try{res.destroy();}catch(e2){}
 async function probeMedia(mediaUrl,headers,options={}){
 const probeHeaders={...headers,Range:'bytes=0-0'};
 const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
-const proxy=options.sinProxy?null:(proxyRaw?parseDlProxy(proxyRaw):null);
+const proxy=proxyDeStream(options);
 if(proxy){
 // googlevideo suele responder 302: hay que seguir el redirect dentro del
 // mismo tunel, igual que hace streamMedia, para no descartar URLs validas.
@@ -568,9 +581,10 @@ const hayCookie=!!cookieHeader;
 const cacheKey=videoId+'|'+kind+'|'+(qualityParam==='best'?'best':qualityParam);
 const cacheado=dlMediaCache.get(cacheKey);
 if(cacheado&&cacheado.expiresAt>Date.now()){
-const probeCacheado=await probeMedia(cacheado.url,cacheado.headers);
+const opcionesCache=cacheado.sinProxy?{sinProxy:true}:(cacheado.proxy?{proxy:cacheado.proxy}:{});
+const probeCacheado=await probeMedia(cacheado.url,cacheado.headers,opcionesCache);
 if(probeCacheado===200||probeCacheado===206){
-return streamMedia(req,res,sendJson,requestId,cacheado.url,{referer:'https://www.youtube.com/',headers:cacheado.headers,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
+return streamMedia(req,res,sendJson,requestId,cacheado.url,{referer:'https://www.youtube.com/',headers:cacheado.headers,...opcionesCache,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
 }
 dlMediaCache.delete(cacheKey);
 }
@@ -585,22 +599,75 @@ const candidatos=[
 {cliente:'MWEB',cookie:true},
 {cliente:null,cookie:true},
 ];
+// Ultimo candidato: resolucion y descarga DIRECTAS desde la IP de salida de
+// Vercel, sin proxy. Esa IP rota por region y a veces no esta bloqueada.
+candidatos.push({cliente:'WEB',cookie:true,sinProxy:true});
+// Recordar el cliente que funciono la ultima vez (TTL 6h) y probarlo primero.
+const claveCliente=videoId+'|'+kind;
+const recordado=dlClienteCache.get(claveCliente);
+if(recordado&&recordado.expiresAt>Date.now()){
+const idx=candidatos.findIndex((c)=>c.cliente===recordado.cliente&&c.cookie===recordado.cookie&&!!c.sinProxy===!!recordado.sinProxy);
+if(idx>0){
+const elegido=candidatos.splice(idx,1)[0];
+candidatos.unshift(elegido);
+console.log('[dl] cliente recordado primero: '+(recordado.cliente||'auto')+(recordado.sinProxy?' (sinProxy)':''));
+}
+}else if(recordado){
+dlClienteCache.delete(claveCliente);
+}
+// Salud de los proxies (health check con TTL 60s, probe max 5s por proxy).
+const proxiesLista=(secureApi&&typeof secureApi.listaProxies==='function')?secureApi.listaProxies():[];
+let todosBloqueados=false;
+if(proxiesLista.length){
+try{
+const ordenados=await secureApi.proxiesSaludables();
+todosBloqueados=ordenados.length>0&&ordenados.every((p)=>p.sano===false);
+console.log('[dl] salud de proxies: '+JSON.stringify(secureApi.estadoSaludProxies())+(todosBloqueados?' -> TODOS BLOQUEADOS: solo se prueba el candidato directo':''));
+}catch(e){
+console.log('[dl] health check de proxies fallo: '+String(e&&e.message||e).slice(0,120));
+}
+}
 const dlDeadline=Date.now()+45000;
 for(const c of candidatos){
 if(Date.now()>dlDeadline)break;
+// Fail fast: con todos los proxies bloqueados, los 9 candidatos por proxy
+// usarian la misma IP bloqueada; solo tiene sentido el camino directo.
+if(todosBloqueados&&!c.sinProxy)continue;
+let proxyDelCandidato=null;
+if(!c.sinProxy&&proxiesLista.length){
+try{
+const ordenados=await secureApi.proxiesSaludables();
+const primero=ordenados[0]||null;
+proxyDelCandidato=primero&&primero.sano!==false?primero:null;
+}catch(e){proxyDelCandidato=null;}
+if(!proxyDelCandidato){
+console.log('[dl] cliente='+(c.cliente||'auto')+' salteado: no hay proxy sano');
+continue;
+}
+}
 let media;
 try{
-media=await secureApi.fetchYoutubeMedia(videoId,kind==='audio'?'audio':'video',qualityParam==='best'?'best':qualityParam,null,c.cliente?{client:c.cliente,cookie:c.cookie}:{});
+const opcionesMedia=c.cliente?{client:c.cliente,cookie:c.cookie}:{};
+if(c.sinProxy)opcionesMedia.sinProxy=true;
+media=await secureApi.fetchYoutubeMedia(videoId,kind==='audio'?'audio':'video',qualityParam==='best'?'best':qualityParam,null,opcionesMedia);
 }catch(e){
+console.log('[dl] cliente='+(c.cliente||'auto')+(c.sinProxy?' sinProxy':' proxy='+(proxyDelCandidato?proxyDelCandidato.id:'-'))+' player fallo: '+String(e&&e.message||e).slice(0,100));
 continue;
 }
 if(!media||!media.url)continue;
 const dlHeaders=c.cookie&&hayCookie?{Cookie:cookieHeader}:{};
-const probeStatus=await probeMedia(media.url,dlHeaders);
+const probeStatus=await probeMedia(media.url,dlHeaders,c.sinProxy?{sinProxy:true}:{proxy:proxyDelCandidato});
+console.log('[dl] cliente='+(c.cliente||'auto')+(c.sinProxy?' sinProxy':' proxy='+(proxyDelCandidato?proxyDelCandidato.id:'-'))+' probe='+probeStatus);
+if(probeStatus===403&&proxyDelCandidato){
+secureApi.marcarProxyBloqueado(proxyDelCandidato);
+continue;
+}
 if(probeStatus!==200&&probeStatus!==206)continue;
-dlMediaCache.set(cacheKey,{url:media.url,headers:dlHeaders,expiresAt:Date.now()+30*60*1000});
+dlMediaCache.set(cacheKey,{url:media.url,headers:dlHeaders,proxy:c.sinProxy?null:proxyDelCandidato,sinProxy:!!c.sinProxy,expiresAt:Date.now()+30*60*1000});
 if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
-return streamMedia(req,res,sendJson,requestId,media.url,{referer:'https://www.youtube.com/',headers:dlHeaders,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
+dlClienteCache.set(claveCliente,{cliente:c.cliente,cookie:c.cookie,sinProxy:!!c.sinProxy,expiresAt:Date.now()+6*60*60*1000});
+if(dlClienteCache.size>200)dlClienteCache.delete(dlClienteCache.keys().next().value);
+return streamMedia(req,res,sendJson,requestId,media.url,{referer:'https://www.youtube.com/',headers:dlHeaders,sinProxy:!!c.sinProxy,proxy:c.sinProxy?undefined:proxyDelCandidato,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
 }
 return sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:'Ningun cliente pudo descargar desde este hosting.'});
 }
@@ -701,7 +768,19 @@ return sendJson(404,{ok:false,error:{message:String(e&&e.message||e).slice(0,220
 }
 }
 if(pathname==='/status'){
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),dl_proxy_configurada:!!(process.env.DL_PROXY_URL||process.env.dl_proxy_url),admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
+let proxySalud='no configurado';
+let proxiesDetalle;
+try{
+const pl=(secureApi&&typeof secureApi.listaProxies==='function')?secureApi.listaProxies():[];
+if(pl.length){
+const ordenados=await secureApi.proxiesSaludables();
+proxySalud=ordenados.some((p)=>p.sano===true)?'OK':(ordenados.every((p)=>p.sano===false)?'BLOQUEADO':'sin verificar');
+proxiesDetalle=secureApi.estadoSaludProxies();
+}
+}catch(e){
+proxySalud='sin verificar';
+}
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),youtube_visitor_data_como:'Recomendada: sube el exito del cliente WEB con PO Token. Conseguila de un navegador logueado en YouTube: F12 > Console > ytcfg.get("VISITOR_DATA") y pega el valor en la variable YOUTUBE_VISITOR_DATA.',dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),dl_proxy_configurada:!!(process.env.DL_PROXY_URL||process.env.dl_proxy_url),proxy:proxySalud,proxies_detalle:proxiesDetalle,admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
