@@ -487,18 +487,23 @@ const SEARX_INSTANCIAS = [
   'https://anonsearch.win',
   'https://paulgo.io',
   'https://searx.tiekoetter.com',
-  'https://searx.be',
   'https://priv.au',
   'https://opnxng.com',
-  'https://search.inetol.net',
-  'https://search.sapti.me',
   'https://baresearch.org',
+  'https://search.rhscz.eu',
+  'https://search.inetol.net',
   'https://search.hbubli.cc',
-  'https://searx.works',
+  'https://searx.be',
   'https://etsi.me',
   'https://search.rowie.at',
   'https://grep.vim.wtf',
   'https://find.xenorio.xyz',
+  'https://search.im-in.space',
+  'https://searx.githo.st',
+  'https://www.gruble.de',
+  'https://search.bus-hit.me',
+  'https://searxng.au',
+  'https://searx.baczek.me',
 ];
 let searxOffset = 0;
 
@@ -558,7 +563,10 @@ function extraerResultadosSearxDeHtml(text) {
 }
 
 async function buscarSearxTikTok(query, limit, parentSignal) {
-  const q = encodeURIComponent(`${query} site:tiktok.com`);
+  const variantes = [
+    encodeURIComponent(`${query} site:tiktok.com`),
+    encodeURIComponent(`${query} tiktok`),
+  ];
   const mapear = (videos) => videos.slice(0, limit).map(({ videoId, username, title, thumbnail }) => ({
     type: 'video',
     videoId,
@@ -569,9 +577,9 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
     author: { username, nickname: '' },
     stats: { views: 0, likes: 0, comments: 0, shares: 0 },
   }));
-  // Pide una pagina de resultados a una instancia: JSON nativo primero y HTML
-  // de la misma pagina si el JSON no vino (429 o deshabilitado).
-  const pedirPagina = async (instancia, pageno) => {
+  // Pide una pagina a una instancia: JSON nativo primero y HTML de la misma
+  // pagina si el JSON no vino (429 o deshabilitado). Registra el resultado.
+  const pedirPagina = async (instancia, q, pageno) => {
     const extra = pageno > 1 ? `&pageno=${pageno}` : '';
     let videos = [];
     try {
@@ -596,7 +604,10 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
         } catch {}
       }
     } catch {}
-    if (videos.length) return videos;
+    if (videos.length) {
+      console.log(`[searx] ${instancia} p${pageno} json -> ${videos.length} videos`);
+      return videos;
+    }
     try {
       const response = await fetch(`${instancia}/search?q=${q}${extra}`, {
         headers: {
@@ -607,34 +618,52 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
         signal: senalConLimite(parentSignal, 7000),
       });
       const text = await response.text().catch(() => '');
-      if (response.status === 429 || text.includes('Just a moment')) return 'BLOQUEADA';
+      if (response.status === 429 || text.includes('Just a moment')) {
+        console.log(`[searx] ${instancia} p${pageno} -> bloqueada (HTTP ${response.status})`);
+        return 'BLOQUEADA';
+      }
       for (const { videoId, username, title, thumbnail } of extraerResultadosSearxDeHtml(text)) {
         if (!videos.some((v) => v.videoId === videoId)) videos.push({ videoId, username, title, thumbnail });
       }
     } catch (error) {
       if (parentSignal?.aborted) throw error;
+      console.log(`[searx] ${instancia} p${pageno} -> error ${String(error?.message || error).slice(0, 60)}`);
       return 'BLOQUEADA';
     }
+    console.log(`[searx] ${instancia} p${pageno} html -> ${videos.length} videos`);
     return videos;
   };
   const acumulados = [];
   const inicio = Date.now();
-  for (let intento = 0; intento < 8 && acumulados.length < limit; intento += 1) {
-    if (Date.now() - inicio > 25000) break;
+  const presupuesto = 25000;
+  const vencido = () => Date.now() - inicio > presupuesto;
+  let qActiva = variantes[0];
+  for (let intento = 0; intento < 5 && acumulados.length < limit; intento += 1) {
+    if (vencido()) break;
     const instancia = SEARX_INSTANCIAS[(intento + searxOffset) % SEARX_INSTANCIAS.length];
-    const primera = await pedirPagina(instancia, 1);
-    if (primera === 'BLOQUEADA') {
-      searxOffset += 1;
-      await new Promise((resolve) => setTimeout(resolve, 800));
-      continue;
+    // Variante del query sin site: solo cuando la principal no trajo nada.
+    if (intento >= 3 && !acumulados.length && qActiva === variantes[0]) {
+      qActiva = variantes[1];
+      console.log('[searx] cambio a variante sin site: tras intentos sin resultados');
     }
-    let videos = primera;
-    // Paginacion: una instancia sana puede dar mas resultados en paginas siguientes.
+    let videos = [];
+    // 2 intentos por instancia con 1.5s de separacion antes de pasar a la siguiente.
+    for (let sub = 0; sub < 2 && !videos.length; sub += 1) {
+      if (sub > 0) {
+        if (vencido()) break;
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+      const primera = await pedirPagina(instancia, qActiva, 1);
+      if (primera === 'BLOQUEADA') continue;
+      videos = primera;
+    }
+    const fallo = !videos.length;
+    // Paginacion: paginas 2 y 3 de la misma instancia.
     for (const pageno of [2, 3]) {
       if (!videos.length || acumulados.length + videos.length >= limit) break;
-      if (Date.now() - inicio > 25000) break;
+      if (vencido()) break;
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const mas = await pedirPagina(instancia, pageno);
+      const mas = await pedirPagina(instancia, qActiva, pageno);
       if (mas === 'BLOQUEADA' || !mas.length) break;
       videos = videos.concat(mas.filter((m) => !videos.some((v) => v.videoId === m.videoId)));
     }
@@ -644,8 +673,9 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
       if (acumulados.length >= limit) break;
     }
     if (acumulados.length >= limit) return mapear(acumulados);
-    if (!videos.length) searxOffset += 1;
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    if (fallo) searxOffset += 1;
+    if (vencido()) break;
+    await new Promise((resolve) => setTimeout(resolve, fallo ? 800 : 200));
   }
   return mapear(acumulados);
 }
@@ -711,16 +741,16 @@ async function enriquecerResultadoTikTok(candidato, parentSignal) {
       ? `https://www.tiktok.com/@${username}/video/${candidato.videoId}`
       : `https://www.tiktok.com/video/${candidato.videoId}`,
     thumbnail: tikwm?.cover || oembed?.thumbnail_url || candidato.thumbnail || '',
-    duration: Number(tikwm?.duration) || 0,
+    duration: Number(tikwm?.duration) || Number(candidato.duration) || 0,
     author: {
       username,
       nickname: String(tikwm?.author?.nickname || oembed?.author_name || '').slice(0, 200),
     },
     stats: {
-      views: Number(tikwm?.play_count) || 0,
-      likes: Number(tikwm?.digg_count) || 0,
-      comments: Number(tikwm?.comment_count) || 0,
-      shares: Number(tikwm?.share_count) || 0,
+      views: Number(tikwm?.play_count) || Number(candidato.stats?.views) || 0,
+      likes: Number(tikwm?.digg_count) || Number(candidato.stats?.likes) || 0,
+      comments: Number(tikwm?.comment_count) || Number(candidato.stats?.comments) || 0,
+      shares: Number(tikwm?.share_count) || Number(candidato.stats?.shares) || 0,
     },
   };
 }
@@ -728,13 +758,78 @@ async function enriquecerResultadoTikTok(candidato, parentSignal) {
 // Orquestador: lanza las 5 fuentes en paralelo (timeout 7s por fuente,
 // presupuesto total ~20s), deduplica por videoId con preferencia
 // directa > tikwm > ddg > ddglite > bing, enriquece y cachea por query+limit.
+// Fuente primaria delegada (opcional): API externa de busqueda de TikTok
+// configurada con ZENITH_SEARCH_URL (y ZENITH_SEARCH_KEY si pide clave).
+// Responde {ok:true, resultados:[{title, url, author, ...}]}.
+async function buscarZenithTikTok(query, limit, parentSignal) {
+  const base = String(process.env.ZENITH_SEARCH_URL || '').trim();
+  if (!base) return [];
+  const url = `${base.replace(/\/+$/, '')}/search?query=${encodeURIComponent(query)}&limit=${limit}`;
+  const headers = {
+    'bypass-tunnel-reminder': 'true',
+    Accept: 'application/json',
+  };
+  const clave = String(process.env.ZENITH_SEARCH_KEY || '').trim();
+  if (clave) {
+    headers['x-api-key'] = clave;
+    headers.Authorization = `Bearer ${clave}`;
+  }
+  try {
+    const response = await fetch(url, { headers, signal: senalConLimite(parentSignal, 8000) });
+    if (!response.ok) {
+      console.log(`[zenith] HTTP ${response.status}`);
+      return [];
+    }
+    const payload = await response.json().catch(() => null);
+    const lista = payload?.resultados || payload?.results;
+    if (!Array.isArray(lista)) {
+      console.log('[zenith] respuesta sin lista de resultados');
+      return [];
+    }
+    const resultados = [];
+    for (const item of lista) {
+      const urlVideo = String(item?.url || item?.link || '');
+      const im = urlVideo.match(/\/video\/(\d{10,25})/);
+      if (!im) continue;
+      const imUser = urlVideo.match(/tiktok\.com\/@([\w.\-]+)/);
+      const author = item?.author;
+      const authorObj = author && typeof author === 'object' ? author : null;
+      resultados.push({
+        type: 'video',
+        videoId: im[1],
+        title: String(item?.title || '').slice(0, 500),
+        url: urlVideo,
+        thumbnail: String(item?.thumbnail || item?.cover || item?.image || ''),
+        duration: Number(item?.duration) || 0,
+        author: {
+          username: String(authorObj?.username || authorObj?.unique_id || (typeof author === 'string' ? author : '') || imUser?.[1] || ''),
+          nickname: String(authorObj?.nickname || authorObj?.name || '').slice(0, 200),
+        },
+        stats: {
+          views: Number(item?.stats?.views ?? item?.views ?? item?.play_count) || 0,
+          likes: Number(item?.stats?.likes ?? item?.likes ?? item?.digg_count) || 0,
+          comments: Number(item?.stats?.comments ?? item?.comments ?? item?.comment_count) || 0,
+          shares: Number(item?.stats?.shares ?? item?.shares ?? item?.share_count) || 0,
+        },
+      });
+    }
+    console.log(`[zenith] ${resultados.length} videos para "${String(query).slice(0, 40)}"`);
+    return resultados.slice(0, limit);
+  } catch (error) {
+    if (parentSignal?.aborted) throw error;
+    console.log(`[zenith] error ${String(error?.message || error).slice(0, 80)}`);
+    return [];
+  }
+}
+
 async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   const qNorm = String(query).toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
   const cacheKey = qNorm + '|' + limit;
   const cached = TT_SEARCH_CACHE.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.results;
 
-  const [directaR, tikwmR, searxR, ddgR, ddgLtR, bingR] = await Promise.allSettled([
+  const [zenithR, directaR, tikwmR, searxR, ddgR, ddgLtR, bingR] = await Promise.allSettled([
+    buscarZenithTikTok(query, limit, parentSignal),
     buscarTikTokDirecta(query, limit, parentSignal),
     buscarTikwmSearch(query, limit, parentSignal),
     buscarSearxTikTok(query, limit, parentSignal),
@@ -744,6 +839,7 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   ]);
 
   let fuentes = [
+    ['zenith', zenithR],
     ['directa', directaR],
     ['tikwm', tikwmR],
     ['searx', searxR],
@@ -770,11 +866,13 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   // segunda pasada con las dos fuentes mas probables tras una pausa corta.
   if (!candidatos.length) {
     await new Promise((resolve) => setTimeout(resolve, 2500));
-    const [tikwmR2, searxR2] = await Promise.allSettled([
+    const [zenithR2, tikwmR2, searxR2] = await Promise.allSettled([
+      buscarZenithTikTok(query, limit, parentSignal),
       buscarTikwmSearch(query, limit, parentSignal),
       buscarSearxTikTok(query, limit, parentSignal),
     ]);
     fuentes = [
+      ['zenith', zenithR2],
       ['directa', directaR],
       ['tikwm', tikwmR2],
       ['searx', searxR2],
