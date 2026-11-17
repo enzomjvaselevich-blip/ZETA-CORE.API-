@@ -77,6 +77,7 @@ const fetchHeaders={
 'Accept-Language':'es-ES,es;q=0.9,en;q=0.8',
 };
 if(options.referer)fetchHeaders.Referer=options.referer;
+if(options.headers)Object.assign(fetchHeaders,options.headers);
 const range=req.headers&&typeof req.headers.range==='string'&&req.headers.range.length<200?req.headers.range:'';
 if(range)fetchHeaders.Range=range;
 const ipBlocked=()=>sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:IP_BLOCKED_MESSAGE});
@@ -165,6 +166,25 @@ try{res.destroy();}catch(e2){}
 }
 }
 
+async function probeMedia(mediaUrl,headers){
+const probeHeaders={...headers,Range:'bytes=0-1000'};
+const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
+const proxy=proxyRaw?parseDlProxy(proxyRaw):null;
+if(proxy){
+try{
+const {mediaRes,cleanup}=await requestMediaViaProxy(proxy,mediaUrl,probeHeaders);
+const status=mediaRes.statusCode;
+cleanup();
+return status;
+}catch(e){return 0;}
+}
+try{
+const r=await fetch(mediaUrl,{headers:probeHeaders,redirect:'follow'});
+try{await r.body?.cancel();}catch(e){}
+return r.status;
+}catch(e){return 0;}
+}
+
 module.exports=async function handler(req,res){
 const requestId=randomUUID();
 const sendJson=(status,payload)=>{
@@ -224,27 +244,55 @@ if(!DL_KINDS.includes(kind)){
 return sendJson(400,{ok:false,message:'Parametro kind invalido. Usa audio, video, tiktok o x.'});
 }
 if(kind==='tiktok'||kind==='x'){
+const {extractTikTokVideo}=require('./documentos/tiktok');
+const {fetchXVideo}=require('./documentos/xvideo');
 let data;
 try{
-if(kind==='tiktok'){
-const {extractTikTokVideo}=require('./documentos/tiktok');
-data=await extractTikTokVideo(query);
-}else{
-const {fetchXVideo}=require('./documentos/xvideo');
-data=await fetchXVideo(query);
-}
+data=kind==='tiktok'?await extractTikTokVideo(query):await fetchXVideo(query);
 }catch(e){
 return sendJson(502,{ok:false,message:'No se pudo resolver el video solicitado.',error:String(e&&e.message||e).slice(0,140)});
 }
-const mediaUrl=kind==='tiktok'
-?(data?.data?.links?.hd||data?.data?.links?.sd||data?.data?.links?.wm||'')
-:(data?.best||'');
-if(!mediaUrl){
+const scrapeHeaders=kind==='tiktok'?(data?.descarga_headers||{}):{};
+const referer=kind==='tiktok'?'https://www.tiktok.com/':'https://x.com/';
+const extraerUrls=(d)=>kind==='tiktok'
+?[d?.data?.links?.hd,d?.data?.links?.wm,d?.data?.links?.sd].filter(Boolean)
+:(d?.best?[d.best]:[]);
+let candidatos=extraerUrls(data);
+if(!candidatos.length){
 return sendJson(502,{ok:false,message:'No se encontro una URL de media descargable para ese enlace.'});
 }
-return streamMedia(req,res,sendJson,requestId,mediaUrl,{referer:kind==='tiktok'?'https://www.tiktok.com/':'https://x.com/'});
+const dlDeadline=Date.now()+45000;
+let reScrapeado=false;
+for(let ronda=0;ronda<2;ronda+=1){
+for(const mediaUrl of candidatos){
+if(Date.now()>dlDeadline)break;
+let probeStatus=await probeMedia(mediaUrl,{...scrapeHeaders,Referer:referer});
+if(probeStatus===403&&kind==='x'){
+probeStatus=await probeMedia(mediaUrl,scrapeHeaders);
 }
-// kind audio|video -> YouTube: mismo flujo que /ytmp3 y /ytmp4.
+if(probeStatus===200||probeStatus===206){
+return streamMedia(req,res,sendJson,requestId,mediaUrl,{referer,headers:scrapeHeaders});
+}
+}
+if(ronda===0&&kind==='tiktok'&&!reScrapeado&&Date.now()<dlDeadline){
+try{
+data=await extractTikTokVideo(query);
+candidatos=extraerUrls(data);
+reScrapeado=true;
+}catch(e){break;}
+}else break;
+}
+return sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:'Ningun cliente pudo descargar desde este hosting.'});
+}
+// kind audio|video -> YouTube: prueba de 1 KB por candidato; solo transmite
+// cuando la prueba responde 200/206. Orden: web (con cookies), web (sin
+// cookies), WEB_EMBEDDED, TV_SIMPLY (TVHTML5_SIMPLY_EMBEDDED_PLAYER),
+// ANDROID_VR, IOS, ANDROID, mweb.
+let videoId=query;
+const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
+if(match){
+videoId=match[1];
+}else if(!/^[a-zA-Z0-9_-]{11}$/.test(query)){
 let Innertube;
 try{
 const mod=await import('youtubei.js');
@@ -253,11 +301,6 @@ Innertube=mod.Innertube;
 return sendJson(500,{ok:false,message:'Error interno: Modulo youtubei.js no encontrado.',details:e.message});
 }
 const yt=await Innertube.create({generate_session:false});
-let videoId=query;
-const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
-if(match){
-videoId=match[1];
-}else if(!/^[a-zA-Z0-9_-]{11}$/.test(query)){
 let primerVideo=null;
 for(let intento=0;intento<2&&!primerVideo;intento+=1){
 if(intento>0)await new Promise(r=>setTimeout(r,800));
@@ -268,16 +311,35 @@ primerVideo=videos.find(v=>v&&/^[a-zA-Z0-9_-]{11}$/.test(String(v.id||'')))||nul
 if(!primerVideo)return sendJson(404,{ok:false,message:'No se encontraron resultados para la busqueda: '+query});
 videoId=String(primerVideo.id);
 }
+const cookieHeader=secureApi.normalizeYoutubeCookie(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie||'');
+const hayCookie=!!cookieHeader;
+const candidatos=[
+{cliente:'WEB',cookie:true},
+...(hayCookie?[{cliente:'WEB',cookie:false}]:[]),
+{cliente:'WEB_EMBEDDED',cookie:true},
+{cliente:'TV_SIMPLY',cookie:true},
+{cliente:'ANDROID_VR',cookie:true},
+{cliente:'IOS',cookie:true},
+{cliente:'ANDROID',cookie:true},
+{cliente:'MWEB',cookie:true},
+{cliente:null,cookie:true},
+];
+const dlDeadline=Date.now()+45000;
+for(const c of candidatos){
+if(Date.now()>dlDeadline)break;
 let media;
 try{
-media=await secureApi.fetchYoutubeMedia(videoId,kind==='audio'?'audio':'video',qualityParam==='best'?'best':qualityParam);
+media=await secureApi.fetchYoutubeMedia(videoId,kind==='audio'?'audio':'video',qualityParam==='best'?'best':qualityParam,null,c.cliente?{client:c.cliente,cookie:c.cookie}:{});
 }catch(e){
-return sendJson(e.statusCode||502,{ok:false,message:e.message||'No se pudo obtener el media de YouTube.'});
+continue;
 }
-if(!media||!media.url){
-return sendJson(502,{ok:false,message:'No se encontro una URL de media descargable para ese video.'});
+if(!media||!media.url)continue;
+const dlHeaders=c.cookie&&hayCookie?{Cookie:cookieHeader}:{};
+const probeStatus=await probeMedia(media.url,dlHeaders);
+if(probeStatus!==200&&probeStatus!==206)continue;
+return streamMedia(req,res,sendJson,requestId,media.url,{referer:'https://www.youtube.com/',headers:dlHeaders,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
 }
-return streamMedia(req,res,sendJson,requestId,media.url,{referer:'https://www.youtube.com/',filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
+return sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:'Ningun cliente pudo descargar desde este hosting.'});
 }
 if(pathname==='/ytmp3'||pathname==='/ytmp4'||pathname==='/youtube'||pathname==='/ytsearch'){
 let Innertube;

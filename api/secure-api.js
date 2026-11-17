@@ -658,7 +658,58 @@ async function acquireYoutubePoMinter(youtube) {
   return youtubePoMinterCache;
 }
 
-async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
+function makeStableFetch() {
+  return async (input, init = {}) => {
+    let requestUrl;
+    try {
+      requestUrl = new URL(input instanceof URL ? input.href : String(input));
+    } catch {
+      throw apiError(502, 'YouTube intent\u00f3 consultar un destino no permitido.', { code: 'YOUTUBE_UPSTREAM_BLOCKED' });
+    }
+    if (
+      requestUrl.protocol !== 'https:' || requestUrl.username || requestUrl.password || requestUrl.port ||
+      !['youtube.com', 'www.youtube.com'].includes(requestUrl.hostname.toLowerCase())
+    ) {
+      throw apiError(502, 'YouTube intent\u00f3 consultar un destino no permitido.', { code: 'YOUTUBE_UPSTREAM_BLOCKED' });
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(apiError(504, 'La solicitud al proveedor excedi\u00f3 el tiempo l\u00edmite.')), 20000);
+    const outer = init.signal;
+    if (outer) {
+      if (outer.aborted) {
+        clearTimeout(timer);
+        throw apiError(504, 'La solicitud excedi\u00f3 el tiempo l\u00edmite.');
+      }
+      outer.addEventListener('abort', () => controller.abort(outer.reason), { once: true });
+    }
+    try {
+      return await fetch(input, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
+const youtubeInstanceCache = { conCookie: null, sinCookie: null };
+
+async function getYoutubeInstance(usarCookie) {
+  const key = usarCookie ? 'conCookie' : 'sinCookie';
+  const cached = youtubeInstanceCache[key];
+  if (cached && cached.expiresAt > Date.now()) return cached.instance;
+  const ytjs = await import('youtubei.js');
+  patchJsEvaluator(ytjs.Platform);
+  const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
+  const visitorRaw = process.env.YOUTUBE_VISITOR_DATA || process.env.youtube_visitor_data || '';
+  const instance = await ytjs.Innertube.create({
+    fetch: makeStableFetch(),
+    ...(usarCookie && cookieRaw ? { cookie: normalizeYoutubeCookie(cookieRaw) } : {}),
+    ...(usarCookie && visitorRaw ? { visitor_data: visitorRaw } : {}),
+  });
+  youtubeInstanceCache[key] = { instance, expiresAt: Date.now() + 6 * 60 * 60 * 1000 };
+  return instance;
+}
+
+async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options = {}) {
   const videoIdLimpio = String(videoId || '').trim();
   if (!/^[a-zA-Z0-9_-]{11}$/.test(videoIdLimpio)) {
     throw apiError(400, `No se pudo resolver un videoId valido a partir de la consulta (se obtuvo: "${videoIdLimpio.slice(0, 60) || 'vacio'}").`, {
@@ -672,45 +723,8 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
   const abortFromParent = () => controller.abort(parentSignal.reason || timeoutError);
   const timer = setTimeout(() => controller.abort(timeoutError), 24000);
   if (parentSignal) parentSignal.addEventListener('abort', abortFromParent, { once: true });
-  const fetchWithTimeout = (input, init = {}) => {
-    let requestUrl;
-    try {
-      requestUrl = new URL(input instanceof URL ? input.href : typeof input === 'string' ? input : input.url);
-    } catch {
-      throw apiError(502, 'YouTube intentó consultar un destino no permitido.', { code: 'YOUTUBE_UPSTREAM_BLOCKED' });
-    }
-    if (
-      requestUrl.protocol !== 'https:' || requestUrl.username || requestUrl.password || requestUrl.port ||
-      !['youtube.com', 'www.youtube.com'].includes(requestUrl.hostname.toLowerCase())
-    ) {
-      throw apiError(502, 'YouTube intentó consultar un destino no permitido.', { code: 'YOUTUBE_UPSTREAM_BLOCKED' });
-    }
-
-    const requestController = new AbortController();
-    const abortRequest = (signal) => requestController.abort(signal.reason);
-    const abortFromDeadline = () => abortRequest(controller.signal);
-    const abortFromRequest = () => abortRequest(init.signal);
-    if (parentSignal?.aborted) abortFromParent();
-    if (controller.signal.aborted) abortFromDeadline();
-    else controller.signal.addEventListener('abort', abortFromDeadline, { once: true });
-    if (init.signal?.aborted) abortFromRequest();
-    else init.signal?.addEventListener('abort', abortFromRequest, { once: true });
-    return fetch(input, { ...init, signal: requestController.signal }).finally(() => {
-      controller.signal.removeEventListener('abort', abortFromDeadline);
-      init.signal?.removeEventListener('abort', abortFromRequest);
-    });
-  };
-
   try {
-    const ytjs = await import('youtubei.js');
-    patchJsEvaluator(ytjs.Platform);
-    const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
-    const visitorRaw = process.env.YOUTUBE_VISITOR_DATA || process.env.youtube_visitor_data || '';
-    const youtube = await ytjs.Innertube.create({
-      fetch: fetchWithTimeout,
-      ...(cookieRaw ? { cookie: normalizeYoutubeCookie(cookieRaw) } : {}),
-      ...(visitorRaw ? { visitor_data: visitorRaw } : {}),
-    });
+    const youtube = options.youtube || await getYoutubeInstance(options.cookie !== false);
     const clients = ['IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
     const deadline = Date.now() + 21000;
     let lastFormatError;
@@ -756,6 +770,11 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
       }
       return null;
     };
+    if (typeof options.client === 'string' && options.client) {
+      const media = await attemptClient(options.client);
+      if (media) return media;
+      throw apiError(502, `El cliente ${options.client} no pudo obtener un enlace descargable.`, { code: 'YOUTUBE_CLIENT_FAILED' });
+    }
     for (let round = 0; round < 3; round += 1) {
       if (Date.now() > deadline - 3000) break;
       const media = await attemptInParallel(clients.slice(0, 5), undefined);
@@ -905,6 +924,7 @@ async function fetchTikTokVideo(initialUrl, parentSignal) {
     return {
       creator: 'Jxmpier207',
       status: true,
+      descarga_headers: { ...UPSTREAM_HEADERS },
       data: {
         id: String(videoData.id || ''),
         url: canonicalUrl,
@@ -1027,6 +1047,8 @@ module.exports = {
   extractYoutubeVideoId,
   fetchRealSearchResults,
   fetchTikTokVideo,
+  normalizeYoutubeCookie,
+  getYoutubeInstance,
   fetchYoutubeMedia,
   fetchYoutubeWatchPageMedia,
   selectYoutubeMediaFormat,
