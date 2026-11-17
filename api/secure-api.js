@@ -353,72 +353,71 @@ async function fetchRealSearchResults(query, limit, platform, parentSignal) {
     return results;
   }
 
-  const allowedHosts = ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'douyin.com', 'www.douyin.com', 'v.douyin.com'];
+  return buscarTikTokMultiFuente(query, limit, parentSignal);
+}
+
+const NAVEGADOR_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const TT_SEARCH_HOSTS = ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com'];
+const TT_SEARCH_CACHE = new Map();
+const TT_SEARCH_CACHE_TTL = 5 * 60 * 1000;
+
+function senalConLimite(parentSignal, ms) {
+  return parentSignal ? AbortSignal.any([parentSignal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
+}
+
+// Fuente a: scraping directo de las paginas discover/search de TikTok.
+// Devuelve resultados completos o [] si TikTok no le muestra nada al scraper.
+async function buscarTikTokDirecta(query, limit, parentSignal) {
   const slug = slugifyTikTokQuery(query);
   const pages = [];
   if (slug) pages.push(`https://www.tiktok.com/discover/${encodeURIComponent(slug)}`);
   pages.push(`https://www.tiktok.com/search?q=${encodeURIComponent(query)}`);
-
   const results = [];
-  let sawKnownMarkup = false;
-  let crudos = 0;
-  // Dos rondas: si la primera no alcanza el limite pedido, se reintenta
-  // combinando discover + search sin duplicar videoId.
   for (let round = 0; round < 2 && results.length < limit; round += 1) {
-    if (round > 0) await new Promise((resolve) => setTimeout(resolve, 600));
+    if (round > 0) await new Promise((resolve) => setTimeout(resolve, 400));
     for (const pageUrl of pages) {
       let text;
       try {
-        ({ text } = await fetchTextSafe(pageUrl, { allowedHosts, parentSignal, timeoutMs: 4500 }));
+        ({ text } = await fetchTextSafe(pageUrl, { allowedHosts: TT_SEARCH_HOSTS, parentSignal, timeoutMs: 6000 }));
       } catch (error) {
-        if (error.statusCode === 504) throw error;
+        if (parentSignal?.aborted) throw error;
         continue;
       }
-      if (text.includes('__UNIVERSAL_DATA_FOR_REHYDRATION__') || text.includes('SIGI_STATE')) {
-        sawKnownMarkup = true;
-      }
-      const items = parseTikTokEmbeddedItems(text);
-      crudos += items.length;
-      for (const item of items) {
+      for (const item of parseTikTokEmbeddedItems(text)) {
         const result = mapTikTokItemToResult(item);
         if (!result || results.some((existing) => existing.videoId === result.videoId)) continue;
         results.push(result);
-        if (results.length >= limit) break;
+        if (results.length >= limit) return results;
       }
-      if (results.length >= limit) break;
-    }
-  }
-  console.log(`[ttsearch] query="${String(query).slice(0, 80)}" crudos=${crudos} resultados=${results.length}`);
-  if (!results.length) {
-    // TikTok no le muestra resultados de busqueda a los scrapers desde IPs de
-    // datacenter. Respaldo: buscador de tikwm con el MISMO query, mapeado al
-    // mismo formato. Si tambien falla, se devuelve vacio, nunca resultados de
-    // otra busqueda ni contenido generico.
-    try {
-      const respaldo = await buscarTikTokViaTikwm(query, limit, parentSignal);
-      console.log(`[ttsearch] query="${String(query).slice(0, 80)}" respaldo_tikwm=${respaldo.length}`);
-      return respaldo;
-    } catch (error) {
-      console.log(`[ttsearch] query="${String(query).slice(0, 80)}" respaldo_tikwm_fallo=${String(error && error.message || error).slice(0, 120)}`);
-      return [];
+      if (results.length >= limit) return results;
     }
   }
   return results;
 }
 
-async function buscarTikTokViaTikwm(query, limit, parentSignal) {
+// Fuente b: buscador de tikwm con headers de navegador real. Si Cloudflare lo
+// challengea se marca como bloqueada y no se reintenta.
+async function buscarTikwmSearch(query, limit, parentSignal) {
   const endpoint = `https://www.tikwm.com/api/feed/search?q=${encodeURIComponent(query)}&count=${Math.min(Math.max(Number(limit) || 5, 1), 20)}`;
   const response = await fetch(endpoint, {
-    headers: { 'User-Agent': UPSTREAM_HEADERS['User-Agent'] || 'Mozilla/5.0', Accept: 'application/json' },
-    signal: parentSignal ? AbortSignal.any([parentSignal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+    headers: {
+      'User-Agent': NAVEGADOR_UA,
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+      Referer: 'https://www.tiktok.com/',
+    },
+    signal: senalConLimite(parentSignal, 7000),
   });
-  if (!response.ok) throw apiError(502, `El respaldo de busqueda de TikTok respondio HTTP ${response.status}.`);
-  const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('application/json')) throw apiError(502, 'El respaldo de busqueda de TikTok no devolvio JSON.');
-  const payload = await response.json().catch(() => null);
+  const text = await response.text().catch(() => '');
+  if (text.includes('Just a moment') || text.includes('cf-challenge') || text.includes('challenge-platform')) {
+    throw new Error('tikwm bloqueado por Cloudflare');
+  }
+  if (!response.ok) throw new Error(`tikwm respondio HTTP ${response.status}.`);
+  let payload = null;
+  try { payload = JSON.parse(text); } catch { throw new Error('tikwm no devolvio JSON.'); }
   const videos = payload?.data?.videos;
   if (!payload || payload.code !== 0 || !Array.isArray(videos)) {
-    throw apiError(502, `El respaldo de busqueda de TikTok no devolvio datos (${String(payload?.msg || 'sin mensaje').slice(0, 80)}).`);
+    throw new Error(`tikwm sin datos (${String(payload?.msg || 'sin mensaje').slice(0, 60)}).`);
   }
   const results = [];
   for (const video of videos) {
@@ -447,6 +446,165 @@ async function buscarTikTokViaTikwm(query, limit, parentSignal) {
     });
     if (results.length >= limit) break;
   }
+  return results;
+}
+
+// Extrae pares @usuario/video/<id> de HTML de motores de busqueda, incluyendo
+// links redirigidos de DDG (uddg=) y Bing (u=a1<base64url>).
+function extraerVideosTikTokDeHtml(text) {
+  const encontrados = new Map();
+  const limpio = String(text).replace(/\\u002F/gi, '/').replace(/%2F/gi, '/');
+  let m;
+  const patron = /tiktok\.com\/@([\w.\-]+)\/video\/(\d{10,25})/g;
+  while ((m = patron.exec(limpio)) !== null) {
+    if (!encontrados.has(m[2])) encontrados.set(m[2], m[1]);
+  }
+  const uddg = /uddg=([^&"'\s]+)/g;
+  while ((m = uddg.exec(limpio)) !== null) {
+    try {
+      const im = decodeURIComponent(m[1]).match(/tiktok\.com\/@([\w.\-]+)\/video\/(\d{10,25})/);
+      if (im && !encontrados.has(im[2])) encontrados.set(im[2], im[1]);
+    } catch {}
+  }
+  const bing = /(?:&|&amp;|\?)u=a1([A-Za-z0-9_\-]+)/g;
+  while ((m = bing.exec(limpio)) !== null) {
+    try {
+      const dec = Buffer.from(m[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+      const im = dec.match(/tiktok\.com\/@([\w.\-]+)\/video\/(\d{10,25})/);
+      if (im && !encontrados.has(im[2])) encontrados.set(im[2], im[1]);
+    } catch {}
+  }
+  return [...encontrados.entries()].map(([videoId, username]) => ({ videoId, username }));
+}
+
+// Fuentes c/d/e: motores de busqueda con site:tiktok.com.
+async function buscarEnMotorTikTok(motor, query, limit, parentSignal) {
+  const q = encodeURIComponent(`site:tiktok.com ${query}`);
+  const pageUrls = {
+    ddg: `https://html.duckduckgo.com/html/?q=${q}`,
+    ddglite: `https://lite.duckduckgo.com/lite/?q=${q}`,
+    bing: `https://www.bing.com/search?q=${q}`,
+  };
+  const pageUrl = pageUrls[motor];
+  if (!pageUrl) return [];
+  const { text } = await fetchTextSafe(pageUrl, {
+    allowedHosts: ['duckduckgo.com', 'html.duckduckgo.com', 'lite.duckduckgo.com', 'www.bing.com', 'bing.com'],
+    parentSignal,
+    timeoutMs: 7000,
+    headers: { 'user-agent': NAVEGADOR_UA, 'accept-language': 'es-ES,es;q=0.9,en;q=0.8' },
+  });
+  return extraerVideosTikTokDeHtml(text).slice(0, limit).map(({ videoId, username }) => ({
+    type: 'video',
+    videoId,
+    title: '',
+    url: `https://www.tiktok.com/@${username}/video/${videoId}`,
+    thumbnail: '',
+    duration: 0,
+    author: { username, nickname: '' },
+    stats: { views: 0, likes: 0, comments: 0, shares: 0 },
+  }));
+}
+
+// Enriquecido en paralelo (8s por video) con fuentes que si responden desde
+// datacenter: oEmbed publico de TikTok y el endpoint de descarga de tikwm.
+async function enriquecerResultadoTikTok(candidato, parentSignal) {
+  const url = candidato.url || `https://www.tiktok.com/video/${candidato.videoId}`;
+  const [oembedR, tikwmR] = await Promise.allSettled([
+    fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`, {
+      headers: { 'User-Agent': NAVEGADOR_UA, Accept: 'application/json' },
+      signal: senalConLimite(parentSignal, 8000),
+    }).then((r) => (r.ok ? r.json().catch(() => null) : null)),
+    fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`, {
+      headers: {
+        'User-Agent': NAVEGADOR_UA,
+        Accept: 'application/json, text/plain, */*',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        Referer: 'https://www.tiktok.com/',
+      },
+      signal: senalConLimite(parentSignal, 8000),
+    }).then((r) => (r.ok ? r.json().catch(() => null) : null)),
+  ]);
+  const oembed = oembedR.status === 'fulfilled' ? oembedR.value : null;
+  const tikwm = tikwmR.status === 'fulfilled' && tikwmR.value?.code === 0 ? tikwmR.value.data : null;
+  const username = candidato.author?.username
+    || (url.match(/tiktok\.com\/@([\w.\-]+)\//) || [])[1]
+    || '';
+  const title = String(oembed?.title || tikwm?.title || '').slice(0, 500) || 'video de TikTok';
+  return {
+    type: 'video',
+    videoId: candidato.videoId,
+    title,
+    url: username
+      ? `https://www.tiktok.com/@${username}/video/${candidato.videoId}`
+      : `https://www.tiktok.com/video/${candidato.videoId}`,
+    thumbnail: tikwm?.cover || oembed?.thumbnail_url || '',
+    duration: Number(tikwm?.duration) || 0,
+    author: {
+      username,
+      nickname: String(tikwm?.author?.nickname || oembed?.author_name || '').slice(0, 200),
+    },
+    stats: {
+      views: Number(tikwm?.play_count) || 0,
+      likes: Number(tikwm?.digg_count) || 0,
+      comments: Number(tikwm?.comment_count) || 0,
+      shares: Number(tikwm?.share_count) || 0,
+    },
+  };
+}
+
+// Orquestador: lanza las 5 fuentes en paralelo (timeout 7s por fuente,
+// presupuesto total ~20s), deduplica por videoId con preferencia
+// directa > tikwm > ddg > ddglite > bing, enriquece y cachea por query+limit.
+async function buscarTikTokMultiFuente(query, limit, parentSignal) {
+  const qNorm = String(query).toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+  const cacheKey = qNorm + '|' + limit;
+  const cached = TT_SEARCH_CACHE.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.results;
+
+  const [directaR, tikwmR, ddgR, ddgLtR, bingR] = await Promise.allSettled([
+    buscarTikTokDirecta(query, limit, parentSignal),
+    buscarTikwmSearch(query, limit, parentSignal),
+    buscarEnMotorTikTok('ddg', query, limit, parentSignal),
+    buscarEnMotorTikTok('ddglite', query, limit, parentSignal),
+    buscarEnMotorTikTok('bing', query, limit, parentSignal),
+  ]);
+
+  const fuentes = [
+    ['directa', directaR],
+    ['tikwm', tikwmR],
+    ['ddg', ddgR],
+    ['ddglite', ddgLtR],
+    ['bing', bingR],
+  ];
+  const vistos = new Set();
+  const candidatos = [];
+  for (const [, fuente] of fuentes) {
+    if (fuente.status !== 'fulfilled' || !Array.isArray(fuente.value)) continue;
+    for (const candidato of fuente.value) {
+      if (!candidato?.videoId || vistos.has(candidato.videoId)) continue;
+      vistos.add(candidato.videoId);
+      candidatos.push(candidato);
+      if (candidatos.length >= limit) break;
+    }
+    if (candidatos.length >= limit) break;
+  }
+
+  const enriquecidos = await Promise.allSettled(
+    candidatos.map((candidato) => (candidato.title ? Promise.resolve(candidato) : enriquecerResultadoTikTok(candidato, parentSignal)))
+  );
+  const results = candidatos.map((candidato, i) => {
+    const enriquecido = enriquecidos[i];
+    if (enriquecido?.status === 'fulfilled' && enriquecido.value) return enriquecido.value;
+    return { ...candidato, title: candidato.title || 'video de TikTok' };
+  });
+
+  const conteo = fuentes
+    .map(([nombre, fuente]) => `${nombre}=${fuente.status === 'fulfilled' && Array.isArray(fuente.value) ? fuente.value.length : 'X'}`)
+    .join(' ');
+  console.log(`[ttsearch] query="${qNorm.slice(0, 80)}" fuentes: ${conteo} -> resultados=${results.length}`);
+
+  if (TT_SEARCH_CACHE.size > 100) TT_SEARCH_CACHE.clear();
+  TT_SEARCH_CACHE.set(cacheKey, { results, expiresAt: Date.now() + TT_SEARCH_CACHE_TTL });
   return results;
 }
 
