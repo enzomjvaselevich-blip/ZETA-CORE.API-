@@ -592,10 +592,8 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
           for (const { videoId, username, title } of extraerResultadosSearxDeHtml(text)) {
             if (!videos.some((v) => v.videoId === videoId)) videos.push({ videoId, username, title });
           }
-          if (!videos.length) {
-            const idx = text.indexOf('tiktok.com/@');
-            if (idx >= 0) searxMuestraHtml = text.slice(Math.max(0, idx - 400), idx + 300);
-          }
+          const idx = text.indexOf('tiktok.com/@');
+          if (idx >= 0) searxMuestraHtml = text.slice(Math.max(0, idx - 400), idx + 300);
         }
       } catch (error) {
         if (parentSignal?.aborted) throw error;
