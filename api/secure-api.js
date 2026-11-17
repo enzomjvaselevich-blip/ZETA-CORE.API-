@@ -1180,12 +1180,129 @@ function normalizeYoutubeCookie(raw) {
   return pairs.join('; ');
 }
 
+// ============================================================================
+// Sesión anónima auto-gestionada (TAREA 1): la API crea y mantiene su PROPIA
+// sesión de YouTube sin login. Se hace scraping de youtube.com como navegador
+// real (UA Chrome, Accept-Language es, cookie SOCS=CAI), se recogen las
+// Set-Cookie (VISITOR_INFO1_LIVE, YSC, GPS...) y se extrae VISITOR_DATA del
+// HTML/contexto. TTL 6h, renovación inmediata bajo demanda (LOGIN_REQUIRED o
+// reintento interno). Cero configuración del dueño.
+// ============================================================================
+const SESION_ANONIMA_TTL = 6 * 60 * 60 * 1000;
+const UA_SESION_ANONIMA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+let sesionAnonima = null;
+let renovandoSesion = null;
+
+// Puro: convierte la lista de Set-Cookie de una respuesta en una cabecera
+// "name=value; ..." sin duplicados (se conserva la primera aparición).
+function parseSetCookies(lista) {
+  const pares = [];
+  const vistos = new Set();
+  for (const crudo of Array.isArray(lista) ? lista : []) {
+    const par = String(crudo || '').split(';')[0];
+    const eq = par.indexOf('=');
+    if (eq <= 0) continue;
+    const nombre = par.slice(0, eq).trim();
+    if (!nombre || vistos.has(nombre)) continue;
+    vistos.add(nombre);
+    pares.push(par);
+  }
+  return { cookie: pares.join('; '), pares };
+}
+
+// Puro: extrae VISITOR_DATA del HTML de youtube.com (viene escapado como JSON).
+function extraerVisitorData(html) {
+  const texto = String(html || '');
+  const m = texto.match(/"visitorData":"((?:[^"\\]|\\.)*)"/) || texto.match(/"VISITOR_DATA":"((?:[^"\\]|\\.)*)"/);
+  if (!m) return '';
+  try {
+    const valor = JSON.parse('"' + m[1] + '"');
+    return typeof valor === 'string' ? valor : '';
+  } catch {
+    return m[1];
+  }
+}
+
+// Puro: garantiza que la cabecera de cookies de sesión incluya SOCS=CAI
+// (consentimiento de YouTube ya aceptado, evita el muro de consentimiento).
+function asegurarCookieSesion(cookie) {
+  const pares = String(cookie || '').split(';').map((s) => s.trim()).filter(Boolean);
+  const nombres = pares.map((p) => p.split('=')[0]);
+  if (!nombres.includes('SOCS')) pares.unshift('SOCS=CAI');
+  return pares.join('; ');
+}
+
+async function scrapearSesionAnonima() {
+  const variantes = [
+    { url: 'https://www.youtube.com/?hl=es&gl=US', cookie: 'SOCS=CAI' },
+    { url: 'https://www.youtube.com/?hl=es&gl=ES', cookie: 'CONSENT=YES+cb.20210328-17-p0.es+FX+678; SOCS=CAI' },
+  ];
+  for (const variante of variantes) {
+    try {
+      const res = await fetch(variante.url, {
+        headers: {
+          'user-agent': UA_SESION_ANONIMA,
+          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'accept-language': 'es-ES,es;q=0.9,en;q=0.8',
+          cookie: variante.cookie,
+        },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(10000),
+      });
+      if (res.status !== 200) {
+        try { await res.body?.cancel(); } catch {}
+        continue;
+      }
+      const html = await res.text();
+      const { cookie } = parseSetCookies(typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : []);
+      const visitorData = extraerVisitorData(html);
+      if (visitorData) {
+        return { cookies: asegurarCookieSesion([variante.cookie, cookie].filter(Boolean).join('; ')), visitorData };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function obtenerSesionAnonima(forzar = false) {
+  if (sesionAnonima && !forzar && Date.now() - sesionAnonima.createdAt < SESION_ANONIMA_TTL) return sesionAnonima;
+  if (renovandoSesion) return renovandoSesion;
+  renovandoSesion = (async () => {
+    try {
+      const nueva = await scrapearSesionAnonima();
+      if (!nueva) {
+        if (sesionAnonima) return sesionAnonima;
+        throw apiError(502, 'No se pudo generar una sesion anonima de YouTube (youtube.com no expuso VISITOR_DATA).', { code: 'YOUTUBE_SESION_ANONIMA' });
+      }
+      sesionAnonima = {
+        cookies: nueva.cookies,
+        visitorData: nueva.visitorData,
+        version: (sesionAnonima ? sesionAnonima.version : 0) + 1,
+        createdAt: Date.now(),
+      };
+      console.log('[sesion-anonima] v' + sesionAnonima.version + ' creada sola (' + nueva.cookies.split(';').length + ' cookies, visitor data auto-generado)');
+      return sesionAnonima;
+    } finally {
+      renovandoSesion = null;
+    }
+  })();
+  return renovandoSesion;
+}
+
+function estadoSesionAnonima() {
+  if (!sesionAnonima) return { activa: false };
+  return { activa: true, version: sesionAnonima.version, edad_min: Math.round((Date.now() - sesionAnonima.createdAt) / 60000) };
+}
+
 let youtubePoMinterCache = null;
 
 async function acquireYoutubePoMinter(youtube) {
   if (youtubePoMinterCache && youtubePoMinterCache.expiresAt > Date.now()) return youtubePoMinterCache;
   const visitorData = youtube.session.context.client.visitorData;
   if (!visitorData) return null;
+  if (youtubePoMinterCache && youtubePoMinterCache.visitorData !== visitorData) {
+    youtubePoMinterCache = null;
+  }
   const challengeResponse = await youtube.getAttestationChallenge('ENGAGEMENT_TYPE_UNBOUND');
   const bg = challengeResponse.bg_challenge;
   const interpreterUrl = bg?.interpreter_url?.private_do_not_access_or_else_trusted_resource_url_wrapped_value || bg?.interpreter_url;
@@ -1260,15 +1377,40 @@ function makeStableFetch() {
   };
 }
 
-const youtubeInstanceCache = { conCookie: null, sinCookie: null };
+const youtubeInstanceCache = { conCookie: null, sinCookie: null, anonima: new Map() };
 
-async function getYoutubeInstance(usarCookie) {
-  const key = usarCookie ? 'conCookie' : 'sinCookie';
+async function getYoutubeInstance(usarCookie, opciones = {}) {
+  const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
+  if (!(usarCookie && cookieRaw)) {
+    // Instancia anónima con la sesión auto-generada (cero configuración del
+    // dueño). La instancia se cachea por versión de sesión: al renovar la
+    // sesión, se crea una instancia nueva.
+    let sesion = opciones.sesionAnonima || null;
+    if (!sesion) sesion = await obtenerSesionAnonima(false).catch(() => null);
+    if (sesion) {
+      const key = 'v' + sesion.version;
+      const cached = youtubeInstanceCache.anonima.get(key);
+      if (cached && cached.expiresAt > Date.now()) return cached.instance;
+      const ytjs = await import('youtubei.js');
+      patchJsEvaluator(ytjs.Platform);
+      const instance = await ytjs.Innertube.create({
+        fetch: makeStableFetch(),
+        cookie: sesion.cookies,
+        visitor_data: sesion.visitorData,
+      });
+      youtubeInstanceCache.anonima.set(key, { instance, expiresAt: Date.now() + 60 * 60 * 1000 });
+      if (youtubeInstanceCache.anonima.size > 3) {
+        const primera = youtubeInstanceCache.anonima.keys().next().value;
+        youtubeInstanceCache.anonima.delete(primera);
+      }
+      return instance;
+    }
+  }
+  const key = usarCookie && cookieRaw ? 'conCookie' : 'sinCookie';
   const cached = youtubeInstanceCache[key];
   if (cached && cached.expiresAt > Date.now()) return cached.instance;
   const ytjs = await import('youtubei.js');
   patchJsEvaluator(ytjs.Platform);
-  const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
   const visitorRaw = process.env.YOUTUBE_VISITOR_DATA || process.env.youtube_visitor_data || '';
   const instance = await ytjs.Innertube.create({
     fetch: makeStableFetch(),
@@ -1287,6 +1429,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     });
   }
   if (parentSignal?.aborted) throw apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
+  const inicioMs = Date.now();
 
   const controller = new AbortController();
   const timeoutError = apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
@@ -1402,6 +1545,21 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
         throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
       }
       diagnostics.push({ cliente: 'WATCH_PAGE', ok: false, error: String(watchError.message || watchError).slice(0, 120), detalle: watchError.detalles });
+    }
+    // Reintento interno (TAREA 4): si los clientes devolvieron LOGIN_REQUIRED
+    // (cookie manual vencida o bloqueo anti-bot de la IP), se renueva la sesión
+    // anónima AHORA y se reintenta en el mismo pedido con una instancia fresca.
+    if (loginRequiredCount > 0 && !options.sesionRenovada && !options.youtube && Date.now() - inicioMs < 12000) {
+      try {
+        console.log('[dl][capa1] LOGIN_REQUIRED x' + loginRequiredCount + ': reintento en el mismo pedido con sesion anonima renovada');
+        await obtenerSesionAnonima(true).catch(() => null);
+        const anonima = await getYoutubeInstance(false);
+        const media = await fetchYoutubeMedia(videoId, type, quality, parentSignal, { ...options, youtube: anonima, cookie: false, sesionRenovada: true });
+        return media;
+      } catch (e) {
+        lastCause = e;
+        diagnostics.push({ cliente: 'REINTENTO_SESION', ok: false, error: String(e && e.message || e).slice(0, 120) });
+      }
     }
     if (loginRequiredCount >= clients.length - 1) {
       const loginError = apiError(502, 'Este video tiene restriccion de edad o verificacion anti-bot: YouTube exige inicio de sesion para descargarlo.', {
@@ -1751,9 +1909,162 @@ function estadoSaludInstancias() {
   }));
 }
 
+// ============================================================================
+// Descubrimiento runtime de instancias publicas (TAREA 2): ademas de las
+// hardcodeadas, se consultan las listas publicas oficiales (Invidious/Piped/
+// cobalt) cada 6h y se agregan las instancias https sin clave que respondan.
+// ============================================================================
+const TTL_LISTAS_INSTANCIAS = 6 * 60 * 60 * 1000;
+const LISTAS_INSTANCIAS = {
+  invidious: 'https://api.invidious.io/instances.json',
+  piped: 'https://piped-instances.kavin.rocks/',
+  cobalt: 'https://instances.cobalt.best/api/instances.json',
+};
+const instanciasDescubiertas = { invidious: [], piped: [], cobalt: [], leidoAt: 0, renovando: null };
+
+function normalizarHostInstancia(valor) {
+  try {
+    const crudo = String(valor || '').trim();
+    if (!crudo) return '';
+    return new URL(crudo.startsWith('http') ? crudo : 'https://' + crudo).host.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+// Puro: filtra instancias Invidious de api.invidious.io/instances.json
+// (pares [name, info]; solo type https y api !== false, sin onion).
+function hostsDeInvidious(json) {
+  if (!Array.isArray(json)) return [];
+  const hosts = [];
+  for (const entrada of json) {
+    if (!Array.isArray(entrada) || !entrada[0] || !entrada[1] || typeof entrada[1] !== 'object') continue;
+    const nombre = String(entrada[0]).replace(/\.onion.*$/i, '');
+    const info = entrada[1];
+    if (nombre.endsWith('.onion')) continue;
+    const tipo = info?.type;
+    const esHttps = tipo === 'https' || (Array.isArray(tipo) && tipo.includes('https'));
+    if (!esHttps) continue;
+    if (info.api === false) continue;
+    const host = normalizarHostInstancia(info.uri || nombre);
+    if (host && !host.endsWith('.onion') && !hosts.includes(host)) hosts.push(host);
+  }
+  return hosts;
+}
+
+// Puro: extrae api_url de la lista publica de Piped.
+function hostsDePiped(json) {
+  const lista = Array.isArray(json) ? json : Array.isArray(json?.instances) ? json.instances : [];
+  const hosts = [];
+  for (const entrada of lista) {
+    const host = normalizarHostInstancia(entrada?.api_url || entrada?.api || '');
+    if (host && !host.endsWith('.onion') && !hosts.includes(host)) hosts.push(host);
+  }
+  return hosts;
+}
+
+// Puro: extrae endpoints de API online sin turnstile de la lista comunitaria
+// de cobalt (instances.cobalt.best).
+function hostsDeCobalt(json) {
+  if (!Array.isArray(json)) return [];
+  const hosts = [];
+  for (const entrada of json) {
+    if (!entrada || typeof entrada !== 'object') continue;
+    if (entrada.turnstile) continue;
+    if (entrada.api_online === false || entrada.online === false) continue;
+    const host = normalizarHostInstancia(entrada.api || entrada.url || entrada.domain || '');
+    if (host && !hosts.includes(host)) hosts.push(host);
+  }
+  return hosts;
+}
+
+async function fetchJsonPublico(url, timeoutMs = 6000) {
+  if (!url.startsWith('https://')) throw new Error('solo https');
+  const r = await fetch(url, {
+    headers: { 'User-Agent': UA_SESION_ANONIMA, Accept: 'application/json' },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return await r.json();
+}
+
+async function descubrirInstancias(forzar = false) {
+  if (!forzar && instanciasDescubiertas.leidoAt && Date.now() - instanciasDescubiertas.leidoAt < TTL_LISTAS_INSTANCIAS) return instanciasDescubiertas;
+  if (instanciasDescubiertas.renovando) return instanciasDescubiertas.renovando;
+  instanciasDescubiertas.renovando = (async () => {
+    try {
+      const [inv, piped, cobalt] = await Promise.allSettled([
+        fetchJsonPublico(LISTAS_INSTANCIAS.invidious),
+        fetchJsonPublico(LISTAS_INSTANCIAS.piped),
+        fetchJsonPublico(LISTAS_INSTANCIAS.cobalt),
+      ]);
+      if (inv.status === 'fulfilled') instanciasDescubiertas.invidious = hostsDeInvidious(inv.value);
+      if (piped.status === 'fulfilled') instanciasDescubiertas.piped = hostsDePiped(piped.value);
+      if (cobalt.status === 'fulfilled') instanciasDescubiertas.cobalt = hostsDeCobalt(cobalt.value);
+      instanciasDescubiertas.leidoAt = Date.now();
+      console.log('[inst] descubiertas: invidious=' + instanciasDescubiertas.invidious.length + ' piped=' + instanciasDescubiertas.piped.length + ' cobalt=' + instanciasDescubiertas.cobalt.length);
+      return instanciasDescubiertas;
+    } finally {
+      instanciasDescubiertas.renovando = null;
+    }
+  })();
+  return instanciasDescubiertas.renovando;
+}
+
+// Fusiona hardcodeadas (primero) + descubiertas, deduplicadas por host.
+async function instanciasPara(servicio, hardcodeadas) {
+  const vistas = new Set();
+  const finales = [];
+  for (const base of Array.isArray(hardcodeadas) ? hardcodeadas : []) {
+    const host = normalizarHostInstancia(base);
+    if (host && !vistas.has(host)) {
+      vistas.add(host);
+      finales.push('https://' + host);
+    }
+  }
+  try {
+    await descubrirInstancias(false);
+    for (const host of instanciasDescubiertas[servicio] || []) {
+      if (!vistas.has(host)) {
+        vistas.add(host);
+        finales.push('https://' + host);
+      }
+    }
+  } catch {}
+  return finales;
+}
+
+function estadoInstanciasDescubiertas() {
+  return {
+    invidious: instanciasDescubiertas.invidious.length,
+    piped: instanciasDescubiertas.piped.length,
+    cobalt: instanciasDescubiertas.cobalt.length,
+    hace_min: instanciasDescubiertas.leidoAt ? Math.round((Date.now() - instanciasDescubiertas.leidoAt) / 60000) : null,
+  };
+}
+
 function alturaDeCalidad(texto) {
   const m = String(texto || '').match(/(\d{3,4})p/);
   return m ? Number(m[1]) : 0;
+}
+
+// Puro (TAREA 3): escalera de calidades a recorrer en /dl cuando la calidad
+// pedida falla en todas las capas. Las calidades bajas pasan los filtros de
+// googlevideo con más frecuencia; solo se responde IP_BLOQUEADA cuando ni la
+// calidad mínima obtiene nada. El audio ya degrada solo dentro de
+// fetchYoutubeMedia (itag 140 -> cualquier audio -> progresivo itag 18).
+function escaleraCalidades(kind, calidad) {
+  const pedido = String(calidad || '').trim();
+  if (kind === 'audio') {
+    return pedido && pedido !== 'best' ? [pedido, 'best'] : ['best'];
+  }
+  const escalera = ['best', '480', '360', '18'];
+  if (pedido && pedido !== 'best' && /^\d+$/.test(pedido)) {
+    const previas = escalera.filter((q) => q === 'best' || (Number(q) && Number(q) < Number(pedido)));
+    return [pedido, ...previas];
+  }
+  return escalera;
 }
 
 // Funcion pura: elige el formato de una respuesta de Invidious
@@ -1867,7 +2178,7 @@ async function probeUrlMedia(mediaUrl, timeoutMs = 5000) {
 
 async function resolverViaInvidious(videoId, kind, presupuestoMs = 9000) {
   const deadline = Date.now() + presupuestoMs;
-  for (const base of INSTANCIAS_INVIDIOUS) {
+  for (const base of await instanciasPara('invidious', INSTANCIAS_INVIDIOUS)) {
     if (Date.now() > deadline - 500) break;
     let host = '';
     try { host = new URL(base).host; } catch { continue; }
@@ -1911,7 +2222,7 @@ async function resolverViaInvidious(videoId, kind, presupuestoMs = 9000) {
 
 async function resolverViaPiped(videoId, kind, presupuestoMs = 9000) {
   const deadline = Date.now() + presupuestoMs;
-  for (const base of INSTANCIAS_PIPED) {
+  for (const base of await instanciasPara('piped', INSTANCIAS_PIPED)) {
     if (Date.now() > deadline - 500) break;
     let host = '';
     try { host = new URL(base).host; } catch { continue; }
@@ -1955,7 +2266,7 @@ async function resolverViaPiped(videoId, kind, presupuestoMs = 9000) {
 
 async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
   const deadline = Date.now() + presupuestoMs;
-  for (const base of INSTANCIAS_COBALT) {
+  for (const base of await instanciasPara('cobalt', INSTANCIAS_COBALT)) {
     if (Date.now() > deadline - 500) break;
     let host = '';
     try { host = new URL(base).host; } catch { continue; }
@@ -2045,6 +2356,14 @@ module.exports = {
   obtenerDiagnosticoTikTok,
   normalizeYoutubeCookie,
   getYoutubeInstance,
+  obtenerSesionAnonima,
+  estadoSesionAnonima,
+  parseSetCookies,
+  extraerVisitorData,
+  escaleraCalidades,
+  descubrirInstancias,
+  estadoInstanciasDescubiertas,
+  instanciasPara,
   elegirFormatoInvidious,
   elegirFormatoPiped,
   resolverViaInstanciasPublicas,

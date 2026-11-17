@@ -366,13 +366,13 @@ videoId=String(primerVideo.id);
 }
 const cookieHeader=secureApi.normalizeYoutubeCookie(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie||'');
 const hayCookie=!!cookieHeader;
-const cacheKey=videoId+'|'+kind+'|'+(qualityParam==='best'?'best':qualityParam);
 const dlHeadersBase=hayCookie?{Cookie:cookieHeader}:{};
 const dlDeadline=Date.now()+35000;
 const tInicioDl=Date.now();
 const tipoMedia=kind==='audio'?'audio':'video';
-const calidadMedia=qualityParam==='best'?'best':qualityParam;
+const calidadPedido=qualityParam==='best'?'best':qualityParam;
 const extDefault=kind==='audio'?'m4a':'mp4';
+const cacheKey=videoId+'|'+kind+'|'+calidadPedido;
 const cacheado=dlMediaCache.get(cacheKey);
 if(cacheado&&cacheado.expiresAt>Date.now()){
 const probeCacheado=await probeMedia(cacheado.url,cacheado.headers||{});
@@ -386,32 +386,42 @@ const claveCliente=videoId+'|'+kind;
 const recordado=dlClienteCache.get(claveCliente);
 if(recordado&&recordado.expiresAt<Date.now())dlClienteCache.delete(claveCliente);
 // CAPA 1: scraping directo. Intento A = camino completo de youtubei.js
-// (clientes en paralelo + PO token bgutil + watch page), recortado a 8s.
-// Intento B = clientes puntuales en paralelo (capa 1 + capa 3 sin cookie),
-// probe en orden de prioridad.
+// (clientes en paralelo + PO token bgutil + watch page + sesion anonima
+// auto-generada), recortado a 8s. Intento B = clientes puntuales en paralelo
+// (capa 1 + capa 3 sin cookie), probe en orden de prioridad.
+// CAPA 2: instancias publicas en paralelo.
+// TAREAS 3/4: si la calidad pedida falla, se degrada (480p -> 360p -> itag 18)
+// y se re-resuelve una vez con sesion anonima recien renovada antes de
+// responder IP_BLOQUEADA.
+const correrCascada=async(calidad,renovarSesion)=>{
+const t0Pasada=Date.now();
+if(renovarSesion){
+try{await secureApi.obtenerSesionAnonima(true);
+console.log('[dl] pasada calidad='+calidad+' con sesion anonima renovada');}catch(e){}
+}
 const intentoCapa1=(async()=>{
 const conTimeout=(promesa,ms)=>Promise.race([promesa,new Promise((_,rechazar)=>setTimeout(()=>rechazar(new Error('timeout '+ms+'ms')),ms))]);
 try{
-const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidadMedia,null,{sinProxy:true}),8000);
+const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{sinProxy:true}),8000);
 if(media&&media.url){
 const probeStatus=await probeMedia(media.url,dlHeadersBase);
-console.log('[dl][capa1] auto probe='+probeStatus+' ('+(Date.now()-tInicioDl)+'ms)');
+console.log('[dl][capa1] auto probe='+probeStatus+' ('+(Date.now()-t0Pasada)+'ms)');
 if(probeStatus===200||probeStatus===206){
 dlClienteCache.set(claveCliente,{cliente:null,cookie:true,expiresAt:Date.now()+6*60*60*1000});
 return {ok:true,url:media.url,headers:dlHeadersBase,detalle:'auto',ext:extDefault};
 }
 }
 }catch(e){
-console.log('[dl][capa1] auto fallo: '+String(e&&e.message||e).slice(0,100)+' ('+(Date.now()-tInicioDl)+'ms)');
+console.log('[dl][capa1] auto fallo: '+String(e&&e.message||e).slice(0,100)+' ('+(Date.now()-t0Pasada)+'ms)');
 }
 let instanciaConCookie=null,instanciaSinCookie=null;
 try{instanciaConCookie=await secureApi.getYoutubeInstance(true);}catch(e){console.log('[dl][capa1] instancia con cookie fallo: '+String(e&&e.message||e).slice(0,80));}
-if(hayCookie){try{instanciaSinCookie=await secureApi.getYoutubeInstance(false);}catch(e){}}
+try{instanciaSinCookie=await secureApi.getYoutubeInstance(false);}catch(e){}
 if(!instanciaConCookie&&!instanciaSinCookie)return {ok:false};
 const construirCandidatos=()=>{
 const base=[
 {cliente:'WEB',cookie:true,capa:1},
-...(hayCookie?[{cliente:'WEB',cookie:false,capa:1}]:[]),
+{cliente:'WEB',cookie:false,capa:1},
 {cliente:'WEB_EMBEDDED',cookie:true,capa:1},
 {cliente:'TV_SIMPLY',cookie:true,capa:1},
 {cliente:'ANDROID_VR',cookie:true,capa:1},
@@ -429,7 +439,7 @@ return base.filter((c)=>(c.cookie!==false?instanciaConCookie:instanciaSinCookie)
 };
 const candidatos=construirCandidatos();
 const resultados=await Promise.allSettled(candidatos.map((c)=>conTimeout(
-secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidadMedia,null,{client:c.cliente,cookie:c.cookie,sinProxy:true,youtube:c.cookie!==false?instanciaConCookie:instanciaSinCookie}),
+secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{client:c.cliente,cookie:c.cookie,sinProxy:true,youtube:c.cookie!==false?instanciaConCookie:instanciaSinCookie}),
 8000,
 )));
 for(let i=0;i<candidatos.length;i+=1){
@@ -439,7 +449,7 @@ if(r.status!=='fulfilled'||!r.value||!r.value.url)continue;
 const c=candidatos[i];
 const headers=c.cookie&&hayCookie?{Cookie:cookieHeader}:{};
 const probeStatus=await probeMedia(r.value.url,headers);
-console.log('[dl][capa'+c.capa+'] cliente='+c.cliente+(c.cookie?' +cookie':' sincookie')+' probe='+probeStatus+' ('+(Date.now()-tInicioDl)+'ms)');
+console.log('[dl][capa'+c.capa+'] cliente='+c.cliente+(c.cookie?' +cookie':' sincookie')+' probe='+probeStatus+' ('+(Date.now()-t0Pasada)+'ms)');
 if(probeStatus===200||probeStatus===206){
 dlClienteCache.set(claveCliente,{cliente:c.cliente,cookie:c.cookie,expiresAt:Date.now()+6*60*60*1000});
 if(dlClienteCache.size>200)dlClienteCache.delete(dlClienteCache.keys().next().value);
@@ -448,27 +458,48 @@ return {ok:true,url:r.value.url,headers,detalle:'capa'+c.capa+' '+c.cliente,ext:
 }
 return {ok:false};
 })();
-// CAPA 2: instancias publicas en paralelo (arranca YA, sin esperar a capa 1).
 const intentoCapa2=secureApi.resolverViaInstanciasPublicas(videoId,tipoMedia,9000).catch(()=>null);
 // Prioridad capa 1: hasta 8s. Si no llega, se usa capa 2 si ya esta lista.
 let r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),8000))]);
 if(!(r1&&r1.ok)){
-const restante2=Math.max(0,9500-(Date.now()-tInicioDl));
+const restante2=Math.max(0,9500-(Date.now()-t0Pasada));
 const r2=await Promise.race([intentoCapa2,new Promise((r)=>setTimeout(()=>r(null),restante2))]);
 if(r2&&r2.url){
-dlMediaCache.set(cacheKey,{url:r2.url,headers:{},fuente:'capa2:'+r2.fuente+':'+r2.instancia,ext:r2.ext,expiresAt:Date.now()+30*60*1000});
+dlMediaCache.set(videoId+'|'+kind+'|'+calidad,{url:r2.url,headers:{},fuente:'capa2:'+r2.fuente+':'+r2.instancia,ext:r2.ext,expiresAt:Date.now()+30*60*1000});
 if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
-console.log('[dl] salida por CAPA 2 ('+r2.fuente+':'+r2.instancia+') a los '+(Date.now()-tInicioDl)+'ms');
-return streamMedia(req,res,sendJson,requestId,r2.url,{referer:'https://www.youtube.com/',headers:{},filename:videoId+'.'+r2.ext});
+console.log('[dl] salida por CAPA 2 ('+r2.fuente+':'+r2.instancia+' calidad='+r2.calidad+') a los '+(Date.now()-t0Pasada)+'ms');
+return {ok:true,url:r2.url,headers:{},detalle:'capa2 '+r2.fuente+':'+r2.instancia,ext:r2.ext};
 }
-const restante1=Math.max(0,10000-(Date.now()-tInicioDl));
+const restante1=Math.max(0,10000-(Date.now()-t0Pasada));
 r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),restante1))]);
 }
 if(r1&&r1.ok){
-dlMediaCache.set(cacheKey,{url:r1.url,headers:r1.headers,fuente:'capa1:'+r1.detalle,ext:r1.ext,expiresAt:Date.now()+30*60*1000});
+dlMediaCache.set(videoId+'|'+kind+'|'+calidad,{url:r1.url,headers:r1.headers,fuente:'capa1:'+r1.detalle,ext:r1.ext,expiresAt:Date.now()+30*60*1000});
 if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
-console.log('[dl] salida por CAPA 1 ('+r1.detalle+') a los '+(Date.now()-tInicioDl)+'ms');
-return streamMedia(req,res,sendJson,requestId,r1.url,{referer:'https://www.youtube.com/',headers:r1.headers,filename:videoId+'.'+r1.ext});
+console.log('[dl] salida por CAPA 1 ('+r1.detalle+' calidad='+calidad+') a los '+(Date.now()-t0Pasada)+'ms');
+return {ok:true,url:r1.url,headers:r1.headers,detalle:r1.detalle,ext:r1.ext};
+}
+return null;
+};
+// Pasada 1 con la calidad pedida; si falla y el deadline lo permite, pasadas
+// siguientes con calidades degradadas (y la 2da con sesion anonima renovada).
+const escalera=secureApi.escaleraCalidades(kind,calidadPedido);
+let salida=null;
+let calidadUsada='';
+for(let i=0;i<escalera.length;i+=1){
+const cal=escalera[i];
+if(i>0&&Date.now()>dlDeadline-9000)break;
+salida=await correrCascada(cal,i===1);
+if(salida){calidadUsada=cal;break;}
+}
+if(!salida&&Date.now()<dlDeadline-9000){
+// Ultima oportunidad (TAREA 4): sesion anonima recien renovada + calidad minima.
+salida=await correrCascada(kind==='audio'?calidadPedido:'18',true);
+if(salida)calidadUsada=kind==='audio'?calidadPedido:'18';
+}
+if(salida){
+console.log('[dl] entregado calidad='+calidadUsada+' fuente='+salida.detalle+' total='+(Date.now()-tInicioDl)+'ms');
+return streamMedia(req,res,sendJson,requestId,salida.url,{referer:'https://www.youtube.com/',headers:salida.headers,filename:videoId+'.'+salida.ext});
 }
 return sendJson(502,{ok:false,error:'IP_BLOQUEADA',reintentar:true,message:'Ningun cliente ni instancia publica pudo descargar desde este hosting. Vercel rota la IP de salida: reintentar suele funcionar.'});
 }
@@ -517,6 +548,7 @@ return sendJson(200,{ok:true,source:'youtube',query,total_resultados:results.len
 const isAudio=pathname==='/ytmp3';
 // CAPA 1: scraping directo desde la IP de Vercel. Si esta bloqueada, CAPA 2:
 // instancias publicas (sus URLs de tunnel no quedan amarradas a nuestra IP).
+const deadlineYtmp=Date.now()+35000;
 let media=null;
 let errorCapa1=null;
 try{
@@ -524,6 +556,13 @@ media=await secureApi.fetchYoutubeMedia(videoId,isAudio?'audio':'video',qualityP
 }catch(e){
 errorCapa1=e;
 console.log('[ytmp] capa1 fallo: '+String(e&&e.message||e).slice(0,120));
+}
+if(!media||!media.url){
+// Reintento interno (TAREA 4): sesion anonima recien renovada ANTES de caer a capa 2.
+if(Date.now()<deadlineYtmp-15000){
+try{await secureApi.obtenerSesionAnonima(true);console.log('[ytmp] reintento con sesion anonima renovada');}catch(e){}
+try{media=await secureApi.fetchYoutubeMedia(videoId,isAudio?'audio':'video',qualityParam==='best'?'best':qualityParam,null,{cookie:false});console.log('[ytmp] reintento OK');}catch(e2){console.log('[ytmp] reintento fallo: '+String(e2&&e2.message||e2).slice(0,120));}
+}
 }
 let altCapa2=null;
 if(!media||!media.url){
@@ -589,7 +628,7 @@ return sendJson(404,{ok:false,error:{message:String(e&&e.message||e).slice(0,220
 }
 }
 if(pathname==='/status'){
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),youtube_visitor_data_como:'Recomendada: sube el exito del cliente WEB con PO Token. Conseguila de un navegador logueado en YouTube: F12 > Console > ytcfg.get("VISITOR_DATA") y pega el valor en la variable YOUTUBE_VISITOR_DATA.',dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','instancias_publicas'],admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),sesion_anonima:(secureApi.estadoSesionAnonima?typeof secureApi.estadoSesionAnonima==='function'?secureApi.estadoSesionAnonima():{activa:false}:{activa:false}),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','instancias_publicas'],instancias_descubiertas:(secureApi.estadoInstanciasDescubiertas&&typeof secureApi.estadoInstanciasDescubiertas==='function')?secureApi.estadoInstanciasDescubiertas():null,configuracion_dueno:'no requerida: la API auto-gestiona su sesion anonima y su pool de instancias publicas',admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
