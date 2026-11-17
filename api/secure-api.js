@@ -479,6 +479,96 @@ function extraerVideosTikTokDeHtml(text) {
   return [...encontrados.entries()].map(([videoId, username]) => ({ videoId, username }));
 }
 
+// Fuente searx: instancias publicas de SearXNG con site:tiktok.com. Rota por
+// el pool ante 429/challenge (backoff 800ms), maximo 4 instancias, 7s c/u.
+const SEARX_INSTANCIAS = [
+  'https://paulgo.io',
+  'https://searx.tiekoetter.com',
+  'https://searx.be',
+  'https://priv.au',
+  'https://opnxng.com',
+  'https://search.inetol.net',
+  'https://search.sapti.me',
+  'https://baresearch.org',
+  'https://search.hbubli.cc',
+  'https://searx.works',
+];
+let searxOffset = 0;
+
+function candidatoDesdeUrlTikTok(url) {
+  const im = String(url || '').match(/tiktok\.com\/@([\w.\-]+)\/video\/(\d{10,25})/);
+  return im ? { videoId: im[2], username: im[1] } : null;
+}
+
+async function buscarSearxTikTok(query, limit, parentSignal) {
+  const q = encodeURIComponent(`${query} site:tiktok.com`);
+  const mapear = (videos) => videos.slice(0, limit).map(({ videoId, username }) => ({
+    type: 'video',
+    videoId,
+    title: '',
+    url: `https://www.tiktok.com/@${username}/video/${videoId}`,
+    thumbnail: '',
+    duration: 0,
+    author: { username, nickname: '' },
+    stats: { views: 0, likes: 0, comments: 0, shares: 0 },
+  }));
+  for (let intento = 0; intento < 4; intento += 1) {
+    const instancia = SEARX_INSTANCIAS[(intento + searxOffset) % SEARX_INSTANCIAS.length];
+    let videos = [];
+    let bloqueada = false;
+    // Intento 1: JSON nativo. Un 429 aca NO descarta la instancia: muchas la
+    // limitan solo para format=json pero sirven el HTML normalmente.
+    try {
+      const response = await fetch(`${instancia}/search?q=${q}&format=json`, {
+        headers: {
+          'User-Agent': NAVEGADOR_UA,
+          Accept: 'application/json',
+          'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        },
+        signal: senalConLimite(parentSignal, 7000),
+      });
+      const text = await response.text().catch(() => '');
+      if (response.ok && text.trim().startsWith('{')) {
+        try {
+          const payload = JSON.parse(text);
+          for (const item of payload.results || []) {
+            const candidato = candidatoDesdeUrlTikTok(item?.url);
+            if (candidato && !videos.some((v) => v.videoId === candidato.videoId)) videos.push(candidato);
+          }
+        } catch {}
+      }
+    } catch {}
+    // Intento 2: HTML de la misma instancia.
+    if (!videos.length) {
+      try {
+        const response = await fetch(`${instancia}/search?q=${q}`, {
+          headers: {
+            'User-Agent': NAVEGADOR_UA,
+            Accept: 'text/html,application/xhtml+xml',
+            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+          },
+          signal: senalConLimite(parentSignal, 7000),
+        });
+        const text = await response.text().catch(() => '');
+        if (response.status === 429 || text.includes('Just a moment')) {
+          bloqueada = true;
+        } else {
+          for (const { videoId, username } of extraerVideosTikTokDeHtml(text)) {
+            if (!videos.some((v) => v.videoId === videoId)) videos.push({ videoId, username });
+          }
+        }
+      } catch (error) {
+        if (parentSignal?.aborted) throw error;
+        bloqueada = true;
+      }
+    }
+    if (videos.length) return mapear(videos);
+    searxOffset += 1;
+    await new Promise((resolve) => setTimeout(resolve, bloqueada ? 800 : 200));
+  }
+  return [];
+}
+
 // Fuentes c/d/e: motores de busqueda con site:tiktok.com.
 async function buscarEnMotorTikTok(motor, query, limit, parentSignal) {
   const q = encodeURIComponent(`site:tiktok.com ${query}`);
@@ -563,9 +653,10 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   const cached = TT_SEARCH_CACHE.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.results;
 
-  const [directaR, tikwmR, ddgR, ddgLtR, bingR] = await Promise.allSettled([
+  const [directaR, tikwmR, searxR, ddgR, ddgLtR, bingR] = await Promise.allSettled([
     buscarTikTokDirecta(query, limit, parentSignal),
     buscarTikwmSearch(query, limit, parentSignal),
+    buscarSearxTikTok(query, limit, parentSignal),
     buscarEnMotorTikTok('ddg', query, limit, parentSignal),
     buscarEnMotorTikTok('ddglite', query, limit, parentSignal),
     buscarEnMotorTikTok('bing', query, limit, parentSignal),
@@ -574,6 +665,7 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   const fuentes = [
     ['directa', directaR],
     ['tikwm', tikwmR],
+    ['searx', searxR],
     ['ddg', ddgR],
     ['ddglite', ddgLtR],
     ['bing', bingR],
@@ -592,7 +684,12 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   }
 
   const enriquecidos = await Promise.allSettled(
-    candidatos.map((candidato) => (candidato.title ? Promise.resolve(candidato) : enriquecerResultadoTikTok(candidato, parentSignal)))
+    candidatos.map(async (candidato, i) => {
+      if (candidato.title) return candidato;
+      // Escalonado suave para no chocar con el rate limit de tikwm.
+      await new Promise((resolve) => setTimeout(resolve, i * 350));
+      return enriquecerResultadoTikTok(candidato, parentSignal);
+    })
   );
   const results = candidatos.map((candidato, i) => {
     const enriquecido = enriquecidos[i];
