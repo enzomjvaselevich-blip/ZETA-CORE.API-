@@ -1434,12 +1434,13 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
   const controller = new AbortController();
   const timeoutError = apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
   const abortFromParent = () => controller.abort(parentSignal.reason || timeoutError);
-  const timer = setTimeout(() => controller.abort(timeoutError), 24000);
+  const presupuesto = Math.max(3000, Number(options.presupuestoMs) || 24000);
+  const timer = setTimeout(() => controller.abort(timeoutError), presupuesto);
   if (parentSignal) parentSignal.addEventListener('abort', abortFromParent, { once: true });
   try {
     const youtube = options.youtube || await getYoutubeInstance(options.cookie !== false);
     const clients = ['IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
-    const deadline = Date.now() + 21000;
+    const deadline = Date.now() + Math.min(21000, presupuesto - 3000);
     let lastFormatError;
     let lastCause;
     let basicInfo;
@@ -1549,7 +1550,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     // Reintento interno (TAREA 4): si los clientes devolvieron LOGIN_REQUIRED
     // (cookie manual vencida o bloqueo anti-bot de la IP), se renueva la sesión
     // anónima AHORA y se reintenta en el mismo pedido con una instancia fresca.
-    if (loginRequiredCount > 0 && !options.sesionRenovada && !options.youtube && Date.now() - inicioMs < 12000) {
+    if (loginRequiredCount > 0 && !options.sesionRenovada && !options.youtube && Date.now() - inicioMs < presupuesto * 0.5) {
       try {
         console.log('[dl][capa1] LOGIN_REQUIRED x' + loginRequiredCount + ': reintento en el mismo pedido con sesion anonima renovada');
         await obtenerSesionAnonima(true).catch(() => null);
@@ -1910,6 +1911,46 @@ function estadoSaludInstancias() {
   }));
 }
 
+// Registro de intentos de capa 2 (diagnostico: la respuesta de error de /dl
+// expone los ultimos para ver si las instancias estan muertas o no se llaman).
+const registroIntentosCapa2 = [];
+function registrarIntentoCapa2(objetivo, resultado, ms) {
+  registroIntentosCapa2.push({ capa: 2, objetivo, resultado: String(resultado).slice(0, 120), ms: Math.round(ms) });
+  if (registroIntentosCapa2.length > 60) registroIntentosCapa2.shift();
+}
+function obtenerRegistroCapa2() {
+  return registroIntentosCapa2.slice(-20);
+}
+
+// Listado para /status: hardcodeadas + descubiertas con su salud (sin red).
+function listadoInstanciasPublicas() {
+  const grupos = [
+    ['cobalt', INSTANCIAS_COBALT],
+    ['invidious', INSTANCIAS_INVIDIOUS],
+    ['piped', INSTANCIAS_PIPED],
+    ['invidious', instanciasDescubiertas.invidious],
+    ['piped', instanciasDescubiertas.piped],
+    ['cobalt', instanciasDescubiertas.cobalt],
+  ];
+  const vistas = new Set();
+  const salida = [];
+  for (const [servicio, lista] of grupos) {
+    for (const base of Array.isArray(lista) ? lista : []) {
+      const host = normalizarHostInstancia(base);
+      if (!host || vistas.has(host)) continue;
+      vistas.add(host);
+      const entrada = { nombre: host, servicio, salud: 'sin_probar' };
+      const estado = saludInstancias.get(servicio + ':' + host);
+      if (estado) {
+        entrada.salud = estado.viva ? 'ok' : 'caida';
+        entrada.verificado_hace_s = Math.round((Date.now() - estado.checkedAt) / 1000);
+      }
+      salida.push(entrada);
+    }
+  }
+  return salida;
+}
+
 // ============================================================================
 // Descubrimiento runtime de instancias publicas (TAREA 2): ademas de las
 // hardcodeadas, se consultan las listas publicas oficiales (Invidious/Piped/
@@ -2187,16 +2228,17 @@ async function resolverViaInvidious(videoId, kind, presupuestoMs = 9000) {
     if (!instanciaDisponible(nombre)) continue;
     const t0 = Date.now();
     try {
-      const json = await fetchJsonInstancia(base + '/api/v1/videos/' + videoId + '?local=true', 6000);
+      const json = await fetchJsonInstancia(base + '/api/v1/videos/' + videoId + '?local=true', Math.min(6000, Math.max(1000, deadline - Date.now())));
       const elegido = elegirFormatoInvidious(json, kind);
       if (!elegido) {
         marcarInstancia(nombre, true);
+        registrarIntentoCapa2('invidious:' + host, 'sin formato util', Date.now() - t0);
         console.log('[dl][capa2] invidious:' + host + ' sin formato util (' + (Date.now() - t0) + 'ms)');
         continue;
       }
-      const probe = await probeUrlMedia(elegido.url);
+      const probe = await probeUrlMedia(elegido.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
       console.log('[dl][capa2] invidious:' + host + ' probe=' + probe.status + ' itag=' + elegido.itag + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) continue;
+      if (!probe.ok) { registrarIntentoCapa2('invidious:' + host, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0); continue; }
       marcarInstancia(nombre, true);
       return {
         url: elegido.url,
@@ -2215,6 +2257,7 @@ async function resolverViaInvidious(videoId, kind, presupuestoMs = 9000) {
       };
     } catch (e) {
       marcarInstancia(nombre, false);
+      registrarIntentoCapa2('invidious:' + host, 'fallo: ' + String(e && e.message || e).slice(0, 80), Date.now() - t0);
       console.log('[dl][capa2] invidious:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
     }
   }
@@ -2231,16 +2274,17 @@ async function resolverViaPiped(videoId, kind, presupuestoMs = 9000) {
     if (!instanciaDisponible(nombre)) continue;
     const t0 = Date.now();
     try {
-      const json = await fetchJsonInstancia(base + '/streams/' + videoId, 6000);
+      const json = await fetchJsonInstancia(base + '/streams/' + videoId, Math.min(6000, Math.max(1000, deadline - Date.now())));
       const elegido = elegirFormatoPiped(json, kind);
       if (!elegido) {
         marcarInstancia(nombre, true);
+        registrarIntentoCapa2('piped:' + host, 'sin formato util', Date.now() - t0);
         console.log('[dl][capa2] piped:' + host + ' sin formato util (' + (Date.now() - t0) + 'ms)');
         continue;
       }
-      const probe = await probeUrlMedia(elegido.url);
+      const probe = await probeUrlMedia(elegido.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
       console.log('[dl][capa2] piped:' + host + ' probe=' + probe.status + ' calidad=' + elegido.calidad + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) continue;
+      if (!probe.ok) { registrarIntentoCapa2('piped:' + host, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0); continue; }
       marcarInstancia(nombre, true);
       return {
         url: elegido.url,
@@ -2259,6 +2303,7 @@ async function resolverViaPiped(videoId, kind, presupuestoMs = 9000) {
       };
     } catch (e) {
       marcarInstancia(nombre, false);
+      registrarIntentoCapa2('piped:' + host, 'fallo: ' + String(e && e.message || e).slice(0, 80), Date.now() - t0);
       console.log('[dl][capa2] piped:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
     }
   }
@@ -2282,22 +2327,24 @@ async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
         method: 'POST',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
         body: JSON.stringify(cuerpo),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(Math.min(6000, Math.max(1000, deadline - Date.now()))),
       });
       const json = await r.json().catch(() => null);
       if (!json || json.status === 'error' || !json.url) {
         marcarInstancia(nombre, false);
+        registrarIntentoCapa2('cobalt:' + host, 'rechazo: ' + String(json && (json.error && json.error.code || json.status) || 'HTTP ' + r.status).slice(0, 80), Date.now() - t0);
         console.log('[dl][capa2] cobalt:' + host + ' rechazo: ' + String(json && (json.error && json.error.code || json.status) || 'HTTP ' + r.status).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
         continue;
       }
       if (json.status !== 'tunnel' && json.status !== 'stream' && json.status !== 'redirect') {
         marcarInstancia(nombre, false);
+        registrarIntentoCapa2('cobalt:' + host, 'status no usable: ' + json.status, Date.now() - t0);
         console.log('[dl][capa2] cobalt:' + host + ' status no usable: ' + json.status + ' (' + (Date.now() - t0) + 'ms)');
         continue;
       }
-      const probe = await probeUrlMedia(json.url);
+      const probe = await probeUrlMedia(json.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
       console.log('[dl][capa2] cobalt:' + host + ' probe=' + probe.status + ' tipo=' + (probe.tipo || '-') + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) continue;
+      if (!probe.ok) { registrarIntentoCapa2('cobalt:' + host, 'probe ' + probe.status + ' bytes=' + (probe.bytes ?? '-') + ' ' + (probe.tipo || '-'), Date.now() - t0); continue; }
       marcarInstancia(nombre, true);
       return {
         url: json.url,
@@ -2310,6 +2357,7 @@ async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
       };
     } catch (e) {
       marcarInstancia(nombre, false);
+      registrarIntentoCapa2('cobalt:' + host, 'fallo: ' + String(e && e.message || e).slice(0, 80), Date.now() - t0);
       console.log('[dl][capa2] cobalt:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
     }
   }
@@ -2369,6 +2417,8 @@ module.exports = {
   elegirFormatoPiped,
   resolverViaInstanciasPublicas,
   estadoSaludInstancias,
+  obtenerRegistroCapa2,
+  listadoInstanciasPublicas,
   fetchYoutubeMedia,
   fetchYoutubeWatchPageMedia,
   selectYoutubeMediaFormat,
