@@ -360,6 +360,8 @@ const NAVEGADOR_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 const TT_SEARCH_HOSTS = ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com'];
 const TT_SEARCH_CACHE = new Map();
 const TT_SEARCH_CACHE_TTL = 5 * 60 * 1000;
+let diagnosticoTikTok = null;
+function obtenerDiagnosticoTikTok() { return diagnosticoTikTok; }
 
 function senalConLimite(parentSignal, ms) {
   return parentSignal ? AbortSignal.any([parentSignal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
@@ -602,6 +604,16 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
     .map(([nombre, fuente]) => `${nombre}=${fuente.status === 'fulfilled' && Array.isArray(fuente.value) ? fuente.value.length : 'X'}`)
     .join(' ');
   console.log(`[ttsearch] query="${qNorm.slice(0, 80)}" fuentes: ${conteo} -> resultados=${results.length}`);
+  diagnosticoTikTok = {
+    query: qNorm.slice(0, 80),
+    fuentes: Object.fromEntries(fuentes.map(([nombre, fuente]) => [
+      nombre,
+      fuente.status === 'fulfilled'
+        ? (Array.isArray(fuente.value) ? fuente.value.length : 0)
+        : String(fuente.reason?.message || fuente.reason || 'error').slice(0, 80),
+    ])),
+    resultados: results.length,
+  };
 
   if (TT_SEARCH_CACHE.size > 100) TT_SEARCH_CACHE.clear();
   TT_SEARCH_CACHE.set(cacheKey, { results, expiresAt: Date.now() + TT_SEARCH_CACHE_TTL });
@@ -1470,6 +1482,7 @@ module.exports = {
   extractYoutubeVideoId,
   fetchRealSearchResults,
   fetchTikTokVideo,
+  obtenerDiagnosticoTikTok,
   normalizeYoutubeCookie,
   getYoutubeInstance,
   fetchYoutubeMedia,

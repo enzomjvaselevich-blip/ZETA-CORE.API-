@@ -427,9 +427,9 @@ miniatura:`https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`
 }
 if(pathname==='/tiktok'||pathname==='/ttsearch'){
 try{
-const {searchTikTok}=require('./documentos/ttsearch');
+const {searchTikTok,obtenerDiagnosticoTikTok}=require('./documentos/ttsearch');
 const {extractTikTokVideo}=require('./documentos/tiktok');
-if(pathname==='/ttsearch'){let r;try{r=await searchTikTok(query,limit);}catch(e){r=[];}return sendJson(200,{ok:true,results:Array.isArray(r)?r:[]});}
+if(pathname==='/ttsearch'){let r;try{r=await searchTikTok(query,limit);}catch(e){r=[];}const diag=parsedUrl.searchParams.get('debug')==='1'?obtenerDiagnosticoTikTok():undefined;return sendJson(200,diag?{ok:true,results:Array.isArray(r)?r:[],diagnostico:diag}:{ok:true,results:Array.isArray(r)?r:[]});}
 return sendJson(200,{ok:true,...(await extractTikTokVideo(query))});
 }catch(e){return sendJson(502,{ok:false,message:'Modulo TikTok no disponible',error:e.message});}
 }

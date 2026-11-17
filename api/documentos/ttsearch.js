@@ -1,12 +1,9 @@
-// /ttsearch — Buscador de TikTok por scraping puro.
-//
-// Cómo funciona: se pide https://www.tiktok.com/search?q=... y se extrae la
-// lista de videos directamente del HTML devuelto (pares "id"/"desc" que
-// TikTok embebe en la página). No hay API externa involucrada.
+// /ttsearch — Buscador de TikTok multi-fuente (scraping directo, tikwm,
+// DDG HTML, DDG Lite y Bing en paralelo + enriquecido via oEmbed/tikwm).
 const secureApi = require('../secure-api');
 
 async function searchTikTok(query, limit, parentSignal) {
   return secureApi.fetchRealSearchResults(query, limit, 'tiktok', parentSignal);
 }
 
-module.exports = { searchTikTok };
+module.exports = { searchTikTok, obtenerDiagnosticoTikTok: secureApi.obtenerDiagnosticoTikTok };
