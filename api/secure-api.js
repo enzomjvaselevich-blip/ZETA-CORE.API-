@@ -482,6 +482,9 @@ function extraerVideosTikTokDeHtml(text) {
 // Fuente searx: instancias publicas de SearXNG con site:tiktok.com. Rota por
 // el pool ante 429/challenge (backoff 800ms), maximo 4 instancias, 7s c/u.
 const SEARX_INSTANCIAS = [
+  'https://kantan.cat',
+  'https://failsearx.culturanerd.it',
+  'https://anonsearch.win',
   'https://paulgo.io',
   'https://searx.tiekoetter.com',
   'https://searx.be',
@@ -492,6 +495,10 @@ const SEARX_INSTANCIAS = [
   'https://baresearch.org',
   'https://search.hbubli.cc',
   'https://searx.works',
+  'https://etsi.me',
+  'https://search.rowie.at',
+  'https://grep.vim.wtf',
+  'https://find.xenorio.xyz',
 ];
 let searxOffset = 0;
 
@@ -562,7 +569,8 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
     author: { username, nickname: '' },
     stats: { views: 0, likes: 0, comments: 0, shares: 0 },
   }));
-  for (let intento = 0; intento < 4; intento += 1) {
+  const acumulados = [];
+  for (let intento = 0; intento < 6 && acumulados.length < limit; intento += 1) {
     const instancia = SEARX_INSTANCIAS[(intento + searxOffset) % SEARX_INSTANCIAS.length];
     let videos = [];
     let bloqueada = false;
@@ -614,11 +622,16 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
         bloqueada = true;
       }
     }
-    if (videos.length) return mapear(videos);
-    searxOffset += 1;
+    for (const video of videos) {
+      if (acumulados.some((v) => v.videoId === video.videoId)) continue;
+      acumulados.push(video);
+      if (acumulados.length >= limit) break;
+    }
+    if (acumulados.length >= limit) return mapear(acumulados);
+    if (!videos.length) searxOffset += 1;
     await new Promise((resolve) => setTimeout(resolve, bloqueada ? 800 : 200));
   }
-  return [];
+  return mapear(acumulados);
 }
 
 // Fuentes c/d/e: motores de busqueda con site:tiktok.com.
@@ -764,7 +777,9 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   };
 
   if (TT_SEARCH_CACHE.size > 100) TT_SEARCH_CACHE.clear();
-  TT_SEARCH_CACHE.set(cacheKey, { results, expiresAt: Date.now() + TT_SEARCH_CACHE_TTL });
+  // Los resultados vacios se cachean poco tiempo: las fuentes son intermitentes
+  // y una mala ronda no debe dejar la busqueda en cero durante el TTL completo.
+  TT_SEARCH_CACHE.set(cacheKey, { results, expiresAt: Date.now() + (results.length ? TT_SEARCH_CACHE_TTL : 30 * 1000) });
   return results;
 }
 
