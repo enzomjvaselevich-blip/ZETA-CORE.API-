@@ -393,7 +393,7 @@ const parsedUrl=new URL(req.url||'/',`https://${req.headers.host||'api.invalid'}
 let pathname=parsedUrl.pathname.replace(/^\/api(?=\/|$)/,'');
 if(!pathname)pathname='/';
 if(pathname==='/favicon.ico')return res.end();
-const esRutaAdmin=pathname==='/admin'||pathname.startsWith('/admin/')||pathname==='/ping'||pathname==='/fondo'||pathname==='/fondo-archivo';
+const esRutaAdmin=pathname==='/admin'||pathname.startsWith('/admin/')||pathname==='/ping'||pathname==='/fondo'||pathname==='/fondo-archivo'||pathname==='/musica'||pathname==='/musica-archivo';
 if(req.method!=='GET'&&req.method!=='HEAD'&&!esRutaAdmin){
 res.setHeader('Allow','GET, HEAD');
 return sendJson(405,{ok:false,message:'Metodo no permitido. Usa GET o HEAD.'});
