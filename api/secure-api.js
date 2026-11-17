@@ -1565,7 +1565,8 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
       const loginError = apiError(502, 'Este video tiene restriccion de edad o verificacion anti-bot: YouTube exige inicio de sesion para descargarlo.', {
         code: 'YOUTUBE_LOGIN_REQUIRED',
       });
-      loginError.solucion = 'YouTube exige sesion iniciada para este video desde IPs de servidor. Solucion: en Vercel (Settings > Environment Variables) crea YOUTUBE_COOKIE con la cookie de tu navegador logueado en YouTube (F12 > Network > clic en un pedido a youtube.com > Request Headers > Cookie) y haz redeploy.';
+      loginError.reintentar = true;
+      loginError.solucion = 'La API ya gestiona su propia sesion anonima: reintentar suele funcionar porque Vercel rota la IP de salida en cada pedido. No requiere configurar nada.';
       loginError.detalles = diagnostics;
       throw loginError;
     }
