@@ -1,5 +1,8 @@
 const { URL }=require('url');
 const { randomUUID }=require('node:crypto');
+const http=require('node:http');
+const https=require('node:https');
+const tls=require('node:tls');
 // Carga blindada: si secure-api falla al cargarse en el runtime de Vercel
 // (bundling/tracing), la funcion NO crashea en cold start; el error real se
 // expone en /status y como JSON en las rutas que lo necesitan.
@@ -16,6 +19,52 @@ const LIMIT_MIN=1;
 const LIMIT_MAX=20;
 const BROWSER_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const DL_KINDS=['audio','video','tiktok','x'];
+const IP_BLOCKED_MESSAGE='El hosting (Vercel) está bloqueado por YouTube/TikTok para descargas. La descarga debe hacerse desde una IP residencial.';
+
+function parseDlProxy(raw){
+try{
+const u=new URL(raw);
+if(u.protocol!=='http:'||!u.hostname)return null;
+const auth=(u.username||u.password)?'Basic '+Buffer.from(decodeURIComponent(u.username)+':'+decodeURIComponent(u.password)).toString('base64'):null;
+return {host:u.hostname,port:Number(u.port)||80,auth};
+}catch(e){return null;}
+}
+
+function requestMediaViaProxy(proxy,targetUrl,headers){
+return new Promise((resolve,reject)=>{
+const target=new URL(targetUrl);
+if(target.protocol!=='https:')return reject(new Error('El proxy de salida solo soporta destinos https.'));
+const connectReq=http.request({
+host:proxy.host,
+port:proxy.port,
+method:'CONNECT',
+path:target.host+':443',
+headers:{Host:target.host+':443',...(proxy.auth?{'Proxy-Authorization':proxy.auth}:{})},
+timeout:15000,
+});
+connectReq.on('connect',(proxyRes,socket)=>{
+if(proxyRes.statusCode!==200){
+socket.destroy();
+return reject(new Error('El proxy rechazo la conexion (HTTP '+proxyRes.statusCode+').'));
+}
+const tlsSocket=tls.connect({socket,servername:target.hostname});
+tlsSocket.once('secureConnect',()=>{
+const mediaReq=https.request(targetUrl,{
+method:'GET',
+headers,
+agent:false,
+createConnection:()=>tlsSocket,
+},(mediaRes)=>resolve({mediaRes,cleanup:()=>{try{mediaReq.destroy();}catch(e){}try{tlsSocket.destroy();}catch(e){}}}));
+mediaReq.on('error',(e)=>{try{tlsSocket.destroy();}catch(e2){}reject(e);});
+mediaReq.end();
+});
+tlsSocket.once('error',(e)=>{try{socket.destroy();}catch(e2){}reject(e);});
+});
+connectReq.on('timeout',()=>connectReq.destroy(new Error('El proxy tardo demasiado en responder.')));
+connectReq.on('error',(e)=>reject(e));
+connectReq.end();
+});
+}
 
 // Transmite en streaming un archivo de media (googlevideo, tiktokcdn, twimg)
 // desde la misma invocacion de la funcion, para que la IP coincida con la que
@@ -30,28 +79,74 @@ const fetchHeaders={
 if(options.referer)fetchHeaders.Referer=options.referer;
 const range=req.headers&&typeof req.headers.range==='string'&&req.headers.range.length<200?req.headers.range:'';
 if(range)fetchHeaders.Range=range;
+const ipBlocked=()=>sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:IP_BLOCKED_MESSAGE});
+const applyMediaHeaders=(status,contentType,extra={})=>{
+res.statusCode=status;
+res.setHeader('Content-Type',contentType||'application/octet-stream');
+res.setHeader('Accept-Ranges',extra.acceptRanges||'bytes');
+if(extra.contentLength)res.setHeader('Content-Length',extra.contentLength);
+if(extra.contentRange)res.setHeader('Content-Range',extra.contentRange);
+if(options.filename)res.setHeader('Content-Disposition','attachment; filename="'+String(options.filename).replace(/[^a-zA-Z0-9._-]/g,'_')+'"');
+};
+const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
+const proxy=proxyRaw?parseDlProxy(proxyRaw):null;
+if(proxyRaw&&!proxy){
+return sendJson(500,{ok:false,error:'PROXY_INVALIDO',message:'DL_PROXY_URL no es una URL de proxy valida. Formato esperado: http://usuario:pass@host:puerto'});
+}
+if(proxy){
+let resultado=null;
+let destino=mediaUrl;
+try{
+for(let salto=0;salto<4;salto+=1){
+resultado=await requestMediaViaProxy(proxy,destino,fetchHeaders);
+const st=resultado.mediaRes.statusCode;
+const loc=resultado.mediaRes.headers.location;
+if([301,302,303,307,308].includes(st)&&loc){
+resultado.cleanup();
+destino=new URL(loc,destino).href;
+continue;
+}
+break;
+}
+}catch(e){
+return sendJson(502,{ok:false,message:'No se pudo descargar a traves del proxy de salida.',error:String(e&&e.message||e).slice(0,140)});
+}
+const up=resultado.mediaRes;
+if(up.statusCode===403){
+resultado.cleanup();
+return ipBlocked();
+}
+if(up.statusCode!==200&&up.statusCode!==206){
+const status=up.statusCode;
+resultado.cleanup();
+return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+status+').'});
+}
+applyMediaHeaders(up.statusCode,up.headers['content-type'],{acceptRanges:up.headers['accept-ranges'],contentLength:up.headers['content-length'],contentRange:up.headers['content-range']});
+res.on('close',resultado.cleanup);
+up.on('data',(chunk)=>{
+if(!res.write(chunk))up.pause();
+});
+res.on('drain',()=>up.resume());
+up.on('end',()=>res.end());
+up.on('error',()=>{try{res.destroy();}catch(e){}});
+return;
+}
 let upstream;
 try{
 upstream=await fetch(mediaUrl,{headers:fetchHeaders,redirect:'follow'});
 }catch(e){
 return sendJson(502,{ok:false,message:'No se pudo conectar con el servidor de medios.',error:String(e&&e.message||e).slice(0,140)});
 }
+if(upstream.status===403){
+try{await upstream.body?.cancel();}catch(e){}
+return ipBlocked();
+}
 if(!upstream.ok&&upstream.status!==206){
 try{await upstream.body?.cancel();}catch(e){}
 return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+upstream.status+').'});
 }
-res.statusCode=upstream.status;
-res.setHeader('Content-Type',upstream.headers.get('content-type')||'application/octet-stream');
-res.setHeader('Accept-Ranges',upstream.headers.get('accept-ranges')||'bytes');
-const contentLength=upstream.headers.get('content-length');
-if(contentLength)res.setHeader('Content-Length',contentLength);
-const contentRange=upstream.headers.get('content-range');
-if(contentRange)res.setHeader('Content-Range',contentRange);
-if(options.filename)res.setHeader('Content-Disposition','attachment; filename="'+String(options.filename).replace(/[^a-zA-Z0-9._-]/g,'_')+'"');
+applyMediaHeaders(upstream.status,upstream.headers.get('content-type'),{acceptRanges:upstream.headers.get('accept-ranges'),contentLength:upstream.headers.get('content-length'),contentRange:upstream.headers.get('content-range')});
 try{
-// Bombeo manual del stream web (getReader + res.write/drain): evita
-// Readable.fromWeb y pipeline, cuya interop con streams web de fetch es
-// fragil en el runtime serverless de Vercel.
 if(upstream.body&&typeof upstream.body.getReader==='function'){
 const reader=upstream.body.getReader();
 for(;;){
@@ -271,7 +366,7 @@ return sendJson(200,{ok:true,...(await fetchXVideo(query))});
 }catch(e){return sendJson(502,{ok:false,message:'Modulo X no disponible',error:e.message});}
 }
 if(pathname==='/status'){
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/dl','/status']});
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),dl_proxy_configurada:!!(process.env.DL_PROXY_URL||process.env.dl_proxy_url),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
