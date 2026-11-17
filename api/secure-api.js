@@ -508,6 +508,7 @@ function limpiarTituloSearx(texto) {
     .replace(/&(aacute|eacute|iacute|oacute|uacute|ntilde|uuml|Ntilde|Aacute|Eacute|Iacute|Oacute|Uacute);?/g,
       (_, e) => ({ aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', ntilde: 'ñ', uuml: 'ü', Ntilde: 'Ñ', Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú' }[e]))
     .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCodePoint(Number(n)); } catch { return ' '; } })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => { try { return String.fromCodePoint(parseInt(n, 16)); } catch { return ' '; } })
     .replace(/\s+/g, ' ').trim();
   if (!limpio || /^https?:\/\//.test(limpio)) return '';
   return limpio.slice(0, 500);
