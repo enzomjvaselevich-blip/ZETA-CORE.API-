@@ -494,7 +494,6 @@ const SEARX_INSTANCIAS = [
   'https://searx.works',
 ];
 let searxOffset = 0;
-let searxMuestraHtml = null;
 
 function candidatoDesdeUrlTikTok(url) {
   const im = String(url || '').match(/tiktok\.com\/@([\w.\-]+)\/video\/(\d{10,25})/);
@@ -506,42 +505,58 @@ function limpiarTituloSearx(texto) {
     .replace(/<[^>]+>/g, ' ')
     .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ')
+    .replace(/&(aacute|eacute|iacute|oacute|uacute|ntilde|uuml|Ntilde|Aacute|Eacute|Iacute|Oacute|Uacute);?/g,
+      (_, e) => ({ aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', ntilde: 'ñ', uuml: 'ü', Ntilde: 'Ñ', Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú' }[e]))
+    .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCodePoint(Number(n)); } catch { return ' '; } })
     .replace(/\s+/g, ' ').trim();
   if (!limpio || /^https?:\/\//.test(limpio)) return '';
   return limpio.slice(0, 500);
 }
 
-// Extrae videoId, usuario y titulo de los anchors de resultados de SearXNG.
+// Extrae videoId, usuario, titulo y miniatura de los anchors de resultados de
+// SearXNG: el primer anchor es el thumbnail (img con src /image?url=...) y el
+// titulo llega en un anchor posterior del mismo articulo.
 function extraerResultadosSearxDeHtml(text) {
-  const resultados = [];
-  const vistos = new Set();
+  const resultados = new Map();
   const anchor = /<a\s[^>]*href="(https?:\/\/[^"\s]*tiktok\.com\/@[\w.\-]+\/video\/\d{10,25}[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
   let m;
   while ((m = anchor.exec(String(text || ''))) !== null) {
     const candidato = candidatoDesdeUrlTikTok(m[1]);
-    if (!candidato || vistos.has(candidato.videoId)) continue;
-    vistos.add(candidato.videoId);
-    resultados.push({ ...candidato, title: limpiarTituloSearx(m[2]) });
-  }
-  if (!resultados.length) {
-    for (const { videoId, username } of extraerVideosTikTokDeHtml(text)) {
-      if (!vistos.has(videoId)) {
-        vistos.add(videoId);
-        resultados.push({ videoId, username, title: '' });
+    if (!candidato) continue;
+    const title = limpiarTituloSearx(m[2]);
+    let thumbnail = '';
+    const img = /<img[^>]*src="([^"]+)"/.exec(m[2]);
+    if (img) {
+      const param = /[?&]url=([^&"\s]+)/.exec(img[1]);
+      if (param) {
+        try { thumbnail = decodeURIComponent(param[1]); } catch { thumbnail = param[1]; }
+        if (!thumbnail.startsWith('http')) thumbnail = '';
       }
     }
+    const previo = resultados.get(candidato.videoId);
+    if (!previo) {
+      resultados.set(candidato.videoId, { ...candidato, title, thumbnail });
+    } else {
+      if (!previo.title && title) previo.title = title;
+      if (!previo.thumbnail && thumbnail) previo.thumbnail = thumbnail;
+    }
   }
-  return resultados;
+  if (!resultados.size) {
+    for (const { videoId, username } of extraerVideosTikTokDeHtml(text)) {
+      resultados.set(videoId, { videoId, username, title: '', thumbnail: '' });
+    }
+  }
+  return [...resultados.values()];
 }
 
 async function buscarSearxTikTok(query, limit, parentSignal) {
   const q = encodeURIComponent(`${query} site:tiktok.com`);
-  const mapear = (videos) => videos.slice(0, limit).map(({ videoId, username, title }) => ({
+  const mapear = (videos) => videos.slice(0, limit).map(({ videoId, username, title, thumbnail }) => ({
     type: 'video',
     videoId,
     title: title || '',
     url: `https://www.tiktok.com/@${username}/video/${videoId}`,
-    thumbnail: '',
+    thumbnail: thumbnail || '',
     duration: 0,
     author: { username, nickname: '' },
     stats: { views: 0, likes: 0, comments: 0, shares: 0 },
@@ -589,11 +604,9 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
         if (response.status === 429 || text.includes('Just a moment')) {
           bloqueada = true;
         } else {
-          for (const { videoId, username, title } of extraerResultadosSearxDeHtml(text)) {
-            if (!videos.some((v) => v.videoId === videoId)) videos.push({ videoId, username, title });
+          for (const { videoId, username, title, thumbnail } of extraerResultadosSearxDeHtml(text)) {
+            if (!videos.some((v) => v.videoId === videoId)) videos.push({ videoId, username, title, thumbnail });
           }
-          const idx = text.indexOf('tiktok.com/@');
-          if (idx >= 0) searxMuestraHtml = text.slice(Math.max(0, idx - 400), idx + 300);
         }
       } catch (error) {
         if (parentSignal?.aborted) throw error;
@@ -667,7 +680,7 @@ async function enriquecerResultadoTikTok(candidato, parentSignal) {
     url: username
       ? `https://www.tiktok.com/@${username}/video/${candidato.videoId}`
       : `https://www.tiktok.com/video/${candidato.videoId}`,
-    thumbnail: tikwm?.cover || oembed?.thumbnail_url || '',
+    thumbnail: tikwm?.cover || oembed?.thumbnail_url || candidato.thumbnail || '',
     duration: Number(tikwm?.duration) || 0,
     author: {
       username,
@@ -747,7 +760,6 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
         : String(fuente.reason?.message || fuente.reason || 'error').slice(0, 80),
     ])),
     resultados: results.length,
-    searx_muestra: searxMuestraHtml ? searxMuestraHtml.slice(0, 700) : null,
   };
 
   if (TT_SEARCH_CACHE.size > 100) TT_SEARCH_CACHE.clear();
