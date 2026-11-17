@@ -389,10 +389,63 @@ async function fetchRealSearchResults(query, limit, platform, parentSignal) {
     }
   }
   console.log(`[ttsearch] query="${String(query).slice(0, 80)}" crudos=${crudos} resultados=${results.length}`);
-  if (!results.length && !sawKnownMarkup) {
-    // Sin markup conocido no hay resultados de esta busqueda: se devuelve
-    // vacio, nunca resultados de otra busqueda ni contenido generico.
-    return [];
+  if (!results.length) {
+    // TikTok no le muestra resultados de busqueda a los scrapers desde IPs de
+    // datacenter. Respaldo: buscador de tikwm con el MISMO query, mapeado al
+    // mismo formato. Si tambien falla, se devuelve vacio, nunca resultados de
+    // otra busqueda ni contenido generico.
+    try {
+      const respaldo = await buscarTikTokViaTikwm(query, limit, parentSignal);
+      console.log(`[ttsearch] query="${String(query).slice(0, 80)}" respaldo_tikwm=${respaldo.length}`);
+      return respaldo;
+    } catch (error) {
+      console.log(`[ttsearch] query="${String(query).slice(0, 80)}" respaldo_tikwm_fallo=${String(error && error.message || error).slice(0, 120)}`);
+      return [];
+    }
+  }
+  return results;
+}
+
+async function buscarTikTokViaTikwm(query, limit, parentSignal) {
+  const endpoint = `https://www.tikwm.com/api/feed/search?q=${encodeURIComponent(query)}&count=${Math.min(Math.max(Number(limit) || 5, 1), 20)}`;
+  const response = await fetch(endpoint, {
+    headers: { 'User-Agent': UPSTREAM_HEADERS['User-Agent'] || 'Mozilla/5.0', Accept: 'application/json' },
+    signal: parentSignal ? AbortSignal.any([parentSignal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw apiError(502, `El respaldo de busqueda de TikTok respondio HTTP ${response.status}.`);
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) throw apiError(502, 'El respaldo de busqueda de TikTok no devolvio JSON.');
+  const payload = await response.json().catch(() => null);
+  const videos = payload?.data?.videos;
+  if (!payload || payload.code !== 0 || !Array.isArray(videos)) {
+    throw apiError(502, `El respaldo de busqueda de TikTok no devolvio datos (${String(payload?.msg || 'sin mensaje').slice(0, 80)}).`);
+  }
+  const results = [];
+  for (const video of videos) {
+    const videoId = String(video.video_id || '');
+    if (!/^\d{10,25}$/.test(videoId)) continue;
+    if (results.some((existing) => existing.videoId === videoId)) continue;
+    results.push({
+      type: 'video',
+      videoId,
+      title: String(video.title || '').slice(0, 500),
+      url: video.author?.unique_id
+        ? `https://www.tiktok.com/@${video.author.unique_id}/video/${videoId}`
+        : `https://www.tiktok.com/video/${videoId}`,
+      thumbnail: video.cover || '',
+      duration: Number(video.duration) || 0,
+      author: {
+        username: video.author?.unique_id || '',
+        nickname: video.author?.nickname || '',
+      },
+      stats: {
+        views: Number(video.play_count) || 0,
+        likes: Number(video.digg_count) || 0,
+        comments: Number(video.comment_count) || 0,
+        shares: Number(video.share_count) || 0,
+      },
+    });
+    if (results.length >= limit) break;
   }
   return results;
 }
