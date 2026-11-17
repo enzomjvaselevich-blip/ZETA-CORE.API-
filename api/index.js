@@ -33,6 +33,22 @@ const dlMediaCache=new Map();
 // Memoria del cliente que paso el probe por videoId|kind (TTL 6h): la proxima
 // resolucion prueba ESE cliente primero en vez de arrancar del candidato 1.
 const dlClienteCache=new Map();
+// Relay del usuario (IP residencial de su casa): resuelve y streamea YouTube
+// desde ahi, donde googlevideo no bloquea. Salud cacheada 60s.
+const RELAY_URL=(()=>{const u=String(process.env.RELAY_URL||process.env.relay_url||'').trim().replace(/\/+$/,'');return /^https?:\/\//.test(u)?u:'';})();
+const RELAY_KEY=String(process.env.RELAY_KEY||process.env.relay_key||'');
+const relaySalud={estado:null,checkedAt:0};
+async function relayEstado(){
+if(!RELAY_URL||!RELAY_KEY)return null;
+const ahora=Date.now();
+if(relaySalud.estado&&ahora-relaySalud.checkedAt<60000)return relaySalud.estado;
+try{
+const rta=await fetch(RELAY_URL+'/ping',{headers:{'x-relay-key':RELAY_KEY},signal:AbortSignal.timeout(4000)});
+relaySalud.estado=rta.ok?'OK':'CAIDO';
+}catch(e){relaySalud.estado='CAIDO';}
+relaySalud.checkedAt=Date.now();
+return relaySalud.estado;
+}
 function proxyDeStream(options){
 if(options.sinProxy)return null;
 if(options.proxy!==undefined&&options.proxy!==null)return options.proxy;
@@ -338,6 +354,34 @@ try{res.destroy();}catch(e2){}
 }
 }
 
+// Descarga a traves del relay del usuario (su IP de casa). El relay resuelve
+// el player y streamea el archivo; aca solo se le pasa videoId/kind. Devuelve
+// {ok,status}: si ok, la respuesta ya se le mando al cliente.
+function streamDesdeRelay(req,res,videoId,kind,cookie){
+return new Promise((resolve)=>{
+const destino=new URL(RELAY_URL+'/descarga?video='+encodeURIComponent(videoId)+'&kind='+kind);
+const mod=destino.protocol==='https:'?require('node:https'):require('node:http');
+const cabeceras={'x-relay-key':RELAY_KEY,Accept:'*/*'};
+if(cookie)cabeceras['x-yt-cookie']=cookie;
+if(req.headers.range)cabeceras.Range=req.headers.range;
+const pedido=mod.request(destino,{method:'GET',headers:cabeceras},(rta)=>{
+if(rta.statusCode!==200&&rta.statusCode!==206){rta.resume();resolve({ok:false,status:rta.statusCode});return;}
+pedido.setTimeout(30000);
+const sal={'Content-Type':rta.headers['content-type']||(kind==='audio'?'audio/mp4':'video/mp4'),'Accept-Ranges':'bytes','Cache-Control':'no-store'};
+if(rta.headers['content-length'])sal['Content-Length']=rta.headers['content-length'];
+if(rta.headers['content-range'])sal['Content-Range']=rta.headers['content-range'];
+sal['Content-Disposition']='inline; filename="'+videoId+'.'+(kind==='audio'?'m4a':'mp4')+'"';
+res.writeHead(rta.statusCode,sal);
+rta.pipe(res);
+rta.on('end',()=>resolve({ok:true,status:rta.statusCode}));
+rta.on('error',()=>resolve({ok:false,status:0}));
+});
+pedido.setTimeout(8000,()=>{pedido.destroy(new Error('relay no respondio en 8s'));});
+pedido.on('error',()=>{try{if(!res.headersSent)resolve({ok:false,status:0});else resolve({ok:false,status:0});}catch(e){resolve({ok:false,status:0});}});
+pedido.end();
+});
+}
+
 async function probeMedia(mediaUrl,headers,options={}){
 const probeHeaders={...headers,Range:'bytes=0-0'};
 const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
@@ -581,6 +625,11 @@ const hayCookie=!!cookieHeader;
 const cacheKey=videoId+'|'+kind+'|'+(qualityParam==='best'?'best':qualityParam);
 const cacheado=dlMediaCache.get(cacheKey);
 if(cacheado&&cacheado.expiresAt>Date.now()){
+if(cacheado.relay){
+const rtaRelay=await streamDesdeRelay(req,res,videoId,kind,cookieHeader);
+if(rtaRelay.ok)return;
+dlMediaCache.delete(cacheKey);
+}else{
 const opcionesCache=cacheado.sinProxy?{sinProxy:true}:(cacheado.proxy?{proxy:cacheado.proxy}:{});
 const probeCacheado=await probeMedia(cacheado.url,cacheado.headers,opcionesCache);
 if(probeCacheado===200||probeCacheado===206){
@@ -588,7 +637,14 @@ return streamMedia(req,res,sendJson,requestId,cacheado.url,{referer:'https://www
 }
 dlMediaCache.delete(cacheKey);
 }
-const candidatos=[
+}
+const candidatos=[];
+// PRIMERO el relay del usuario (IP residencial): si esta vivo, resuelve y
+// streamea desde ahi, donde googlevideo no bloquea.
+const relayVivo=RELAY_URL&&RELAY_KEY&&(await relayEstado())==='OK';
+if(RELAY_URL)console.log('[dl] relay='+(relayVivo?'OK':'CAIDO/no configurado'));
+if(relayVivo)candidatos.push({relay:true});
+candidatos.push(
 {cliente:'WEB',cookie:true},
 ...(hayCookie?[{cliente:'WEB',cookie:false}]:[]),
 {cliente:'WEB_EMBEDDED',cookie:true},
@@ -598,7 +654,7 @@ const candidatos=[
 {cliente:'ANDROID',cookie:true},
 {cliente:'MWEB',cookie:true},
 {cliente:null,cookie:true},
-];
+);
 // Ultimo candidato: resolucion y descarga DIRECTAS desde la IP de salida de
 // Vercel, sin proxy. Esa IP rota por region y a veces no esta bloqueada.
 candidatos.push({cliente:'WEB',cookie:true,sinProxy:true});
@@ -630,6 +686,17 @@ console.log('[dl] health check de proxies fallo: '+String(e&&e.message||e).slice
 const dlDeadline=Date.now()+45000;
 for(const c of candidatos){
 if(Date.now()>dlDeadline)break;
+if(c.relay){
+const rtaRelay=await streamDesdeRelay(req,res,videoId,kind,cookieHeader);
+if(rtaRelay.ok){
+dlMediaCache.set(cacheKey,{relay:true,expiresAt:Date.now()+30*60*1000});
+dlClienteCache.set(claveCliente,{cliente:'RELAY',relay:true,expiresAt:Date.now()+6*60*60*1000});
+return;
+}
+console.log('[dl] relay fallo (HTTP '+rtaRelay.status+') -> sigo con los proxies');
+relaySalud.estado='CAIDO';relaySalud.checkedAt=Date.now();
+continue;
+}
 // Fail fast: con todos los proxies bloqueados, los 9 candidatos por proxy
 // usarian la misma IP bloqueada; solo tiene sentido el camino directo.
 if(todosBloqueados&&!c.sinProxy)continue;
@@ -776,11 +843,17 @@ if(pl.length){
 const ordenados=await secureApi.proxiesSaludables();
 proxySalud=ordenados.some((p)=>p.sano===true)?'OK':(ordenados.every((p)=>p.sano===false)?'BLOQUEADO':'sin verificar');
 proxiesDetalle=secureApi.estadoSaludProxies();
+// A nivel MEDIA (403 de googlevideo en descargas): si todos los proxies
+// recibieron un 403 de medios en los ultimos 5 min, el bloqueo es real aunque
+// el probe de conectividad (generate_204) pase.
+const conMedia=proxiesDetalle.filter((p)=>typeof p.media_bloqueado_hace_s==='number'&&p.media_bloqueado_hace_s<=300);
+if(conMedia.length===proxiesDetalle.length)proxySalud='BLOQUEADO (media)';
 }
 }catch(e){
 proxySalud='sin verificar';
 }
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),youtube_visitor_data_como:'Recomendada: sube el exito del cliente WEB con PO Token. Conseguila de un navegador logueado en YouTube: F12 > Console > ytcfg.get("VISITOR_DATA") y pega el valor en la variable YOUTUBE_VISITOR_DATA.',dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),dl_proxy_configurada:!!(process.env.DL_PROXY_URL||process.env.dl_proxy_url),proxy:proxySalud,proxies_detalle:proxiesDetalle,admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
+const relayTxt=RELAY_URL?(RELAY_KEY?((await relayEstado())==='OK'?'OK':'CAIDO'):'sin clave'):'no configurado';
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),youtube_visitor_data_como:'Recomendada: sube el exito del cliente WEB con PO Token. Conseguila de un navegador logueado en YouTube: F12 > Console > ytcfg.get("VISITOR_DATA") y pega el valor en la variable YOUTUBE_VISITOR_DATA.',dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),dl_proxy_configurada:!!(process.env.DL_PROXY_URL||process.env.dl_proxy_url),proxy:proxySalud,proxies_detalle:proxiesDetalle,relay:relayTxt,relay_url_configurada:!!RELAY_URL,relay_verificado_hace_s:RELAY_URL?Math.round((Date.now()-relaySalud.checkedAt)/1000):null,admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){

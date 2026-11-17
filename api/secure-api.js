@@ -1260,8 +1260,15 @@ function listaProxies() {
 const TTL_SALUD_PROXY = 60000;
 const saludProxies = new Map();
 
+// Bloqueos a nivel MEDIA (403 de googlevideo en el probe de /dl): se recuerdan
+// aparte porque el probe de conectividad (generate_204) no los detecta.
+const mediosBloqueados = new Map();
+
 function marcarProxyBloqueado(proxy) {
-  if (proxy && proxy.id) saludProxies.set(proxy.id, { sano: false, checkedAt: Date.now() });
+  if (proxy && proxy.id) {
+    saludProxies.set(proxy.id, { sano: false, checkedAt: Date.now() });
+    mediosBloqueados.set(proxy.id, Date.now());
+  }
 }
 
 function marcarProxySano(proxy) {
@@ -1320,10 +1327,12 @@ function estadoSaludProxies() {
   const ahora = Date.now();
   return proxies.map((p) => {
     const estado = saludProxies.get(p.id);
+    const mediaAt = mediosBloqueados.get(p.id);
     return {
       proxy: p.id,
       sano: estado ? estado.sano : null,
       verificado_hace_s: estado ? Math.round((ahora - estado.checkedAt) / 1000) : null,
+      media_bloqueado_hace_s: mediaAt ? Math.round((ahora - mediaAt) / 1000) : null,
     };
   });
 }
