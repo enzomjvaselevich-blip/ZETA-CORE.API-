@@ -662,7 +662,7 @@ function makeStableFetch() {
   return async (input, init = {}) => {
     let requestUrl;
     try {
-      requestUrl = new URL(input instanceof URL ? input.href : String(input));
+      requestUrl = new URL(input instanceof URL ? input.href : input instanceof Request ? input.url : String(input));
     } catch {
       throw apiError(502, 'YouTube intent\u00f3 consultar un destino no permitido.', { code: 'YOUTUBE_UPSTREAM_BLOCKED' });
     }
@@ -958,7 +958,67 @@ async function fetchTikTokVideo(initialUrl, parentSignal) {
       },
     };
   }
-  throw lastError || apiError(502, 'TikTok no devolvió metadatos de video reconocibles.');
+  try {
+    return await fetchTikTokViaTikwm(initialUrl, parentSignal);
+  } catch (respaldoError) {
+    throw lastError || respaldoError;
+  }
+}
+
+async function fetchTikTokViaTikwm(initialUrl, parentSignal) {
+  const endpoint = `https://www.tikwm.com/api/?url=${encodeURIComponent(initialUrl)}&hd=1`;
+  const response = await fetch(endpoint, {
+    headers: { 'User-Agent': UPSTREAM_HEADERS['User-Agent'] || 'Mozilla/5.0', Accept: 'application/json' },
+    signal: parentSignal ? AbortSignal.any([parentSignal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw apiError(502, `El respaldo de TikTok respondió HTTP ${response.status}.`);
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) throw apiError(502, 'El respaldo de TikTok no devolvió JSON.');
+  const payload = await response.json().catch(() => null);
+  if (!payload || payload.code !== 0 || !payload.data) {
+    throw apiError(502, `El respaldo de TikTok no devolvió datos (${String(payload?.msg || 'sin mensaje').slice(0, 80)}).`);
+  }
+  const d = payload.data;
+  const absolutizar = (u) => (typeof u === 'string' && u.startsWith('/') ? `https://www.tikwm.com${u}` : u || '');
+  const play = absolutizar(d.hdplay || d.play);
+  const download = absolutizar(d.wmplay || d.play);
+  if (!play) throw apiError(502, 'El respaldo de TikTok no expuso una URL de video.');
+  return {
+    creator: 'Jxmpier207',
+    status: true,
+    descarga_headers: { ...UPSTREAM_HEADERS },
+    data: {
+      id: String(d.id || ''),
+      url: initialUrl,
+      type: 'video',
+      title: String(d.title || '').slice(0, 2000),
+      cover: d.cover || '',
+      duration: Number(d.duration) || 0,
+      links: {
+        hd: play,
+        sd: absolutizar(d.play || d.hdplay),
+        wm: download,
+        mp3: absolutizar(d.music),
+      },
+      author: {
+        username: d.author?.unique_id || '',
+        nickname: d.author?.nickname || '',
+        avatar: d.author?.avatar || '',
+      },
+      music: {
+        title: d.music_info?.title || '',
+        author: d.music_info?.author || '',
+        cover: d.music_info?.cover || '',
+      },
+      stats: {
+        views: Number(d.play_count) || 0,
+        likes: Number(d.digg_count) || 0,
+        comments: Number(d.comment_count) || 0,
+        shares: Number(d.share_count) || 0,
+        downloads: Number(d.download_count) || 0,
+      },
+    },
+  };
 }
 
 // Tweet-video extraction lives in `api/documentos/xvideo.js`. It reuses
