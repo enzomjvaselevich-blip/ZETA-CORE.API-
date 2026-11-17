@@ -494,6 +494,7 @@ const SEARX_INSTANCIAS = [
   'https://searx.works',
 ];
 let searxOffset = 0;
+let searxMuestraHtml = null;
 
 function candidatoDesdeUrlTikTok(url) {
   const im = String(url || '').match(/tiktok\.com\/@([\w.\-]+)\/video\/(\d{10,25})/);
@@ -590,6 +591,10 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
         } else {
           for (const { videoId, username, title } of extraerResultadosSearxDeHtml(text)) {
             if (!videos.some((v) => v.videoId === videoId)) videos.push({ videoId, username, title });
+          }
+          if (!videos.length) {
+            const idx = text.indexOf('tiktok.com/@');
+            if (idx >= 0) searxMuestraHtml = text.slice(Math.max(0, idx - 400), idx + 300);
           }
         }
       } catch (error) {
@@ -744,6 +749,7 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
         : String(fuente.reason?.message || fuente.reason || 'error').slice(0, 80),
     ])),
     resultados: results.length,
+    searx_muestra: searxMuestraHtml ? searxMuestraHtml.slice(0, 700) : null,
   };
 
   if (TT_SEARCH_CACHE.size > 100) TT_SEARCH_CACHE.clear();
