@@ -569,15 +569,13 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
     author: { username, nickname: '' },
     stats: { views: 0, likes: 0, comments: 0, shares: 0 },
   }));
-  const acumulados = [];
-  for (let intento = 0; intento < 6 && acumulados.length < limit; intento += 1) {
-    const instancia = SEARX_INSTANCIAS[(intento + searxOffset) % SEARX_INSTANCIAS.length];
+  // Pide una pagina de resultados a una instancia: JSON nativo primero y HTML
+  // de la misma pagina si el JSON no vino (429 o deshabilitado).
+  const pedirPagina = async (instancia, pageno) => {
+    const extra = pageno > 1 ? `&pageno=${pageno}` : '';
     let videos = [];
-    let bloqueada = false;
-    // Intento 1: JSON nativo. Un 429 aca NO descarta la instancia: muchas la
-    // limitan solo para format=json pero sirven el HTML normalmente.
     try {
-      const response = await fetch(`${instancia}/search?q=${q}&format=json`, {
+      const response = await fetch(`${instancia}/search?q=${q}&format=json${extra}`, {
         headers: {
           'User-Agent': NAVEGADOR_UA,
           Accept: 'application/json',
@@ -592,35 +590,53 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
           for (const item of payload.results || []) {
             const candidato = candidatoDesdeUrlTikTok(item?.url);
             if (candidato && !videos.some((v) => v.videoId === candidato.videoId)) {
-              videos.push({ ...candidato, title: limpiarTituloSearx(item?.title) });
+              videos.push({ ...candidato, title: limpiarTituloSearx(item?.title), thumbnail: '' });
             }
           }
         } catch {}
       }
     } catch {}
-    // Intento 2: HTML de la misma instancia.
-    if (!videos.length) {
-      try {
-        const response = await fetch(`${instancia}/search?q=${q}`, {
-          headers: {
-            'User-Agent': NAVEGADOR_UA,
-            Accept: 'text/html,application/xhtml+xml',
-            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
-          },
-          signal: senalConLimite(parentSignal, 7000),
-        });
-        const text = await response.text().catch(() => '');
-        if (response.status === 429 || text.includes('Just a moment')) {
-          bloqueada = true;
-        } else {
-          for (const { videoId, username, title, thumbnail } of extraerResultadosSearxDeHtml(text)) {
-            if (!videos.some((v) => v.videoId === videoId)) videos.push({ videoId, username, title, thumbnail });
-          }
-        }
-      } catch (error) {
-        if (parentSignal?.aborted) throw error;
-        bloqueada = true;
+    if (videos.length) return videos;
+    try {
+      const response = await fetch(`${instancia}/search?q=${q}${extra}`, {
+        headers: {
+          'User-Agent': NAVEGADOR_UA,
+          Accept: 'text/html,application/xhtml+xml',
+          'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        },
+        signal: senalConLimite(parentSignal, 7000),
+      });
+      const text = await response.text().catch(() => '');
+      if (response.status === 429 || text.includes('Just a moment')) return 'BLOQUEADA';
+      for (const { videoId, username, title, thumbnail } of extraerResultadosSearxDeHtml(text)) {
+        if (!videos.some((v) => v.videoId === videoId)) videos.push({ videoId, username, title, thumbnail });
       }
+    } catch (error) {
+      if (parentSignal?.aborted) throw error;
+      return 'BLOQUEADA';
+    }
+    return videos;
+  };
+  const acumulados = [];
+  const inicio = Date.now();
+  for (let intento = 0; intento < 8 && acumulados.length < limit; intento += 1) {
+    if (Date.now() - inicio > 25000) break;
+    const instancia = SEARX_INSTANCIAS[(intento + searxOffset) % SEARX_INSTANCIAS.length];
+    const primera = await pedirPagina(instancia, 1);
+    if (primera === 'BLOQUEADA') {
+      searxOffset += 1;
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      continue;
+    }
+    let videos = primera;
+    // Paginacion: una instancia sana puede dar mas resultados en paginas siguientes.
+    for (const pageno of [2, 3]) {
+      if (!videos.length || acumulados.length + videos.length >= limit) break;
+      if (Date.now() - inicio > 25000) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const mas = await pedirPagina(instancia, pageno);
+      if (mas === 'BLOQUEADA' || !mas.length) break;
+      videos = videos.concat(mas.filter((m) => !videos.some((v) => v.videoId === m.videoId)));
     }
     for (const video of videos) {
       if (acumulados.some((v) => v.videoId === video.videoId)) continue;
@@ -629,7 +645,7 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
     }
     if (acumulados.length >= limit) return mapear(acumulados);
     if (!videos.length) searxOffset += 1;
-    await new Promise((resolve) => setTimeout(resolve, bloqueada ? 800 : 200));
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
   return mapear(acumulados);
 }
@@ -727,7 +743,7 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
     buscarEnMotorTikTok('bing', query, limit, parentSignal),
   ]);
 
-  const fuentes = [
+  let fuentes = [
     ['directa', directaR],
     ['tikwm', tikwmR],
     ['searx', searxR],
@@ -737,15 +753,36 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   ];
   const vistos = new Set();
   const candidatos = [];
-  for (const [, fuente] of fuentes) {
-    if (fuente.status !== 'fulfilled' || !Array.isArray(fuente.value)) continue;
-    for (const candidato of fuente.value) {
-      if (!candidato?.videoId || vistos.has(candidato.videoId)) continue;
-      vistos.add(candidato.videoId);
-      candidatos.push(candidato);
+  const juntarCandidatos = () => {
+    for (const [, fuente] of fuentes) {
+      if (fuente.status !== 'fulfilled' || !Array.isArray(fuente.value)) continue;
+      for (const candidato of fuente.value) {
+        if (!candidato?.videoId || vistos.has(candidato.videoId)) continue;
+        vistos.add(candidato.videoId);
+        candidatos.push(candidato);
+        if (candidatos.length >= limit) break;
+      }
       if (candidatos.length >= limit) break;
     }
-    if (candidatos.length >= limit) break;
+  };
+  juntarCandidatos();
+  // Las fuentes upstream son intermitentes: si la primera ronda no trajo nada,
+  // segunda pasada con las dos fuentes mas probables tras una pausa corta.
+  if (!candidatos.length) {
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    const [tikwmR2, searxR2] = await Promise.allSettled([
+      buscarTikwmSearch(query, limit, parentSignal),
+      buscarSearxTikTok(query, limit, parentSignal),
+    ]);
+    fuentes = [
+      ['directa', directaR],
+      ['tikwm', tikwmR2],
+      ['searx', searxR2],
+      ['ddg', ddgR],
+      ['ddglite', ddgLtR],
+      ['bing', bingR],
+    ];
+    juntarCandidatos();
   }
 
   const enriquecidos = await Promise.allSettled(
