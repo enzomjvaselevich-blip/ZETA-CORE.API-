@@ -1119,6 +1119,7 @@ async function selectYoutubeMediaFormat(formats, type, quality, player) {
         url: selected.url,
         quality: selected.format.quality_label || `audio-${Math.round((selected.format.bitrate || 128000) / 1000)}kbps`,
         bitrate: selected.format.bitrate || null,
+        esAudioPuro: String(selected.format.mime_type || '').startsWith('audio/'),
       };
     }
   } else {
@@ -1475,12 +1476,21 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
         return null;
       }
     };
+    // Para audio: preferir un cliente que exponga formato audio-only (itag 140)
+    // antes que aceptar el primer progresivo (itag 18); el progresivo queda de
+    // ultimo recurso si NINGUN cliente da audio puro.
+    const preferirAudioPuro = type === 'audio';
+    let audioFallback = null;
+    const aceptarMedia = (media) => {
+      if (!media) return null;
+      if (!preferirAudioPuro || media.esAudioPuro) return media;
+      if (!audioFallback) audioFallback = media;
+      return null;
+    };
     const attemptInParallel = async (clientList, poToken) => {
       const results = await Promise.allSettled(clientList.map((client) => attemptClient(client, poToken)));
-      for (const result of results) {
-        if (result.status === 'fulfilled' && result.value) return result.value;
-      }
-      return null;
+      const ok = results.filter((r) => r.status === 'fulfilled' && r.value).map((r) => r.value);
+      return ok.find((m) => m.esAudioPuro) || ok[0] || null;
     };
     if (typeof options.client === 'string' && options.client) {
       const media = await attemptClient(options.client);
@@ -1489,14 +1499,16 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     }
     for (let round = 0; round < 3; round += 1) {
       if (Date.now() > deadline - 3000) break;
-      const media = await attemptInParallel(clients.slice(0, 5), undefined);
+      const media = aceptarMedia(await attemptInParallel(clients.slice(0, 5), undefined));
       if (media) return media;
+      if (audioFallback) break;
     }
     for (const client of clients.slice(5)) {
       if (Date.now() > deadline - 2500) break;
-      const media = await attemptClient(client);
+      const media = aceptarMedia(await attemptClient(client));
       if (media) return media;
     }
+    if (audioFallback) return audioFallback;
     if (loginRequiredCount > 0 && Date.now() < deadline - 9000) {
       try {
         const minterData = await acquireYoutubePoMinter(youtube);
@@ -1505,13 +1517,13 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
           const videoToken = await minterData.minter.mintAsWebsafeString(videoId);
           for (const client of ['IOS', 'ANDROID_VR', 'WEB', 'MWEB']) {
             if (Date.now() > deadline - 2500) break;
-            const media = await attemptClient(client, videoToken);
+            const media = aceptarMedia(await attemptClient(client, videoToken));
             if (media) return media;
           }
           const visitorToken = await minterData.minter.mintAsWebsafeString(minterData.visitorData);
           for (const client of ['WEB', 'MWEB']) {
             if (Date.now() > deadline - 2500) break;
-            const media = await attemptClient(client, visitorToken);
+            const media = aceptarMedia(await attemptClient(client, visitorToken));
             if (media) return media;
           }
         } else {

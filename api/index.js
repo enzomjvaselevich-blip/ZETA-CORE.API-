@@ -19,6 +19,9 @@ const LIMIT_MIN=1;
 const LIMIT_MAX=20;
 const BROWSER_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const DL_KINDS=['audio','video','tiktok','x'];
+// Cache de la resolucion del player de YouTube para /dl: los enlaces de
+// googlevideo duran ~6h; guardarlos 30 min evita re-resolver en cada pedido.
+const dlMediaCache=new Map();
 const IP_BLOCKED_MESSAGE='El hosting (Vercel) está bloqueado por YouTube/TikTok para descargas. La descarga debe hacerse desde una IP residencial.';
 
 function parseDlProxy(raw){
@@ -95,11 +98,11 @@ if(proxyRaw&&!proxy){
 return sendJson(500,{ok:false,error:'PROXY_INVALIDO',message:'DL_PROXY_URL no es una URL de proxy valida. Formato esperado: http://usuario:pass@host:puerto'});
 }
 if(proxy){
-let resultado=null;
 let destino=mediaUrl;
+let resultado=null;
 try{
 for(let salto=0;salto<4;salto+=1){
-resultado=await requestMediaViaProxy(proxy,destino,fetchHeaders);
+resultado=await requestMediaViaProxy(proxy,destino,{...fetchHeaders,Range:range||'bytes=0-0'});
 const st=resultado.mediaRes.statusCode;
 const loc=resultado.mediaRes.headers.location;
 if([301,302,303,307,308].includes(st)&&loc){
@@ -112,7 +115,94 @@ break;
 }catch(e){
 return sendJson(502,{ok:false,message:'No se pudo descargar a traves del proxy de salida.',error:String(e&&e.message||e).slice(0,140)});
 }
-const up=resultado.mediaRes;
+const up0=resultado.mediaRes;
+if(up0.statusCode===403){
+resultado.cleanup();
+return ipBlocked();
+}
+if(up0.statusCode!==200&&up0.statusCode!==206){
+const status=up0.statusCode;
+resultado.cleanup();
+return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+status+').'});
+}
+const totalCrudo=String(up0.headers['content-range']||'').match(/\/(\d+)\s*$/);
+const total=totalCrudo?Number(totalCrudo[1]):0;
+const porRangos=!range&&up0.statusCode===206&&total>1024*1024;
+try{resultado.cleanup();}catch(e){}
+if(porRangos){
+// Descarga por rangos en paralelo: 6-8 tramos pedidos a la vez por el proxy
+// (cada uno con su tunel CONNECT) y entregados al cliente EN ORDEN. Multiplica
+// el throughput del proxy sin cambiar el contrato: el cliente recibe un 200
+// con el archivo completo.
+const partes=total>8*1024*1024?8:6;
+const tam=Math.ceil(total/partes);
+const tramos=[];
+for(let i=0;i<partes;i+=1){
+const desde=i*tam;
+if(desde>total-1)break;
+tramos.push({desde,hasta:Math.min(total-1,desde+tam-1)});
+}
+const limpiezas=tramos.map(()=>null);
+const pedidos=tramos.map(({desde,hasta},i)=>new Promise((resolverParte)=>{
+let cerrado=false;
+const fin=(valor)=>{if(!cerrado){cerrado=true;clearTimeout(temporizador);resolverParte(valor);}};
+const temporizador=setTimeout(()=>fin(null),40000);
+let destinoParte=destino;
+(async()=>{
+try{
+for(let salto=0;salto<4;salto+=1){
+const parte=await requestMediaViaProxy(proxy,destinoParte,{...fetchHeaders,Range:'bytes='+desde+'-'+hasta});
+limpiezas[i]=parte.cleanup;
+const st=parte.mediaRes.statusCode;
+const loc=parte.mediaRes.headers.location;
+if([301,302,303,307,308].includes(st)&&loc&&salto<3){
+parte.cleanup();
+limpiezas[i]=null;
+destinoParte=new URL(loc,destinoParte).href;
+continue;
+}
+fin(parte);
+return;
+}
+fin(null);
+}catch(e){fin(null);}
+})();
+}));
+const parte0=await pedidos[0];
+if(!parte0||![200,206].includes(parte0.mediaRes.statusCode)){
+for(const limpieza of limpiezas)try{limpieza&&limpieza();}catch(e){}
+return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga por rangos.'});
+}
+applyMediaHeaders(200,parte0.mediaRes.headers['content-type'],{acceptRanges:'bytes',contentLength:total});
+res.on('close',()=>{for(const limpieza of limpiezas)try{limpieza&&limpieza();}catch(e){}});
+for(let i=0;i<pedidos.length;i+=1){
+const parte=i===0?parte0:await pedidos[i];
+if(!parte||![200,206].includes(parte.mediaRes.statusCode)){
+try{res.destroy();}catch(e){}
+return;
+}
+const up=parte.mediaRes;
+await new Promise((terminar,romper)=>{
+up.on('data',(chunk)=>{
+if(!res.write(chunk))up.pause();
+});
+res.on('drain',()=>up.resume());
+up.on('end',terminar);
+up.on('error',romper);
+res.on('close',terminar);
+});
+try{parte.cleanup();}catch(e){}
+limpiezas[i]=null;
+}
+res.end();
+return;
+}
+let up=up0;
+if(range||up0.statusCode===200){
+try{
+resultado.cleanup();
+resultado=await requestMediaViaProxy(proxy,destino,fetchHeaders);
+up=resultado.mediaRes;
 if(up.statusCode===403){
 resultado.cleanup();
 return ipBlocked();
@@ -121,6 +211,10 @@ if(up.statusCode!==200&&up.statusCode!==206){
 const status=up.statusCode;
 resultado.cleanup();
 return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+status+').'});
+}
+}catch(e){
+return sendJson(502,{ok:false,message:'No se pudo descargar a traves del proxy de salida.',error:String(e&&e.message||e).slice(0,140)});
+}
 }
 applyMediaHeaders(up.statusCode,up.headers['content-type'],{acceptRanges:up.headers['accept-ranges'],contentLength:up.headers['content-length'],contentRange:up.headers['content-range']});
 res.on('close',resultado.cleanup);
@@ -167,7 +261,7 @@ try{res.destroy();}catch(e2){}
 }
 
 async function probeMedia(mediaUrl,headers){
-const probeHeaders={...headers,Range:'bytes=0-1000'};
+const probeHeaders={...headers,Range:'bytes=0-0'};
 const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
 const proxy=proxyRaw?parseDlProxy(proxyRaw):null;
 if(proxy){
@@ -325,6 +419,15 @@ videoId=String(primerVideo.id);
 }
 const cookieHeader=secureApi.normalizeYoutubeCookie(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie||'');
 const hayCookie=!!cookieHeader;
+const cacheKey=videoId+'|'+kind+'|'+(qualityParam==='best'?'best':qualityParam);
+const cacheado=dlMediaCache.get(cacheKey);
+if(cacheado&&cacheado.expiresAt>Date.now()){
+const probeCacheado=await probeMedia(cacheado.url,cacheado.headers);
+if(probeCacheado===200||probeCacheado===206){
+return streamMedia(req,res,sendJson,requestId,cacheado.url,{referer:'https://www.youtube.com/',headers:cacheado.headers,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
+}
+dlMediaCache.delete(cacheKey);
+}
 const candidatos=[
 {cliente:'WEB',cookie:true},
 ...(hayCookie?[{cliente:'WEB',cookie:false}]:[]),
@@ -349,6 +452,8 @@ if(!media||!media.url)continue;
 const dlHeaders=c.cookie&&hayCookie?{Cookie:cookieHeader}:{};
 const probeStatus=await probeMedia(media.url,dlHeaders);
 if(probeStatus!==200&&probeStatus!==206)continue;
+dlMediaCache.set(cacheKey,{url:media.url,headers:dlHeaders,expiresAt:Date.now()+30*60*1000});
+if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
 return streamMedia(req,res,sendJson,requestId,media.url,{referer:'https://www.youtube.com/',headers:dlHeaders,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
 }
 return sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:'Ningun cliente pudo descargar desde este hosting.'});
