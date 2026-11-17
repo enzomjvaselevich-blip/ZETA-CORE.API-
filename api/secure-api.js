@@ -644,6 +644,12 @@ async function acquireYoutubePoMinter(youtube) {
 }
 
 async function fetchYoutubeMedia(videoId, type, quality, parentSignal) {
+  const videoIdLimpio = String(videoId || '').trim();
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoIdLimpio)) {
+    throw apiError(400, `No se pudo resolver un videoId valido a partir de la consulta (se obtuvo: "${videoIdLimpio.slice(0, 60) || 'vacio'}").`, {
+      code: 'YOUTUBE_VIDEO_ID_INVALID',
+    });
+  }
   if (parentSignal?.aborted) throw apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
 
   const controller = new AbortController();

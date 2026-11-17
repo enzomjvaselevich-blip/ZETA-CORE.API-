@@ -60,17 +60,22 @@ const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|e
 if(match){
 videoId=match[1];
 }else if(!/^[a-zA-Z0-9_-]{11}$/.test(query)){
+let primerVideo=null;
+for(let intento=0;intento<2&&!primerVideo;intento+=1){
+if(intento>0)await new Promise(r=>setTimeout(r,800));
 const search=await yt.search(query,{type:'video'});
-const firstVideo=search.videos?.[0];
-if(!firstVideo)return sendJson(404,{ok:false,message:'No se encontraron resultados para la busqueda: '+query});
-videoId=firstVideo.id;
-const vistasTexto=String(firstVideo.view_count?.text||firstVideo.view_count||'').replace(/[^0-9]/g,'');
-const partesDur=String(firstVideo.duration?.text||'').split(':').map(Number).filter(n=>!Number.isNaN(n));
-searchMeta={titulo:firstVideo.title?.text||firstVideo.title||'',canal:firstVideo.author?.name||'',visitas:Number(vistasTexto)||0,duracion:partesDur.length>=2?partesDur.reduce((a,b)=>a*60+b,0):0};
+const videos=Array.isArray(search.videos)?search.videos:[];
+primerVideo=videos.find(v=>v&&/^[a-zA-Z0-9_-]{11}$/.test(String(v.id||'')))||null;
+}
+if(!primerVideo)return sendJson(404,{ok:false,message:'No se encontraron resultados para la busqueda: '+query});
+videoId=String(primerVideo.id);
+const vistasTexto=String(primerVideo.view_count?.text||primerVideo.view_count||'').replace(/[^0-9]/g,'');
+const partesDur=String(primerVideo.duration?.text||'').split(':').map(Number).filter(n=>!Number.isNaN(n));
+searchMeta={titulo:primerVideo.title?.text||primerVideo.title||'',canal:primerVideo.author?.name||'',visitas:Number(vistasTexto)||0,duracion:partesDur.length>=2?partesDur.reduce((a,b)=>a*60+b,0):0};
 }
 if(pathname==='/ytsearch'){
 const search=await yt.search(query,{type:'video'});
-const results=(search.videos||[]).slice(0,limit).map(v=>({
+const results=(search.videos||[]).filter(v=>v&&/^[a-zA-Z0-9_-]{11}$/.test(String(v.id||''))).slice(0,limit).map(v=>({
 videoId:v.id,
 title:v.title?.text||v.title,
 canal:v.author?.name||'Desconocido',
