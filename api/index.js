@@ -69,6 +69,19 @@ connectReq.end();
 });
 }
 
+// Pedido HTTPS directo con node:https y agent:false: conexion nueva por
+// pedido, sin el pool keep-alive de undici. Los CDN de Meta (lookaside de
+// Facebook) contestan con su HTML de redirect cuando el pedido reutiliza una
+// conexion donde la respuesta anterior se aborto.
+function pedirHttps(targetUrl,headers,timeoutMs=10000){
+return new Promise((resolve,reject)=>{
+const pedido=https.request(targetUrl,{method:'GET',headers,agent:false},(respuesta)=>resolve(respuesta));
+pedido.on('error',reject);
+pedido.setTimeout(timeoutMs,()=>pedido.destroy(new Error('timeout de pedido')));
+pedido.end();
+});
+}
+
 // Transmite en streaming un archivo de media (googlevideo, tiktokcdn, twimg)
 // desde la misma invocacion de la funcion, para que la IP coincida con la que
 // genero la URL firmada. Pasa el header Range del cliente y copia los headers
@@ -226,18 +239,55 @@ up.on('end',()=>res.end());
 up.on('error',()=>{try{res.destroy();}catch(e){}});
 return;
 }
+if(options.exigirVideo){
+// Stream por node:https con agent:false: misma conexion fresca que el probe;
+// por undici (pool reutilizado) el lookaside de Facebook contesta HTML.
+let destinoStream=mediaUrl;
+let respuesta=null;
+try{
+for(let salto=0;salto<4;salto+=1){
+respuesta=await pedirHttps(destinoStream,fetchHeaders);
+const st=respuesta.statusCode;
+const loc=respuesta.headers.location;
+if([301,302,303,307,308].includes(st)&&loc){
+respuesta.resume();
+destinoStream=new URL(loc,destinoStream).href;
+continue;
+}
+break;
+}
+}catch(e){
+return sendJson(502,{ok:false,message:'No se pudo conectar con el servidor de medios.',error:String(e&&e.message||e).slice(0,140)});
+}
+const tipoStream=String(respuesta.headers['content-type']||'');
+if(!tipoStream.includes('video')&&!tipoStream.includes('octet-stream')){
+respuesta.resume();
+return sendJson(404,{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'El servidor de medios respondio HTML en vez de video (ventana temporal de la plataforma). Reintenta en unos segundos.'});
+}
+if(respuesta.statusCode===403){
+respuesta.resume();
+return ipBlocked();
+}
+if(respuesta.statusCode!==200&&respuesta.statusCode!==206){
+const status=respuesta.statusCode;
+respuesta.resume();
+return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+status+').'});
+}
+applyMediaHeaders(respuesta.statusCode,tipoStream,{acceptRanges:respuesta.headers['accept-ranges'],contentLength:respuesta.headers['content-length'],contentRange:respuesta.headers['content-range']});
+res.on('close',()=>{try{respuesta.destroy();}catch(e){}});
+respuesta.on('data',(chunk)=>{
+if(!res.write(chunk))respuesta.pause();
+});
+res.on('drain',()=>respuesta.resume());
+respuesta.on('end',()=>res.end());
+respuesta.on('error',()=>{try{res.destroy();}catch(e){}});
+return;
+}
 let upstream;
 try{
 upstream=await fetch(mediaUrl,{headers:fetchHeaders,redirect:'follow'});
 }catch(e){
 return sendJson(502,{ok:false,message:'No se pudo conectar con el servidor de medios.',error:String(e&&e.message||e).slice(0,140)});
-}
-if(options.exigirVideo){
-const tipo=String(upstream.headers.get('content-type')||'');
-if(!tipo.includes('video')&&!tipo.includes('octet-stream')){
-try{await upstream.body?.cancel();}catch(e){}
-return sendJson(404,{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'El servidor de medios respondio HTML en vez de video (ventana temporal de la plataforma). Reintenta en unos segundos.'});
-}
 }
 if(upstream.status===403){
 try{await upstream.body?.cancel();}catch(e){}
@@ -302,13 +352,22 @@ return r.status;
 // a veces responden HTML (muro de login / lookaside) con status 200; transmitir
 // eso al cliente seria entregar basura. OJO: el lookaside de Facebook responde
 // HTML con Range bytes=0-0 pero video/mp4 con bytes=0-99, por eso 0-99.
-// Devuelve {ok,status,tipo}.
+// Usa node:https con agent:false (conexion nueva por pedido, sin el pool de
+// undici): reutilizar la conexion del probe anterior hace que el lookaside
+// conteste con su HTML de redirect. Devuelve {ok,status,tipo}.
 async function probeMediaTipo(mediaUrl,headers){
+const destino=new URL(mediaUrl);
+if(destino.protocol!=='https:')return {ok:false,status:0,tipo:''};
 try{
-const r=await fetch(mediaUrl,{...headers,Range:'bytes=0-99',redirect:'follow',signal:AbortSignal.timeout(10000)});
-const tipo=String(r.headers.get('content-type')||'');
-try{await r.body?.cancel();}catch(e){}
-return {ok:(r.status===200||r.status===206)&&(tipo.includes('video')||tipo.includes('octet-stream')),status:r.status,tipo};
+let respuesta=await pedirHttps(destino.href,{...headers,Range:'bytes=0-99'});
+for(let salto=0;salto<4&&[301,302,303,307,308].includes(respuesta.statusCode)&&respuesta.headers.location;salto+=1){
+respuesta.resume();
+respuesta=await pedirHttps(new URL(respuesta.headers.location,destino).href,{...headers,Range:'bytes=0-99'});
+}
+const tipo=String(respuesta.headers['content-type']||'');
+const ok=(respuesta.statusCode===200||respuesta.statusCode===206)&&(tipo.includes('video')||tipo.includes('octet-stream'));
+respuesta.resume();
+return {ok,status:respuesta.statusCode,tipo};
 }catch(e){return {ok:false,status:0,tipo:''};}
 }
 
