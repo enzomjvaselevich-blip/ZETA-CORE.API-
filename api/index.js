@@ -371,7 +371,7 @@ const dlHeadersBase=hayCookie?{Cookie:cookieHeader}:{};
 // exito (capa 1 + capa 2 en paralelo). Si a los 10s nada paso el probe, se
 // responde 502 IP_BLOQUEADA con reintentar:true en ese momento: el bot
 // reintenta y Vercel rota la IP de salida.
-const dlDeadline=Date.now()+10000;
+const dlDeadline=Date.now()+9500;
 const tInicioDl=Date.now();
 const intentos=[];
 const tipoMedia=kind==='audio'?'audio':'video';
@@ -470,7 +470,7 @@ const intentoCapa2=secureApi.resolverViaInstanciasPublicas(videoId,tipoMedia,900
 // Prioridad capa 1: hasta 8s. Si no llega, se usa capa 2 si ya esta lista.
 let r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),8000))]);
 if(!(r1&&r1.ok)){
-const restante2=Math.max(0,9500-(Date.now()-t0Pasada));
+const restante2=Math.max(0,8800-(Date.now()-t0Pasada));
 const r2=await Promise.race([intentoCapa2,new Promise((r)=>setTimeout(()=>r(null),restante2))]);
 if(r2&&r2.url){
 dlMediaCache.set(videoId+'|'+kind+'|'+calidad,{url:r2.url,headers:{},fuente:'capa2:'+r2.fuente+':'+r2.instancia,ext:r2.ext,expiresAt:Date.now()+30*60*1000});
@@ -478,7 +478,7 @@ if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
 console.log('[dl] salida por CAPA 2 ('+r2.fuente+':'+r2.instancia+' calidad='+r2.calidad+') a los '+(Date.now()-t0Pasada)+'ms');
 return {ok:true,url:r2.url,headers:{},detalle:'capa2 '+r2.fuente+':'+r2.instancia,ext:r2.ext};
 }
-const restante1=Math.max(0,10000-(Date.now()-t0Pasada));
+const restante1=Math.max(0,9000-(Date.now()-t0Pasada));
 r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),restante1))]);
 }
 if(r1&&r1.ok){
