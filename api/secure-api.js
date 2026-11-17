@@ -380,7 +380,7 @@ async function buscarTikTokDirecta(query, limit, parentSignal) {
     for (const pageUrl of pages) {
       let text;
       try {
-        ({ text } = await fetchTextSafe(pageUrl, { allowedHosts: TT_SEARCH_HOSTS, parentSignal, timeoutMs: 6000 }));
+        ({ text } = await fetchTextSafe(pageUrl, { allowedHosts: TT_SEARCH_HOSTS, parentSignal, timeoutMs: 4500 }));
       } catch (error) {
         if (parentSignal?.aborted) throw error;
         continue;
@@ -562,7 +562,7 @@ function extraerResultadosSearxDeHtml(text) {
   return [...resultados.values()];
 }
 
-async function buscarSearxTikTok(query, limit, parentSignal) {
+async function buscarSearxTikTok(query, limit, parentSignal, presupuestoMs) {
   const variantes = [
     encodeURIComponent(`${query} site:tiktok.com`),
     encodeURIComponent(`${query} tiktok`),
@@ -589,7 +589,7 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
           Accept: 'application/json',
           'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
         },
-        signal: senalConLimite(parentSignal, 7000),
+        signal: senalConLimite(parentSignal, 4000),
       });
       const text = await response.text().catch(() => '');
       if (response.ok && text.trim().startsWith('{')) {
@@ -615,7 +615,7 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
           Accept: 'text/html,application/xhtml+xml',
           'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
         },
-        signal: senalConLimite(parentSignal, 7000),
+        signal: senalConLimite(parentSignal, 4000),
       });
       const text = await response.text().catch(() => '');
       if (response.status === 429 || text.includes('Just a moment')) {
@@ -635,7 +635,7 @@ async function buscarSearxTikTok(query, limit, parentSignal) {
   };
   const acumulados = [];
   const inicio = Date.now();
-  const presupuesto = 25000;
+  const presupuesto = Math.max(3000, Math.min(11000, Number(presupuestoMs) || 11000));
   const vencido = () => Date.now() - inicio > presupuesto;
   let qActiva = variantes[0];
   for (let intento = 0; intento < 5 && acumulados.length < limit; intento += 1) {
@@ -693,7 +693,7 @@ async function buscarEnMotorTikTok(motor, query, limit, parentSignal) {
   const { text } = await fetchTextSafe(pageUrl, {
     allowedHosts: ['duckduckgo.com', 'html.duckduckgo.com', 'lite.duckduckgo.com', 'www.bing.com', 'bing.com'],
     parentSignal,
-    timeoutMs: 7000,
+    timeoutMs: 4000,
     headers: { 'user-agent': NAVEGADOR_UA, 'accept-language': 'es-ES,es;q=0.9,en;q=0.8' },
   });
   return extraerVideosTikTokDeHtml(text).slice(0, limit).map(({ videoId, username }) => ({
@@ -715,7 +715,7 @@ async function enriquecerResultadoTikTok(candidato, parentSignal) {
   const [oembedR, tikwmR] = await Promise.allSettled([
     fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`, {
       headers: { 'User-Agent': NAVEGADOR_UA, Accept: 'application/json' },
-      signal: senalConLimite(parentSignal, 8000),
+      signal: senalConLimite(parentSignal, 4000),
     }).then((r) => (r.ok ? r.json().catch(() => null) : null)),
     fetch(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`, {
       headers: {
@@ -724,7 +724,7 @@ async function enriquecerResultadoTikTok(candidato, parentSignal) {
         'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
         Referer: 'https://www.tiktok.com/',
       },
-      signal: senalConLimite(parentSignal, 8000),
+      signal: senalConLimite(parentSignal, 4000),
     }).then((r) => (r.ok ? r.json().catch(() => null) : null)),
   ]);
   const oembed = oembedR.status === 'fulfilled' ? oembedR.value : null;
@@ -828,78 +828,88 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   const cached = TT_SEARCH_CACHE.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.results;
 
-  const [zenithR, directaR, tikwmR, searxR, ddgR, ddgLtR, bingR] = await Promise.allSettled([
-    buscarZenithTikTok(query, limit, parentSignal),
-    buscarTikTokDirecta(query, limit, parentSignal),
-    buscarTikwmSearch(query, limit, parentSignal),
-    buscarSearxTikTok(query, limit, parentSignal),
-    buscarEnMotorTikTok('ddg', query, limit, parentSignal),
-    buscarEnMotorTikTok('ddglite', query, limit, parentSignal),
-    buscarEnMotorTikTok('bing', query, limit, parentSignal),
-  ]);
+  const t0 = Date.now();
+  const tiempos = {};
+  const medir = async (nombre, promesa) => {
+    const inicio = Date.now();
+    try {
+      const value = await promesa;
+      tiempos[nombre] = Date.now() - inicio;
+      return { status: 'fulfilled', value };
+    } catch (reason) {
+      tiempos[nombre] = Date.now() - inicio;
+      return { status: 'rejected', reason };
+    }
+  };
 
-  let fuentes = [
-    ['zenith', zenithR],
-    ['directa', directaR],
-    ['tikwm', tikwmR],
-    ['searx', searxR],
-    ['ddg', ddgR],
-    ['ddglite', ddgLtR],
-    ['bing', bingR],
-  ];
   const vistos = new Set();
   const candidatos = [];
-  const juntarCandidatos = () => {
-    for (const [, fuente] of fuentes) {
-      if (fuente.status !== 'fulfilled' || !Array.isArray(fuente.value)) continue;
-      for (const candidato of fuente.value) {
-        if (!candidato?.videoId || vistos.has(candidato.videoId)) continue;
-        vistos.add(candidato.videoId);
-        candidatos.push(candidato);
-        if (candidatos.length >= limit) break;
-      }
+  const juntar = (valor) => {
+    if (!Array.isArray(valor)) return;
+    for (const candidato of valor) {
+      if (!candidato?.videoId || vistos.has(candidato.videoId)) continue;
+      vistos.add(candidato.videoId);
+      candidatos.push(candidato);
       if (candidatos.length >= limit) break;
     }
   };
-  juntarCandidatos();
-  // Las fuentes upstream son intermitentes: si la primera ronda no trajo nada,
-  // segunda pasada con las dos fuentes mas probables tras una pausa corta.
+
+  let fuentes = [];
+  // Fuente primaria delegada: si ZENITH_SEARCH_URL esta configurada es
+  // bloqueante y prioritaria; si trae resultados no se lanzan las demas.
+  const zenithConfigurada = Boolean(String(process.env.ZENITH_SEARCH_URL || '').trim());
+  if (zenithConfigurada) {
+    const zenithR = await medir('zenith', buscarZenithTikTok(query, limit, parentSignal));
+    fuentes.push(['zenith', zenithR]);
+    juntar(zenithR.value);
+  }
   if (!candidatos.length) {
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-    const [zenithR2, tikwmR2, searxR2] = await Promise.allSettled([
-      buscarZenithTikTok(query, limit, parentSignal),
-      buscarTikwmSearch(query, limit, parentSignal),
-      buscarSearxTikTok(query, limit, parentSignal),
+    const [directaR, tikwmR, searxR, ddgR, ddgLtR, bingR] = await Promise.all([
+      medir('directa', buscarTikTokDirecta(query, limit, parentSignal)),
+      medir('tikwm', buscarTikwmSearch(query, limit, parentSignal)),
+      medir('searx', buscarSearxTikTok(query, limit, parentSignal)),
+      medir('ddg', buscarEnMotorTikTok('ddg', query, limit, parentSignal)),
+      medir('ddglite', buscarEnMotorTikTok('ddglite', query, limit, parentSignal)),
+      medir('bing', buscarEnMotorTikTok('bing', query, limit, parentSignal)),
     ]);
-    fuentes = [
-      ['zenith', zenithR2],
-      ['directa', directaR],
-      ['tikwm', tikwmR2],
-      ['searx', searxR2],
-      ['ddg', ddgR],
-      ['ddglite', ddgLtR],
-      ['bing', bingR],
-    ];
-    juntarCandidatos();
+    fuentes.push(['directa', directaR], ['tikwm', tikwmR], ['searx', searxR], ['ddg', ddgR], ['ddglite', ddgLtR], ['bing', bingR]);
+    for (const [, fuente] of fuentes) juntar(fuente.value);
+    // Segunda pasada solo si queda presupuesto: las fuentes upstream son
+    // intermitentes y un reintento corto suele recuperar resultados.
+    if (!candidatos.length && Date.now() - t0 < 7000) {
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      const restante = Math.max(3000, 11000 - (Date.now() - t0));
+      const [tikwmR2, searxR2] = await Promise.all([
+        medir('tikwm2', buscarTikwmSearch(query, limit, parentSignal)),
+        medir('searx2', buscarSearxTikTok(query, limit, parentSignal, restante)),
+      ]);
+      fuentes.push(['tikwm2', tikwmR2], ['searx2', searxR2]);
+      juntar(tikwmR2.value);
+      juntar(searxR2.value);
+    }
   }
 
-  const enriquecidos = await Promise.allSettled(
-    candidatos.map(async (candidato, i) => {
-      // Escalonado suave para no chocar con el rate limit de tikwm.
-      await new Promise((resolve) => setTimeout(resolve, i * 350));
+  // Enriquecido solo para los que no traen titulo (los que ya lo tienen
+  // responden rapido); timeout 4s por video, escalonado para no chocar
+  // con el rate limit de tikwm.
+  const pendientes = candidatos.filter((c) => !c.title);
+  const enriquecidos = pendientes.length
+    ? await Promise.allSettled(pendientes.map(async (candidato, i) => {
+      if (i) await new Promise((resolve) => setTimeout(resolve, i * 300));
       return enriquecerResultadoTikTok(candidato, parentSignal);
-    })
-  );
-  const results = candidatos.map((candidato, i) => {
-    const enriquecido = enriquecidos[i];
+    }))
+    : [];
+  const enriquecidoDe = new Map(pendientes.map((c, i) => [c.videoId, enriquecidos[i]]));
+  const results = candidatos.map((candidato) => {
+    const enriquecido = enriquecidoDe.get(candidato.videoId);
     if (enriquecido?.status === 'fulfilled' && enriquecido.value) return enriquecido.value;
     return { ...candidato, title: candidato.title || 'video de TikTok' };
   });
 
   const conteo = fuentes
-    .map(([nombre, fuente]) => `${nombre}=${fuente.status === 'fulfilled' && Array.isArray(fuente.value) ? fuente.value.length : 'X'}`)
+    .map(([nombre, fuente]) => `${nombre}=${fuente.status === 'fulfilled' && Array.isArray(fuente.value) ? fuente.value.length : 'X'}(${tiempos[nombre] || 0}ms)`)
     .join(' ');
-  console.log(`[ttsearch] query="${qNorm.slice(0, 80)}" fuentes: ${conteo} -> resultados=${results.length}`);
+  console.log(`[ttsearch] query="${qNorm.slice(0, 80)}" fuentes: ${conteo} -> resultados=${results.length} total=${Date.now() - t0}ms`);
   diagnosticoTikTok = {
     query: qNorm.slice(0, 80),
     fuentes: Object.fromEntries(fuentes.map(([nombre, fuente]) => [
@@ -908,6 +918,8 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
         ? (Array.isArray(fuente.value) ? fuente.value.length : 0)
         : String(fuente.reason?.message || fuente.reason || 'error').slice(0, 80),
     ])),
+    tiempos_fuente: { ...tiempos },
+    tiempo_total_ms: Date.now() - t0,
     resultados: results.length,
   };
 
