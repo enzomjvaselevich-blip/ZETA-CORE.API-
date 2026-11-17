@@ -362,24 +362,28 @@ async function fetchRealSearchResults(query, limit, platform, parentSignal) {
 
   const results = [];
   let sawKnownMarkup = false;
-  for (const pageUrl of pages) {
-    let text;
-    try {
-      ({ text } = await fetchTextSafe(pageUrl, { allowedHosts, parentSignal, timeoutMs: 4500 }));
-    } catch (error) {
-      if (error.statusCode === 504) throw error;
-      continue;
+  // Dos rondas: si la primera no alcanza el limite pedido, se reintenta
+  // combinando discover + search sin duplicar videoId.
+  for (let round = 0; round < 2 && results.length < limit; round += 1) {
+    if (round > 0) await new Promise((resolve) => setTimeout(resolve, 600));
+    for (const pageUrl of pages) {
+      let text;
+      try {
+        ({ text } = await fetchTextSafe(pageUrl, { allowedHosts, parentSignal, timeoutMs: 4500 }));
+      } catch (error) {
+        if (error.statusCode === 504) throw error;
+        continue;
+      }
+      if (text.includes('__UNIVERSAL_DATA_FOR_REHYDRATION__') || text.includes('SIGI_STATE')) {
+        sawKnownMarkup = true;
+      }
+      for (const item of parseTikTokEmbeddedItems(text)) {
+        const result = mapTikTokItemToResult(item);
+        if (!result || results.some((existing) => existing.videoId === result.videoId)) continue;
+        results.push(result);
+        if (results.length >= limit) return results;
+      }
     }
-    if (text.includes('__UNIVERSAL_DATA_FOR_REHYDRATION__') || text.includes('SIGI_STATE')) {
-      sawKnownMarkup = true;
-    }
-    for (const item of parseTikTokEmbeddedItems(text)) {
-      const result = mapTikTokItemToResult(item);
-      if (!result || results.some((existing) => existing.videoId === result.videoId)) continue;
-      results.push(result);
-      if (results.length >= limit) return results;
-    }
-    if (results.length >= limit) break;
   }
   if (!results.length && !sawKnownMarkup) {
     throw apiError(502, 'TikTok devolvió una página de búsqueda inesperada.');
@@ -450,8 +454,9 @@ function mapWatchPageFormats(streamingData) {
   const adaptive = Array.isArray(streamingData?.adaptiveFormats) ? streamingData.adaptiveFormats : [];
   const progressiveItags = new Set(progressive.map((f) => String(f.itag)));
   const mapFormat = (f, isProgressive) => {
-    const mime = typeof f.mimeType === 'string' ? f.mimeType : '';
+    const mime = typeof f.mimeType === 'string' ? f.mimeType : typeof f.mime_type === 'string' ? f.mime_type : '';
     return {
+      itag: Number(f.itag) || null,
       mime_type: mime,
       bitrate: Number(f.bitrate) || 0,
       height: Number(f.height) || 0,
@@ -529,8 +534,18 @@ async function selectYoutubeMediaFormat(formats, type, quality, player) {
   const available = resolved.filter((item) => item.url);
 
   if (type === 'audio') {
+    // Prioridad: 1) itag 140 (m4a audio puro), 2) cualquier formato audio/mp4 o
+    // audio/webm, 3) ultimo recurso: un formato progresivo con audio (itag 18).
     const audioOnly = available.filter(({ format }) => format.mime_type?.startsWith('audio/'));
-    const selected = audioOnly.sort((a, b) => (b.format.bitrate || 0) - (a.format.bitrate || 0))[0] ||
+    const audioScore = (item) => {
+      const itag = String(item.format.itag || '');
+      const mime = String(item.format.mime_type || '');
+      if (itag === '140') return 3;
+      if (mime.startsWith('audio/mp4') || mime.startsWith('audio/webm')) return 2;
+      return 1;
+    };
+    const selected = audioOnly.slice()
+      .sort((a, b) => (audioScore(b) - audioScore(a)) || ((b.format.bitrate || 0) - (a.format.bitrate || 0)))[0] ||
       available.filter(({ format }) => format.has_audio)
         .sort((a, b) => (b.format.bitrate || 0) - (a.format.bitrate || 0))[0];
     if (selected) {
@@ -831,13 +846,7 @@ function validTikTokUrl(input) {
   return url;
 }
 
-async function fetchTikTokVideo(initialUrl, parentSignal) {
-  validTikTokUrl(initialUrl);
-  const { text } = await fetchTextSafe(initialUrl, {
-    allowedHosts: ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'douyin.com', 'www.douyin.com', 'v.douyin.com'],
-    parentSignal,
-    timeoutMs: 4500,
-  });
+function parseTikTokVideoData(text) {
   let videoData;
   const universalMatch = text.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
   if (universalMatch) {
@@ -847,7 +856,8 @@ async function fetchTikTokVideo(initialUrl, parentSignal) {
     } catch {}
   }
   if (!videoData) {
-    const sigiMatch = text.match(/window\[['"]SIGI_STATE['"]\]\s*=\s*({[\s\S]*?})\s*;window\[['"]SIGI_RETRY['"]\]/);
+    // SIGI_STATE tolerante: no exige el sufijo window['SIGI_RETRY'].
+    const sigiMatch = text.match(/window\[['"]SIGI_STATE['"]\]\s*=\s*({[\s\S]*?})\s*;/);
     if (sigiMatch) {
       try {
         const sigi = JSON.parse(sigiMatch[1]);
@@ -856,23 +866,58 @@ async function fetchTikTokVideo(initialUrl, parentSignal) {
       } catch {}
     }
   }
-  if (!videoData) throw apiError(502, 'TikTok no devolvió metadatos de video reconocibles.');
-  return {
-    creator: 'Jxmpier207',
-    status: true,
-    data: {
-      id: String(videoData.id || ''),
-      url: initialUrl,
-      type: 'video',
-      title: String(videoData.desc || '').slice(0, 2000),
-      cover: videoData.video?.cover || '',
-      duration: Number(videoData.video?.duration) || 0,
-      links: {
-        hd: videoData.video?.playAddr || '',
-        sd: videoData.video?.playAddr || '',
-        wm: videoData.video?.downloadAddr || '',
-        mp3: videoData.music?.playUrl || '',
-      },
+  return videoData || null;
+}
+
+async function fetchTikTokVideo(initialUrl, parentSignal) {
+  validTikTokUrl(initialUrl);
+  const allowedHosts = ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com', 'douyin.com', 'www.douyin.com', 'v.douyin.com'];
+  let lastError;
+  // Dos intentos: fetchTextSafe sigue redirects, por lo que una URL corta
+  // (vt.tiktok.com) se resuelve sola a la pagina canonica del video.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 700));
+    let text;
+    let finalUrl = initialUrl;
+    try {
+      ({ text, url: finalUrl } = await fetchTextSafe(initialUrl, {
+        allowedHosts,
+        parentSignal,
+        timeoutMs: 4500,
+      }));
+    } catch (error) {
+      if (error.statusCode === 400 || error.statusCode === 504) throw error;
+      lastError = error;
+      continue;
+    }
+    const videoData = parseTikTokVideoData(text);
+    if (!videoData) {
+      lastError = apiError(502, 'TikTok no devolvió metadatos de video reconocibles.');
+      continue;
+    }
+    const play = videoData.video?.playAddr || videoData.video?.downloadAddr || '';
+    const download = videoData.video?.downloadAddr || videoData.video?.playAddr || '';
+    if (!play) {
+      lastError = apiError(502, 'TikTok no expuso una URL de video descargable para este enlace.');
+      continue;
+    }
+    const canonicalUrl = typeof finalUrl === 'string' && /^https:\/\/(www\.)?tiktok\.com\/.+\/video\//.test(finalUrl) ? finalUrl : initialUrl;
+    return {
+      creator: 'Jxmpier207',
+      status: true,
+      data: {
+        id: String(videoData.id || ''),
+        url: canonicalUrl,
+        type: 'video',
+        title: String(videoData.desc || '').slice(0, 2000),
+        cover: videoData.video?.cover || '',
+        duration: Number(videoData.video?.duration) || 0,
+        links: {
+          hd: play,
+          sd: play,
+          wm: download,
+          mp3: videoData.music?.playUrl || '',
+        },
       author: {
         username: videoData.author?.uniqueId || '',
         nickname: videoData.author?.nickname || '',
@@ -985,3 +1030,4 @@ module.exports = {
   selectYoutubeMediaFormat,
   publicErrorMessage,
 };
+

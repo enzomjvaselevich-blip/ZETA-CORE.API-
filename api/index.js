@@ -1,10 +1,53 @@
 const { URL }=require('url');
 const { randomUUID }=require('node:crypto');
+const { Readable }=require('node:stream');
+const { pipeline }=require('node:stream/promises');
 const secureApi=require('./secure-api');
 const VALID_QUALITY=/^(?:best|\d{3,4}p)$/;
 const VALID_LIMIT=/^\d+$/;
 const LIMIT_MIN=1;
 const LIMIT_MAX=20;
+const BROWSER_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const DL_KINDS=['audio','video','tiktok','x'];
+
+// Transmite en streaming un archivo de media (googlevideo, tiktokcdn, twimg)
+// desde la misma invocacion de la funcion, para que la IP coincida con la que
+// genero la URL firmada. Pasa el header Range del cliente y copia los headers
+// de respuesta relevantes (200 o 206).
+async function streamMedia(req,res,sendJson,requestId,mediaUrl,options={}){
+const fetchHeaders={
+'User-Agent':BROWSER_UA,
+'Accept':'*/*',
+'Accept-Language':'es-ES,es;q=0.9,en;q=0.8',
+};
+if(options.referer)fetchHeaders.Referer=options.referer;
+const range=req.headers&&typeof req.headers.range==='string'&&req.headers.range.length<200?req.headers.range:'';
+if(range)fetchHeaders.Range=range;
+let upstream;
+try{
+upstream=await fetch(mediaUrl,{headers:fetchHeaders,redirect:'follow'});
+}catch(e){
+return sendJson(502,{ok:false,message:'No se pudo conectar con el servidor de medios.',error:String(e&&e.message||e).slice(0,140)});
+}
+if(!upstream.ok&&upstream.status!==206){
+try{await upstream.body?.cancel();}catch(e){}
+return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+upstream.status+').'});
+}
+res.statusCode=upstream.status;
+res.setHeader('Content-Type',upstream.headers.get('content-type')||'application/octet-stream');
+res.setHeader('Accept-Ranges',upstream.headers.get('accept-ranges')||'bytes');
+const contentLength=upstream.headers.get('content-length');
+if(contentLength)res.setHeader('Content-Length',contentLength);
+const contentRange=upstream.headers.get('content-range');
+if(contentRange)res.setHeader('Content-Range',contentRange);
+if(options.filename)res.setHeader('Content-Disposition','attachment; filename="'+String(options.filename).replace(/[^a-zA-Z0-9._-]/g,'_')+'"');
+try{
+await pipeline(Readable.fromWeb(upstream.body),res);
+}catch(e){
+try{res.destroy();}catch(e2){}
+}
+}
+
 module.exports=async function handler(req,res){
 const requestId=randomUUID();
 const sendJson=(status,payload)=>{
@@ -28,14 +71,14 @@ if(!pathname)pathname='/';
 if(pathname==='/favicon.ico')return res.end();
 if(pathname==='/'||pathname===''||pathname==='/docs'){
 res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
-return res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ZETA-CORE API</title><style>*{box-sizing:border-box}body{background:#0a0e14;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:16px}.card{background:#12161f;border:1px solid #232936;border-radius:20px;padding:32px;max-width:640px;width:100%}h1{margin:0 0 4px;font-size:26px}h1 span{color:#6366f1}p.sub{margin:0 0 18px;color:#8b93a7;font-size:14px}label{display:block;font-size:12px;color:#8b93a7;margin:12px 0 4px;text-transform:uppercase;letter-spacing:1px}input,select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #232936;background:#0d1117;color:#fff;font-size:14px}button{background:#6366f1;border:none;font-weight:700;cursor:pointer;margin-top:16px}button:disabled{opacity:.6;cursor:wait}pre{color:#9cdcfe;text-align:left;white-space:pre-wrap;word-break:break-all;max-height:420px;overflow:auto;background:#0d1117;padding:12px;border-radius:10px;margin:16px 0 0;font-size:12px}.status{margin-top:10px;font-size:13px;min-height:18px}.ok{color:#4ade80}.err{color:#f87171}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:#8b93a7;margin-top:16px}.grid code{color:#9cdcfe}</style></head><body><div class="card"><h1>ZETA<span>-CORE</span> API</h1><p class="sub">Scraper puro: YouTube, TikTok y X/Twitter. Sin APIs internas.</p><label>Endpoint</label><select id="t"><option value="/ytmp4">Video MP4 (/ytmp4)</option><option value="/ytmp3">Audio MP3 (/ytmp3)</option><option value="/ytsearch">Buscar en YouTube (/ytsearch)</option><option value="/tiktok">Video de TikTok (/tiktok)</option><option value="/ttsearch">Buscar en TikTok (/ttsearch)</option><option value="/xvideo">Video de X/Twitter (/xvideo)</option></select><label id="ql">Consulta o enlace</label><input id="q" placeholder="Texto de busqueda o enlace del video"><label id="qll">Calidad (solo YouTube)</label><select id="qt"><option value="best">best</option><option value="360p">360p</option><option value="480p">480p</option><option value="720p" selected>720p</option><option value="1080p">1080p</option></select><label id="liml">Limite (solo busquedas)</label><input id="lim" type="number" min="1" max="20" value="5"><button class="btn" id="go" onclick="test()">Probar API</button><div class="status" id="st"></div><pre id="out">Esperando peticion...</pre><div class="grid"><span>GET <code>/ytmp3?query=</code></span><span>GET <code>/ytmp4?query=&quality=</code></span><span>GET <code>/ytsearch?query=&limit=</code></span><span>GET <code>/tiktok?query=</code></span><span>GET <code>/ttsearch?query=&limit=</code></span><span>GET <code>/xvideo?query=</code></span><span>GET <code>/status</code></span></div></div><script>const $=id=>document.getElementById(id);const isSearch=()=>['/ytsearch','/ttsearch'].includes($('t').value);const isYt=()=>['/ytmp3','/ytmp4','/ytsearch'].includes($('t').value);const isUrlOnly=()=>['/tiktok','/xvideo'].includes($('t').value);function sync(){$('qt').style.display=isYt()?'':'none';$('qll').style.display=isYt()?'':'none';$('lim').style.display=isSearch()?'':'none';$('liml').style.display=isSearch()?'':'none';$('q').placeholder=isUrlOnly()?'https://... enlace del video':isSearch()?'Texto a buscar':'Texto o enlace de YouTube'}async function test(){const t=$('t').value,q=$('q').value.trim();if(!q){$('st').className='status err';$('st').textContent='Escribe una consulta o enlace.';return}let url=t+'?query='+encodeURIComponent(q);if(isYt())url+='&quality='+encodeURIComponent($('qt').value);if(isSearch())url+='&limit='+encodeURIComponent($('lim').value||'5');$('go').disabled=true;$('st').className='status';$('st').textContent='Procesando...';$('out').textContent='Procesando '+q+'...';try{const r=await fetch(url);const j=await r.json();$('out').textContent=JSON.stringify(j,null,2);$('st').className='status '+(r.ok?'ok':'err');$('st').textContent='HTTP '+r.status+(j.requestId?' - '+j.requestId:'')}catch(e){$('st').className='status err';$('st').textContent='Error: '+e}$('go').disabled=false}['t','qt','lim'].forEach(id=>$(id).addEventListener('change',sync));sync();</script></body></html>`);
+return res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ZETA-CORE API</title><style>*{box-sizing:border-box}body{background:#0a0e14;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:16px}.card{background:#12161f;border:1px solid #232936;border-radius:20px;padding:32px;max-width:640px;width:100%}h1{margin:0 0 4px;font-size:26px}h1 span{color:#6366f1}p.sub{margin:0 0 18px;color:#8b93a7;font-size:14px}label{display:block;font-size:12px;color:#8b93a7;margin:12px 0 4px;text-transform:uppercase;letter-spacing:1px}input,select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #232936;background:#0d1117;color:#fff;font-size:14px}button{background:#6366f1;border:none;font-weight:700;cursor:pointer;margin-top:16px}button:disabled{opacity:.6;cursor:wait}pre{color:#9cdcfe;text-align:left;white-space:pre-wrap;word-break:break-all;max-height:420px;overflow:auto;background:#0d1117;padding:12px;border-radius:10px;margin:16px 0 0;font-size:12px}.status{margin-top:10px;font-size:13px;min-height:18px}.ok{color:#4ade80}.err{color:#f87171}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:#8b93a7;margin-top:16px}.grid code{color:#9cdcfe}</style></head><body><div class="card"><h1>ZETA<span>-CORE</span> API</h1><p class="sub">Scraper puro: YouTube, TikTok y X/Twitter. Sin APIs internas.</p><label>Endpoint</label><select id="t"><option value="/ytmp4">Video MP4 (/ytmp4)</option><option value="/ytmp3">Audio MP3 (/ytmp3)</option><option value="/ytsearch">Buscar en YouTube (/ytsearch)</option><option value="/tiktok">Video de TikTok (/tiktok)</option><option value="/ttsearch">Buscar en TikTok (/ttsearch)</option><option value="/xvideo">Video de X/Twitter (/xvideo)</option><option value="/dl">Descarga directa (/dl)</option></select><label id="ql">Consulta o enlace</label><input id="q" placeholder="Texto de busqueda o enlace del video"><label id="kl" style="display:none">Tipo (/dl)</label><select id="kd" style="display:none"><option value="video">Video de YouTube</option><option value="audio">Audio de YouTube</option><option value="tiktok">TikTok</option><option value="x">X/Twitter</option></select><label id="qll">Calidad (solo YouTube)</label><select id="qt"><option value="best">best</option><option value="360p">360p</option><option value="480p">480p</option><option value="720p" selected>720p</option><option value="1080p">1080p</option></select><label id="liml">Limite (solo busquedas)</label><input id="lim" type="number" min="1" max="20" value="5"><button class="btn" id="go" onclick="test()">Probar API</button><div class="status" id="st"></div><pre id="out">Esperando peticion...</pre><div class="grid"><span>GET <code>/ytmp3?query=</code></span><span>GET <code>/ytmp4?query=&quality=</code></span><span>GET <code>/ytsearch?query=&limit=</code></span><span>GET <code>/tiktok?query=</code></span><span>GET <code>/ttsearch?query=&limit=</code></span><span>GET <code>/xvideo?query=</code></span><span>GET <code>/dl?query=&kind=&key=</code></span><span>GET <code>/status</code></span></div></div><script>const $=id=>document.getElementById(id);const isSearch=()=>['/ytsearch','/ttsearch'].includes($('t').value);const isYt=()=>['/ytmp3','/ytmp4','/ytsearch'].includes($('t').value)||($('t').value==='/dl'&&['video','audio'].includes($('kd').value));const isUrlOnly=()=>['/tiktok','/xvideo'].includes($('t').value);const isDl=()=>$('t').value==='/dl';function sync(){$('kl').style.display=isDl()?'':'none';$('kd').style.display=isDl()?'':'none';$('qt').style.display=isYt()?'':'none';$('qll').style.display=isYt()?'':'none';$('lim').style.display=isSearch()?'':'none';$('liml').style.display=isSearch()?'':'none';$('q').placeholder=isUrlOnly()?'https://... enlace del video':isSearch()?'Texto a buscar':'Texto o enlace de YouTube'}async function test(){const t=$('t').value,q=$('q').value.trim();if(!q){$('st').className='status err';$('st').textContent='Escribe una consulta o enlace.';return}let url=t+'?query='+encodeURIComponent(q);if(isDl())url+='&kind='+encodeURIComponent($('kd').value);if(isYt()&&!isDl())url+='&quality='+encodeURIComponent($('qt').value);if(isYt()&&isDl()&&['video','audio'].includes($('kd').value))url+='&quality='+encodeURIComponent($('qt').value);if(isSearch())url+='&limit='+encodeURIComponent($('lim').value||'5');$('go').disabled=true;$('st').className='status';$('st').textContent='Procesando...';$('out').textContent='Procesando '+q+'...';try{const r=await fetch(url);const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')){const j=await r.json();$('out').textContent=JSON.stringify(j,null,2)}else{$('out').textContent='Respuesta binaria: '+ct+' ('+r.status+')'}$('st').className='status '+(r.ok?'ok':'err');$('st').textContent='HTTP '+r.status}catch(e){$('st').className='status err';$('st').textContent='Error: '+e}$('go').disabled=false}['t','qt','lim','kd'].forEach(id=>$(id).addEventListener('change',sync));sync();</script></body></html>`);
 }
 const rawQuery=parsedUrl.searchParams.get('query')||parsedUrl.searchParams.get('url')||parsedUrl.searchParams.get('prompt')||'';
 const query=rawQuery.trim();
 const qualityParam=parsedUrl.searchParams.get('quality')||'best';
 const limitParam=parsedUrl.searchParams.get('limit')||'5';
 const isSearchRoute=['/ytsearch','/ttsearch'].includes(pathname);
-if(!query&&['/ytmp3','/ytmp4','/youtube','/ytsearch','/tiktok','/ttsearch','/xvideo'].includes(pathname)){
+if(!query&&['/ytmp3','/ytmp4','/youtube','/ytsearch','/tiktok','/ttsearch','/xvideo','/dl'].includes(pathname)){
 return sendJson(400,{ok:false,message:'Falta el parametro query o url'});
 }
 if(!isSearchRoute&&pathname!=='/'&&!VALID_QUALITY.test(qualityParam)){
@@ -44,6 +87,75 @@ return sendJson(400,{ok:false,message:`Calidad invalida: "${qualityParam}". Usa 
 let limit=Number(limitParam);
 if(!VALID_LIMIT.test(limitParam)||limit<LIMIT_MIN||limit>LIMIT_MAX){
 return sendJson(400,{ok:false,message:`Limite invalido: "${limitParam}". Usa un numero entre ${LIMIT_MIN} y ${LIMIT_MAX}.`});
+}
+if(pathname==='/dl'){
+// Proteccion por clave: si DL_KEY esta definida, exigir ?key= o header x-api-key.
+const dlKey=process.env.DL_KEY||'';
+if(dlKey){
+const provided=parsedUrl.searchParams.get('key')||(Array.isArray(req.headers['x-api-key'])?req.headers['x-api-key'][0]:req.headers['x-api-key'])||'';
+if(provided!==dlKey){
+return sendJson(401,{ok:false,message:'Clave invalida o ausente. Pasa ?key= o el header x-api-key.'});
+}
+}
+const kind=(parsedUrl.searchParams.get('kind')||'video').toLowerCase();
+if(!DL_KINDS.includes(kind)){
+return sendJson(400,{ok:false,message:'Parametro kind invalido. Usa audio, video, tiktok o x.'});
+}
+if(kind==='tiktok'||kind==='x'){
+let data;
+try{
+if(kind==='tiktok'){
+const {extractTikTokVideo}=require('./documentos/tiktok');
+data=await extractTikTokVideo(query);
+}else{
+const {fetchXVideo}=require('./documentos/xvideo');
+data=await fetchXVideo(query);
+}
+}catch(e){
+return sendJson(502,{ok:false,message:'No se pudo resolver el video solicitado.',error:String(e&&e.message||e).slice(0,140)});
+}
+const mediaUrl=kind==='tiktok'
+?(data?.data?.links?.hd||data?.data?.links?.sd||data?.data?.links?.wm||'')
+:(data?.best||'');
+if(!mediaUrl){
+return sendJson(502,{ok:false,message:'No se encontro una URL de media descargable para ese enlace.'});
+}
+return streamMedia(req,res,sendJson,requestId,mediaUrl,{referer:kind==='tiktok'?'https://www.tiktok.com/':'https://x.com/'});
+}
+// kind audio|video -> YouTube: mismo flujo que /ytmp3 y /ytmp4.
+let Innertube;
+try{
+const mod=await import('youtubei.js');
+Innertube=mod.Innertube;
+}catch(e){
+return sendJson(500,{ok:false,message:'Error interno: Modulo youtubei.js no encontrado.',details:e.message});
+}
+const yt=await Innertube.create({generate_session:false});
+let videoId=query;
+const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
+if(match){
+videoId=match[1];
+}else if(!/^[a-zA-Z0-9_-]{11}$/.test(query)){
+let primerVideo=null;
+for(let intento=0;intento<2&&!primerVideo;intento+=1){
+if(intento>0)await new Promise(r=>setTimeout(r,800));
+const search=await yt.search(query,{type:'video'});
+const videos=Array.isArray(search.videos)?search.videos:[];
+primerVideo=videos.find(v=>v&&/^[a-zA-Z0-9_-]{11}$/.test(String(v.id||'')))||null;
+}
+if(!primerVideo)return sendJson(404,{ok:false,message:'No se encontraron resultados para la busqueda: '+query});
+videoId=String(primerVideo.id);
+}
+let media;
+try{
+media=await secureApi.fetchYoutubeMedia(videoId,kind==='audio'?'audio':'video',qualityParam==='best'?'best':qualityParam);
+}catch(e){
+return sendJson(e.statusCode||502,{ok:false,message:e.message||'No se pudo obtener el media de YouTube.'});
+}
+if(!media||!media.url){
+return sendJson(502,{ok:false,message:'No se encontro una URL de media descargable para ese video.'});
+}
+return streamMedia(req,res,sendJson,requestId,media.url,{referer:'https://www.youtube.com/',filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
 }
 if(pathname==='/ytmp3'||pathname==='/ytmp4'||pathname==='/youtube'||pathname==='/ytsearch'){
 let Innertube;
@@ -132,7 +244,7 @@ return sendJson(200,{ok:true,...(await fetchXVideo(query))});
 }catch(e){return sendJson(502,{ok:false,message:'Modulo X no disponible',error:e.message});}
 }
 if(pathname==='/status'){
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/status']});
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
