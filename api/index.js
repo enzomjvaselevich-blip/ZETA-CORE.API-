@@ -426,6 +426,7 @@ const scrapeHeaders=kind==='instagram'?headersDePeticion():headersDeDescarga();
 // UA devuelven HTML o 403.
 const resolver=()=>kind==='instagram'?fetchInstagramVideo(query):fetchFacebookVideo(query);
 let ultimoError=null;
+const debugProbes=parsedUrl.searchParams.get('debug')==='1'?[]:null;
 // Dos rondas: si los candidatos no pasan el probe (el lookaside de Facebook
 // alterna entre servir el video y un HTML de redirect), re-scrapear una vez
 // antes de fallar; la segunda vuelta suele exponer URLs de video.xx.fbcdn.net.
@@ -448,6 +449,7 @@ for(const mediaUrl of candidatos){
 // extra): cualquier diferencia entre el probe y la descarga es una chance de
 // que el CDN de Meta cambie la respuesta.
 const probe=await probeMediaTipo(mediaUrl,scrapeHeaders);
+if(debugProbes)debugProbes.push({ronda,url:mediaUrl.slice(0,70),status:probe.status,tipo:probe.tipo});
 if(probe.ok){
 return streamMedia(req,res,sendJson,requestId,mediaUrl,{sinProxy:true,headers:scrapeHeaders,exigirVideo:true,mensajeBloqueo:'El CDN de '+(kind==='instagram'?'Instagram':'Facebook')+' rechazo la descarga desde este hosting (HTTP 403).'});
 }
@@ -456,7 +458,7 @@ return streamMedia(req,res,sendJson,requestId,mediaUrl,{sinProxy:true,headers:sc
 if(ultimoError){
 return sendJson(404,{ok:false,error:'SIN_MEDIA',message:String(ultimoError&&ultimoError.message||ultimoError).slice(0,200)});
 }
-return sendJson(404,{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'La plataforma expuso el video pero el archivo no responde como video descargable desde este hosting (puede requerir sesion iniciada).'});
+return sendJson(404,debugProbes?{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'La plataforma expuso el video pero el archivo no responde como video descargable desde este hosting (puede requerir sesion iniciada).',probes:debugProbes}:{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'La plataforma expuso el video pero el archivo no responde como video descargable desde este hosting (puede requerir sesion iniciada).'});
 }
 // kind audio|video -> YouTube: prueba de 1 KB por candidato; solo transmite
 // cuando la prueba responde 200/206. Orden: web (con cookies), web (sin
