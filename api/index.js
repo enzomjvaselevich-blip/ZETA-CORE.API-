@@ -43,7 +43,7 @@ if(!RELAY_URL||!RELAY_KEY)return null;
 const ahora=Date.now();
 if(relaySalud.estado&&ahora-relaySalud.checkedAt<60000)return relaySalud.estado;
 try{
-const rta=await fetch(RELAY_URL+'/ping',{headers:{'x-relay-key':RELAY_KEY},signal:AbortSignal.timeout(4000)});
+const rta=await fetch(RELAY_URL+'/ping',{headers:{'x-relay-key':RELAY_KEY,'bypass-tunnel-reminder':'true'},signal:AbortSignal.timeout(4000)});
 relaySalud.estado=rta.ok?'OK':'CAIDO';
 }catch(e){relaySalud.estado='CAIDO';}
 relaySalud.checkedAt=Date.now();
@@ -361,7 +361,7 @@ function streamDesdeRelay(req,res,videoId,kind,cookie){
 return new Promise((resolve)=>{
 const destino=new URL(RELAY_URL+'/descarga?video='+encodeURIComponent(videoId)+'&kind='+kind);
 const mod=destino.protocol==='https:'?require('node:https'):require('node:http');
-const cabeceras={'x-relay-key':RELAY_KEY,Accept:'*/*'};
+const cabeceras={'x-relay-key':RELAY_KEY,Accept:'*/*','bypass-tunnel-reminder':'true'};
 if(cookie)cabeceras['x-yt-cookie']=cookie;
 if(req.headers.range)cabeceras.Range=req.headers.range;
 const pedido=mod.request(destino,{method:'GET',headers:cabeceras},(rta)=>{
