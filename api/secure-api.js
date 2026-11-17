@@ -761,9 +761,26 @@ async function enriquecerResultadoTikTok(candidato, parentSignal) {
 // Fuente primaria delegada (opcional): API externa de busqueda de TikTok
 // configurada con ZENITH_SEARCH_URL (y ZENITH_SEARCH_KEY si pide clave).
 // Responde {ok:true, resultados:[{title, url, author, ...}]}.
+// Health-check de la fuente zenith: 2 fallos seguidos (timeout o error) la
+// marcan caida por 5 minutos; vencido el plazo, el proximo intento la reactiva.
+const ZENITH_HEALTH = { fallos: 0, caidaHasta: 0, razon: '' };
+
+function zenithEstado() {
+  const base = String(process.env.ZENITH_SEARCH_URL || '').trim();
+  if (!base) return 'no configurada';
+  if (Date.now() < ZENITH_HEALTH.caidaHasta) {
+    return `saltada por health-check (${Math.ceil((ZENITH_HEALTH.caidaHasta - Date.now()) / 1000)}s restantes)`;
+  }
+  return 'activa';
+}
+
 async function buscarZenithTikTok(query, limit, parentSignal) {
   const base = String(process.env.ZENITH_SEARCH_URL || '').trim();
   if (!base) return [];
+  if (Date.now() < ZENITH_HEALTH.caidaHasta) {
+    console.log(`[zenith] saltada por health-check (${Math.ceil((ZENITH_HEALTH.caidaHasta - Date.now()) / 1000)}s restantes)`);
+    return [];
+  }
   const url = `${base.replace(/\/+$/, '')}/search?query=${encodeURIComponent(query)}&limit=${limit}`;
   const headers = {
     'bypass-tunnel-reminder': 'true',
@@ -776,16 +793,11 @@ async function buscarZenithTikTok(query, limit, parentSignal) {
   }
   try {
     const response = await fetch(url, { headers, signal: senalConLimite(parentSignal, 8000) });
-    if (!response.ok) {
-      console.log(`[zenith] HTTP ${response.status}`);
-      return [];
-    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json().catch(() => null);
     const lista = payload?.resultados || payload?.results;
-    if (!Array.isArray(lista)) {
-      console.log('[zenith] respuesta sin lista de resultados');
-      return [];
-    }
+    if (!Array.isArray(lista)) throw new Error('respuesta sin lista de resultados');
+    ZENITH_HEALTH.fallos = 0;
     const resultados = [];
     for (const item of lista) {
       const urlVideo = String(item?.url || item?.link || '');
@@ -817,7 +829,15 @@ async function buscarZenithTikTok(query, limit, parentSignal) {
     return resultados.slice(0, limit);
   } catch (error) {
     if (parentSignal?.aborted) throw error;
-    console.log(`[zenith] error ${String(error?.message || error).slice(0, 80)}`);
+    ZENITH_HEALTH.razon = String(error?.message || error).slice(0, 80);
+    ZENITH_HEALTH.fallos += 1;
+    if (ZENITH_HEALTH.fallos >= 2) {
+      ZENITH_HEALTH.caidaHasta = Date.now() + 5 * 60 * 1000;
+      ZENITH_HEALTH.fallos = 0;
+      console.log(`[zenith] marcada caida por 5 minutos (${ZENITH_HEALTH.razon})`);
+    } else {
+      console.log(`[zenith] fallo ${ZENITH_HEALTH.fallos}/2: ${ZENITH_HEALTH.razon}`);
+    }
     return [];
   }
 }
@@ -855,13 +875,19 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
   };
 
   let fuentes = [];
-  // Fuente primaria delegada: si ZENITH_SEARCH_URL esta configurada es
+  // Fuente primaria delegada: si ZENITH_SEARCH_URL esta configurada y sana es
   // bloqueante y prioritaria; si trae resultados no se lanzan las demas.
+  // No configurada o marcada caida por el health-check: salteada al instante
+  // (0ms, sin intento de red).
   const zenithConfigurada = Boolean(String(process.env.ZENITH_SEARCH_URL || '').trim());
-  if (zenithConfigurada) {
+  const zenithSalteadaPorSalud = zenithConfigurada && Date.now() < ZENITH_HEALTH.caidaHasta;
+  if (zenithConfigurada && !zenithSalteadaPorSalud) {
     const zenithR = await medir('zenith', buscarZenithTikTok(query, limit, parentSignal));
     fuentes.push(['zenith', zenithR]);
     juntar(zenithR.value);
+  } else {
+    tiempos.zenith = 0;
+    fuentes.push(['zenith', { status: 'fulfilled', value: null }]);
   }
   if (!candidatos.length) {
     const [directaR, tikwmR, searxR, ddgR, ddgLtR, bingR] = await Promise.all([
@@ -918,6 +944,7 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
         ? (Array.isArray(fuente.value) ? fuente.value.length : 0)
         : String(fuente.reason?.message || fuente.reason || 'error').slice(0, 80),
     ])),
+    zenith_estado: zenithEstado(),
     tiempos_fuente: { ...tiempos },
     tiempo_total_ms: Date.now() - t0,
     resultados: results.length,
