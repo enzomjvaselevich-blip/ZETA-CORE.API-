@@ -1739,32 +1739,48 @@ async function fetchTikTokViaTikwm(initialUrl, parentSignal) {
 function getVideoVariants(tweet) {
   const variants = [
     ...(tweet.media?.videos || []).flatMap((video) => [
-      ...(video.url ? [{ url: video.url, quality: video.quality }] : []),
+      ...(video.url ? [{ url: video.url, quality: video.quality, contentType: video.contentType }] : []),
       ...(video.variants || []).map((variant) => ({
-        url: variant.url,
+        url: variant.url || variant.src,
         quality: variant.quality || (variant.bitrate ? `${Math.round(variant.bitrate / 1000)}k` : 'unknown'),
         bitrate: variant.bitrate || null,
-        contentType: variant.content_type,
+        contentType: variant.contentType || variant.content_type || variant.type,
       })),
     ]),
+    ...(tweet.video?.variants || []).map((variant) => ({
+      url: variant.src || variant.url,
+      quality: variant.quality || (variant.bitrate ? `${Math.round(variant.bitrate / 1000)}k` : 'unknown'),
+      bitrate: variant.bitrate || null,
+      contentType: variant.contentType || variant.content_type || variant.type,
+    })),
     ...(tweet.extended_entities?.media || []).flatMap((media) => media.video_info?.variants || []),
     ...(tweet.mediaDetails || []).flatMap((media) => media.video_info?.variants || []),
   ];
   const unique = new Map();
   for (const variant of variants) {
-    if (!variant.url || (variant.contentType && variant.contentType !== 'video/mp4')) continue;
+    if (!variant || !variant.url) continue;
+    const tipo = String(variant.contentType || variant.content_type || variant.type || '').toLowerCase();
+    const esM3u8 = tipo.includes('mpegurl') || /\.m3u8($|\?)/i.test(variant.url);
+    const esMp4 = tipo.includes('mp4') || /\.mp4($|\?)/i.test(variant.url);
+    if (!esMp4 && !esM3u8) continue;
     try {
       const url = new URL(variant.url);
       if (url.protocol !== 'https:' || url.hostname !== 'video.twimg.com') continue;
+      const dims = (url.pathname.match(/\d{3,4}x\d{3,4}/) || [])[0] || null;
       unique.set(url.href, {
         url: url.href,
-        quality: variant.quality || 'unknown',
+        quality: variant.quality || dims || (variant.bitrate ? `${Math.round(variant.bitrate / 1000)}k` : 'unknown'),
         ...(variant.bitrate ? { bitrate: variant.bitrate } : {}),
-        type: 'video/mp4',
+        type: esM3u8 ? 'application/vnd.apple.mpegurl' : 'video/mp4',
       });
     } catch {}
   }
-  return [...unique.values()];
+  const lista = [...unique.values()];
+  lista.sort((a, b) => {
+    if ((a.type === 'video/mp4') !== (b.type === 'video/mp4')) return a.type === 'video/mp4' ? -1 : 1;
+    return (b.bitrate || 0) - (a.bitrate || 0);
+  });
+  return lista;
 }
 
 function extractTweetId(inputUrl) {

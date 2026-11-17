@@ -46,6 +46,8 @@ async function fetchXVideo(inputUrl, parentSignal) {
     throw secureApi.apiError(404, 'No se encontraron videos disponibles en la publicación indicada.');
   }
 
+  const mejorMp4 = videos.find((v) => v.type === 'video/mp4') || null;
+
   return {
     ok: true,
     endpoint: 'xvideo',
@@ -53,7 +55,9 @@ async function fetchXVideo(inputUrl, parentSignal) {
     tweet_id: tweetId,
     videos,
     total_videos: videos.length,
-    best: videos[0].url,
+    best: (mejorMp4 || videos[0]).url,
+    ...(mejorMp4 ? { mp4: mejorMp4.url } : {}),
+    solo_hls: !mejorMp4,
     thumbnail: tweet.media?.photos?.[0]?.url || tweet.photos?.[0]?.url || tweet.media?.videos?.[0]?.thumbnail_url || null,
     text: tweet.text || null,
   };
