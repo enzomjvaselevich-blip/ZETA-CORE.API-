@@ -171,11 +171,23 @@ const probeHeaders={...headers,Range:'bytes=0-1000'};
 const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
 const proxy=proxyRaw?parseDlProxy(proxyRaw):null;
 if(proxy){
+// googlevideo suele responder 302: hay que seguir el redirect dentro del
+// mismo tunel, igual que hace streamMedia, para no descartar URLs validas.
+let destino=mediaUrl;
 try{
-const {mediaRes,cleanup}=await requestMediaViaProxy(proxy,mediaUrl,probeHeaders);
+for(let salto=0;salto<4;salto+=1){
+const {mediaRes,cleanup}=await requestMediaViaProxy(proxy,destino,probeHeaders);
 const status=mediaRes.statusCode;
+const loc=mediaRes.headers.location;
+if([301,302,303,307,308].includes(status)&&loc){
+cleanup();
+destino=new URL(loc,destino).href;
+continue;
+}
 cleanup();
 return status;
+}
+return 0;
 }catch(e){return 0;}
 }
 try{
@@ -417,7 +429,7 @@ if(pathname==='/tiktok'||pathname==='/ttsearch'){
 try{
 const {searchTikTok}=require('./documentos/ttsearch');
 const {extractTikTokVideo}=require('./documentos/tiktok');
-if(pathname==='/ttsearch')return sendJson(200,{ok:true,results:await searchTikTok(query,limit)});
+if(pathname==='/ttsearch'){let r;try{r=await searchTikTok(query,limit);}catch(e){r=[];}return sendJson(200,{ok:true,results:Array.isArray(r)?r:[]});}
 return sendJson(200,{ok:true,...(await extractTikTokVideo(query))});
 }catch(e){return sendJson(502,{ok:false,message:'Modulo TikTok no disponible',error:e.message});}
 }

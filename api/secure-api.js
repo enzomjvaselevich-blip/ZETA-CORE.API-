@@ -1,4 +1,7 @@
 const { createHash } = require('node:crypto');
+const http = require('node:http');
+const https = require('node:https');
+const tls = require('node:tls');
 const { Redis } = require('@upstash/redis');
 const { Ratelimit } = require('@upstash/ratelimit');
 const vm = require('node:vm');
@@ -262,14 +265,15 @@ function slugifyTikTokQuery(query) {
 }
 
 function parseTikTokEmbeddedItems(text) {
+  // Solo se aceptan items de la busqueda real. El feed "Para Ti"
+  // (webapp.foryou.video) y el regex legacy traen videos genericos que no
+  // tienen relacion con el query y contaminaban los resultados.
   const items = [];
   const universalMatch = text.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([^<]+)<\/script>/);
   if (universalMatch) {
     try {
       const universal = JSON.parse(universalMatch[1]);
       const scope = universal.__DEFAULT_SCOPE__ || {};
-      const forYouList = scope['webapp.foryou.video']?.itemList;
-      if (Array.isArray(forYouList)) items.push(...forYouList);
       const searchScope = scope['webapp.search-page'];
       const searchLists = [
         searchScope?.data?.itemList,
@@ -286,11 +290,6 @@ function parseTikTokEmbeddedItems(text) {
       const sigi = JSON.parse(sigiMatch[1]);
       items.push(...Object.values(sigi.ItemModule || {}));
     } catch {}
-  }
-  const legacyRegex = /"id":"(\d{10,25})","desc":"((?:\\.|[^"\\])*)"/g;
-  let legacyMatch;
-  while ((legacyMatch = legacyRegex.exec(text)) !== null) {
-    items.push({ id: legacyMatch[1], desc: decodeJsonString(legacyMatch[2]) });
   }
   return items;
 }
@@ -362,6 +361,7 @@ async function fetchRealSearchResults(query, limit, platform, parentSignal) {
 
   const results = [];
   let sawKnownMarkup = false;
+  let crudos = 0;
   // Dos rondas: si la primera no alcanza el limite pedido, se reintenta
   // combinando discover + search sin duplicar videoId.
   for (let round = 0; round < 2 && results.length < limit; round += 1) {
@@ -377,16 +377,22 @@ async function fetchRealSearchResults(query, limit, platform, parentSignal) {
       if (text.includes('__UNIVERSAL_DATA_FOR_REHYDRATION__') || text.includes('SIGI_STATE')) {
         sawKnownMarkup = true;
       }
-      for (const item of parseTikTokEmbeddedItems(text)) {
+      const items = parseTikTokEmbeddedItems(text);
+      crudos += items.length;
+      for (const item of items) {
         const result = mapTikTokItemToResult(item);
         if (!result || results.some((existing) => existing.videoId === result.videoId)) continue;
         results.push(result);
-        if (results.length >= limit) return results;
+        if (results.length >= limit) break;
       }
+      if (results.length >= limit) break;
     }
   }
+  console.log(`[ttsearch] query="${String(query).slice(0, 80)}" crudos=${crudos} resultados=${results.length}`);
   if (!results.length && !sawKnownMarkup) {
-    throw apiError(502, 'TikTok devolvió una página de búsqueda inesperada.');
+    // Sin markup conocido no hay resultados de esta busqueda: se devuelve
+    // vacio, nunca resultados de otra busqueda ni contenido generico.
+    return [];
   }
   return results;
 }
@@ -658,6 +664,130 @@ async function acquireYoutubePoMinter(youtube) {
   return youtubePoMinterCache;
 }
 
+let dlProxyCache;
+function getDlProxy() {
+  if (dlProxyCache !== undefined) return dlProxyCache;
+  const raw = (process.env.DL_PROXY_URL || process.env.dl_proxy_url || '').trim();
+  dlProxyCache = null;
+  if (raw) {
+    try {
+      const u = new URL(raw);
+      if (u.protocol === 'http:' && u.hostname) {
+        dlProxyCache = {
+          host: u.hostname,
+          port: Number(u.port) || 80,
+          auth: (u.username || u.password)
+            ? 'Basic ' + Buffer.from(decodeURIComponent(u.username) + ':' + decodeURIComponent(u.password)).toString('base64')
+            : null,
+        };
+      }
+    } catch {}
+  }
+  return dlProxyCache;
+}
+
+function headersToPlainObject(headers) {
+  if (!headers) return {};
+  if (typeof Headers !== 'undefined' && headers instanceof Headers) return Object.fromEntries(headers.entries());
+  if (Array.isArray(headers)) return Object.fromEntries(headers);
+  return { ...headers };
+}
+
+// Peticion HTTPS a traves del tunel CONNECT del proxy de salida. Devuelve la
+// respuesta cruda de node (mediaRes) para que el llamador la consuma.
+function requestViaProxy(proxy, targetUrl, { method = 'GET', headers = {}, body = null, signal = null, timeoutMs = 20000 }) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(targetUrl);
+    if (target.protocol !== 'https:') return reject(new Error('El proxy de salida solo soporta destinos https.'));
+    let tlsSocket = null;
+    let mediaReq = null;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      try { mediaReq && mediaReq.destroy(); } catch {}
+      try { tlsSocket && tlsSocket.destroy(); } catch {}
+      reject(error);
+    };
+    const onAbort = () => fail(new Error('La solicitud a traves del proxy fue abortada.'));
+    if (signal) {
+      if (signal.aborted) return fail(new Error('La solicitud a traves del proxy fue abortada.'));
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const connectReq = http.request({
+      host: proxy.host,
+      port: proxy.port,
+      method: 'CONNECT',
+      path: target.host + ':443',
+      headers: { Host: target.host + ':443', ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
+      timeout: timeoutMs,
+    });
+    connectReq.on('timeout', () => connectReq.destroy(new Error('El proxy tardo demasiado en responder.')));
+    connectReq.on('error', fail);
+    connectReq.on('connect', (proxyRes, socket) => {
+      if (proxyRes.statusCode !== 200) {
+        socket.destroy();
+        return fail(new Error('El proxy rechazo la conexion (HTTP ' + proxyRes.statusCode + ').'));
+      }
+      tlsSocket = tls.connect({ socket, servername: target.hostname });
+      tlsSocket.once('error', fail);
+      tlsSocket.once('secureConnect', () => {
+        mediaReq = https.request(targetUrl, { method, headers, agent: false, createConnection: () => tlsSocket });
+        mediaReq.on('error', fail);
+        mediaReq.on('response', (mediaRes) => {
+          if (settled) { mediaRes.destroy(); return; }
+          settled = true;
+          if (signal) signal.removeEventListener('abort', onAbort);
+          resolve({
+            mediaRes,
+            cleanup: () => {
+              try { mediaReq.destroy(); } catch {}
+              try { tlsSocket.destroy(); } catch {}
+            },
+          });
+        });
+        if (body != null) mediaReq.write(body);
+        mediaReq.end();
+      });
+    });
+    connectReq.end();
+  });
+}
+
+const PROXIED_RESPONSE_MAX_BYTES = 25 * 1024 * 1024;
+
+async function fetchViaProxy(proxy, targetUrl, { method, headers, body, signal, timeoutMs }) {
+  const { mediaRes, cleanup } = await requestViaProxy(proxy, targetUrl, { method, headers, body, signal, timeoutMs });
+  try {
+    const chunks = [];
+    let total = 0;
+    const buffered = await new Promise((resolve, reject) => {
+      mediaRes.on('data', (chunk) => {
+        total += chunk.length;
+        if (total > PROXIED_RESPONSE_MAX_BYTES) {
+          mediaRes.destroy();
+          reject(new Error('La respuesta del proveedor excedio el tamano maximo.'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      mediaRes.on('end', resolve);
+      mediaRes.on('error', reject);
+    });
+    const flatHeaders = {};
+    for (const [name, value] of Object.entries(mediaRes.headers)) {
+      flatHeaders[name] = Array.isArray(value) ? value.join(', ') : String(value);
+    }
+    return new Response(Buffer.concat(chunks), {
+      status: mediaRes.statusCode,
+      statusText: mediaRes.statusMessage || '',
+      headers: flatHeaders,
+    });
+  } finally {
+    cleanup();
+  }
+}
+
 function makeStableFetch() {
   return async (input, init = {}) => {
     let requestUrl;
@@ -683,6 +813,28 @@ function makeStableFetch() {
       outer.addEventListener('abort', () => controller.abort(outer.reason), { once: true });
     }
     try {
+      const proxy = getDlProxy();
+      if (proxy) {
+        // Con DL_PROXY_URL configurada, TODO el trafico del player sale por el
+        // proxy: asi la URL firmada de googlevideo queda amarrada a la IP del
+        // proxy, la misma IP por la que descarga probeMedia/streamMedia.
+        const method = (init.method || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase();
+        const headers = headersToPlainObject(init.headers || (input instanceof Request ? input.headers : undefined));
+        let body = init.body != null ? init.body : null;
+        if (body == null && input instanceof Request && input.method !== 'GET' && input.body != null) {
+          try { body = Buffer.from(await input.arrayBuffer()); } catch {}
+        }
+        if (body != null && typeof body !== 'string' && !Buffer.isBuffer(body) && typeof body.arrayBuffer === 'function') {
+          try { body = Buffer.from(await body.arrayBuffer()); } catch {}
+        }
+        return await fetchViaProxy(proxy, requestUrl.href, {
+          method,
+          headers,
+          body,
+          signal: controller.signal,
+          timeoutMs: 20000,
+        });
+      }
       return await fetch(input, { ...init, signal: controller.signal });
     } finally {
       clearTimeout(timer);
