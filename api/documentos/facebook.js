@@ -62,16 +62,38 @@ function idsDesdeUrl(url) {
   return [...ids];
 }
 
+// Probe de video. Si el CDN responde HTML, extrae la URL de redireccion
+// (el lookaside de Facebook a veces manda un HTML con location.href hacia la
+// pagina canonica del video en vez del archivo). Devuelve {ok, redirect}.
 async function probeEsVideo(url, parentSignal) {
   try {
     const senal = parentSignal ? AbortSignal.any([parentSignal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000);
     const r = await fetch(url, { headers: { 'User-Agent': BOT_UA, Range: 'bytes=0-99' }, redirect: 'follow', signal: senal });
     const tipo = String(r.headers.get('content-type') || '');
-    try { await r.body?.cancel(); } catch {}
-    return (r.status === 200 || r.status === 206) && (tipo.includes('video') || tipo.includes('octet-stream'));
+    if ((r.status === 200 || r.status === 206) && (tipo.includes('video') || tipo.includes('octet-stream'))) {
+      try { await r.body?.cancel(); } catch {}
+      return { ok: true, redirect: null };
+    }
+    let redirect = null;
+    if (tipo.includes('text/html')) {
+      const html = await r.text().catch(() => '');
+      const crudo = (html.match(/location\.href\s*=\s*"([^"]+)"/) || [])[1]
+        || (html.match(/http-equiv="refresh"[^>]*content="[^"]*url=([^"]+)"/) || [])[1]
+        || null;
+      if (crudo) redirect = decodificarEntidades(crudo.replace(/\\\//g, '/'));
+    } else {
+      try { await r.body?.cancel(); } catch {}
+    }
+    return { ok: false, redirect };
   } catch {
-    return false;
+    return { ok: false, redirect: null };
   }
+}
+
+// Headers para descargar el archivo del CDN: debe ser el MISMO User-Agent de
+// crawler que uso el scraping y el probe, si no el CDN responde HTML o 403.
+function headersDeDescarga() {
+  return { 'User-Agent': BOT_UA };
 }
 
 async function fetchFacebookVideo(inputUrl, parentSignal) {
@@ -109,18 +131,54 @@ async function fetchFacebookVideo(inputUrl, parentSignal) {
     }
   }
 
-  for (const pagina of paginas) {
+  const titulo = paginas.map((p) => extraerTitulo(p.texto)).find(Boolean) || 'video de Facebook';
+
+  // Reunir TODAS las URLs de video expuestas, en orden de calidad (las claves
+  // van de HD a SD), para que el llamador pueda iterar con su propio probe si
+  // alguna responde HTML o falla.
+  const vistas = new Set();
+  const candidatos = [];
+  const clavesPorUrl = new Map();
+  const extraerDe = (texto) => {
     for (const clave of CLAVES_URL_VIDEO) {
-      const urlVideo = extraerValorJson(pagina.texto, clave);
-      if (!urlVideo || !/^https?:\/\//.test(urlVideo)) continue;
-      if (await probeEsVideo(urlVideo, parentSignal)) {
-        return {
-          ok: true,
-          tipo: 'video',
-          titulo: extraerTitulo(pagina.texto) || 'video de Facebook',
-          descarga_directa: urlVideo,
-          calidad: /hd/i.test(clave) ? 'hd' : 'sd',
-        };
+      const urlVideo = extraerValorJson(texto, clave);
+      if (!urlVideo || !/^https?:\/\//.test(urlVideo) || vistas.has(urlVideo)) continue;
+      vistas.add(urlVideo);
+      candidatos.push(urlVideo);
+      clavesPorUrl.set(urlVideo, clave);
+    }
+  };
+  for (const pagina of paginas) extraerDe(pagina.texto);
+
+  // Probe de cada candidato. Si el lookaside responde con su HTML de
+  // redireccion, scrapear la pagina canonica a la que apunta (suele exponer
+  // browser_native_*_url de video.xx.fbcdn.net) y agregar sus URLs.
+  const paginasVisitadas = new Set(paginas.map((p) => p.url));
+  let paginasExtra = 0;
+  for (let i = 0; i < candidatos.length && i < 12; i += 1) {
+    const urlVideo = candidatos[i];
+    const probe = await probeEsVideo(urlVideo, parentSignal);
+    if (probe.ok) {
+      return {
+        ok: true,
+        tipo: 'video',
+        titulo,
+        descarga_directa: urlVideo,
+        calidad: /hd|quality_hd/i.test(clavesPorUrl.get(urlVideo) || '') ? 'hd' : 'sd',
+        candidatos,
+      };
+    }
+    if (probe.redirect && paginasExtra < 2 && !paginasVisitadas.has(probe.redirect)) {
+      try {
+        const r = await pedirTexto(probe.redirect, parentSignal, 12000);
+        paginasVisitadas.add(probe.redirect);
+        if (r.ok) {
+          paginasVisitadas.add(r.urlFinal);
+          paginasExtra += 1;
+          extraerDe(r.texto);
+        }
+      } catch (error) {
+        if (parentSignal?.aborted) throw error;
       }
     }
   }
@@ -128,4 +186,4 @@ async function fetchFacebookVideo(inputUrl, parentSignal) {
   throw secureApi.apiError(404, 'No se pudo extraer el video de Facebook: el enlace no es publico, no contiene video, o Facebook no expuso el archivo a crawlers.');
 }
 
-module.exports = { fetchFacebookVideo };
+module.exports = { fetchFacebookVideo, headersDeDescarga };

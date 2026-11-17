@@ -18,7 +18,7 @@ const VALID_LIMIT=/^\d+$/;
 const LIMIT_MIN=1;
 const LIMIT_MAX=20;
 const BROWSER_UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-const DL_KINDS=['audio','video','tiktok','x'];
+const DL_KINDS=['audio','video','tiktok','x','instagram','facebook'];
 // Cache de la resolucion del player de YouTube para /dl: los enlaces de
 // googlevideo duran ~6h; guardarlos 30 min evita re-resolver en cada pedido.
 const dlMediaCache=new Map();
@@ -83,7 +83,7 @@ if(options.referer)fetchHeaders.Referer=options.referer;
 if(options.headers)Object.assign(fetchHeaders,options.headers);
 const range=req.headers&&typeof req.headers.range==='string'&&req.headers.range.length<200?req.headers.range:'';
 if(range)fetchHeaders.Range=range;
-const ipBlocked=()=>sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:IP_BLOCKED_MESSAGE});
+const ipBlocked=()=>sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:options.mensajeBloqueo||IP_BLOCKED_MESSAGE});
 const applyMediaHeaders=(status,contentType,extra={})=>{
 res.statusCode=status;
 res.setHeader('Content-Type',contentType||'application/octet-stream');
@@ -93,8 +93,8 @@ if(extra.contentRange)res.setHeader('Content-Range',extra.contentRange);
 if(options.filename)res.setHeader('Content-Disposition','attachment; filename="'+String(options.filename).replace(/[^a-zA-Z0-9._-]/g,'_')+'"');
 };
 const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
-const proxy=proxyRaw?parseDlProxy(proxyRaw):null;
-if(proxyRaw&&!proxy){
+const proxy=options.sinProxy?null:(proxyRaw?parseDlProxy(proxyRaw):null);
+if(proxyRaw&&!proxy&&!options.sinProxy){
 return sendJson(500,{ok:false,error:'PROXY_INVALIDO',message:'DL_PROXY_URL no es una URL de proxy valida. Formato esperado: http://usuario:pass@host:puerto'});
 }
 if(proxy){
@@ -232,6 +232,13 @@ upstream=await fetch(mediaUrl,{headers:fetchHeaders,redirect:'follow'});
 }catch(e){
 return sendJson(502,{ok:false,message:'No se pudo conectar con el servidor de medios.',error:String(e&&e.message||e).slice(0,140)});
 }
+if(options.exigirVideo){
+const tipo=String(upstream.headers.get('content-type')||'');
+if(!tipo.includes('video')&&!tipo.includes('octet-stream')){
+try{await upstream.body?.cancel();}catch(e){}
+return sendJson(404,{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'El servidor de medios respondio HTML en vez de video (ventana temporal de la plataforma). Reintenta en unos segundos.'});
+}
+}
 if(upstream.status===403){
 try{await upstream.body?.cancel();}catch(e){}
 return ipBlocked();
@@ -260,10 +267,10 @@ try{res.destroy();}catch(e2){}
 }
 }
 
-async function probeMedia(mediaUrl,headers){
+async function probeMedia(mediaUrl,headers,options={}){
 const probeHeaders={...headers,Range:'bytes=0-0'};
 const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
-const proxy=proxyRaw?parseDlProxy(proxyRaw):null;
+const proxy=options.sinProxy?null:(proxyRaw?parseDlProxy(proxyRaw):null);
 if(proxy){
 // googlevideo suele responder 302: hay que seguir el redirect dentro del
 // mismo tunel, igual que hace streamMedia, para no descartar URLs validas.
@@ -291,6 +298,20 @@ return r.status;
 }catch(e){return 0;}
 }
 
+// Probe directo (sin proxy) que ademas valida el content-type: los CDN de Meta
+// a veces responden HTML (muro de login / lookaside) con status 200; transmitir
+// eso al cliente seria entregar basura. OJO: el lookaside de Facebook responde
+// HTML con Range bytes=0-0 pero video/mp4 con bytes=0-99, por eso 0-99.
+// Devuelve {ok,status,tipo}.
+async function probeMediaTipo(mediaUrl,headers){
+try{
+const r=await fetch(mediaUrl,{...headers,Range:'bytes=0-99',redirect:'follow',signal:AbortSignal.timeout(10000)});
+const tipo=String(r.headers.get('content-type')||'');
+try{await r.body?.cancel();}catch(e){}
+return {ok:(r.status===200||r.status===206)&&(tipo.includes('video')||tipo.includes('octet-stream')),status:r.status,tipo};
+}catch(e){return {ok:false,status:0,tipo:''};}
+}
+
 module.exports=async function handler(req,res){
 const requestId=randomUUID();
 const sendJson=(status,payload)=>{
@@ -314,7 +335,7 @@ if(!pathname)pathname='/';
 if(pathname==='/favicon.ico')return res.end();
 if(pathname==='/'||pathname===''||pathname==='/docs'){
 res.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});
-return res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ZETA-CORE API</title><style>*{box-sizing:border-box}body{background:#0a0e14;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:16px}.card{background:#12161f;border:1px solid #232936;border-radius:20px;padding:32px;max-width:640px;width:100%}h1{margin:0 0 4px;font-size:26px}h1 span{color:#6366f1}p.sub{margin:0 0 18px;color:#8b93a7;font-size:14px}label{display:block;font-size:12px;color:#8b93a7;margin:12px 0 4px;text-transform:uppercase;letter-spacing:1px}input,select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #232936;background:#0d1117;color:#fff;font-size:14px}button{background:#6366f1;border:none;font-weight:700;cursor:pointer;margin-top:16px}button:disabled{opacity:.6;cursor:wait}pre{color:#9cdcfe;text-align:left;white-space:pre-wrap;word-break:break-all;max-height:420px;overflow:auto;background:#0d1117;padding:12px;border-radius:10px;margin:16px 0 0;font-size:12px}.status{margin-top:10px;font-size:13px;min-height:18px}.ok{color:#4ade80}.err{color:#f87171}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:#8b93a7;margin-top:16px}.grid code{color:#9cdcfe}</style></head><body><div class="card"><h1>ZETA<span>-CORE</span> API</h1><p class="sub">Scraper puro: YouTube, TikTok y X/Twitter. Sin APIs internas.</p><label>Endpoint</label><select id="t"><option value="/ytmp4">Video MP4 (/ytmp4)</option><option value="/ytmp3">Audio MP3 (/ytmp3)</option><option value="/ytsearch">Buscar en YouTube (/ytsearch)</option><option value="/tiktok">Video de TikTok (/tiktok)</option><option value="/ttsearch">Buscar en TikTok (/ttsearch)</option><option value="/xvideo">Video de X/Twitter (/xvideo)</option><option value="/instagram">Video de Instagram (/instagram)</option><option value="/facebook">Video de Facebook (/facebook)</option><option value="/dl">Descarga directa (/dl)</option></select><label id="ql">Consulta o enlace</label><input id="q" placeholder="Texto de busqueda o enlace del video"><label id="kl" style="display:none">Tipo (/dl)</label><select id="kd" style="display:none"><option value="video">Video de YouTube</option><option value="audio">Audio de YouTube</option><option value="tiktok">TikTok</option><option value="x">X/Twitter</option></select><label id="qll">Calidad (solo YouTube)</label><select id="qt"><option value="best">best</option><option value="360p">360p</option><option value="480p">480p</option><option value="720p" selected>720p</option><option value="1080p">1080p</option></select><label id="liml">Limite (solo busquedas)</label><input id="lim" type="number" min="1" max="20" value="5"><button class="btn" id="go" onclick="test()">Probar API</button><div class="status" id="st"></div><pre id="out">Esperando peticion...</pre><div class="grid"><span>GET <code>/ytmp3?query=</code></span><span>GET <code>/ytmp4?query=&quality=</code></span><span>GET <code>/ytsearch?query=&limit=</code></span><span>GET <code>/tiktok?query=</code></span><span>GET <code>/ttsearch?query=&limit=</code></span><span>GET <code>/xvideo?query=</code></span><span>GET <code>/instagram?query=</code></span><span>GET <code>/facebook?query=</code></span><span>GET <code>/dl?query=&kind=&key=</code></span><span>GET <code>/status</code></span></div></div><script>const $=id=>document.getElementById(id);const isSearch=()=>['/ytsearch','/ttsearch'].includes($('t').value);const isYt=()=>['/ytmp3','/ytmp4','/ytsearch'].includes($('t').value)||($('t').value==='/dl'&&['video','audio'].includes($('kd').value));const isUrlOnly=()=>['/tiktok','/xvideo','/instagram','/facebook'].includes($('t').value);const isDl=()=>$('t').value==='/dl';function sync(){$('kl').style.display=isDl()?'':'none';$('kd').style.display=isDl()?'':'none';$('qt').style.display=isYt()?'':'none';$('qll').style.display=isYt()?'':'none';$('lim').style.display=isSearch()?'':'none';$('liml').style.display=isSearch()?'':'none';$('q').placeholder=isUrlOnly()?'https://... enlace del video':isSearch()?'Texto a buscar':'Texto o enlace de YouTube'}async function test(){const t=$('t').value,q=$('q').value.trim();if(!q){$('st').className='status err';$('st').textContent='Escribe una consulta o enlace.';return}let url=t+'?query='+encodeURIComponent(q);if(isDl())url+='&kind='+encodeURIComponent($('kd').value);if(isYt()&&!isDl())url+='&quality='+encodeURIComponent($('qt').value);if(isYt()&&isDl()&&['video','audio'].includes($('kd').value))url+='&quality='+encodeURIComponent($('qt').value);if(isSearch())url+='&limit='+encodeURIComponent($('lim').value||'5');$('go').disabled=true;$('st').className='status';$('st').textContent='Procesando...';$('out').textContent='Procesando '+q+'...';try{const r=await fetch(url);const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')){const j=await r.json();$('out').textContent=JSON.stringify(j,null,2)}else{$('out').textContent='Respuesta binaria: '+ct+' ('+r.status+')'}$('st').className='status '+(r.ok?'ok':'err');$('st').textContent='HTTP '+r.status}catch(e){$('st').className='status err';$('st').textContent='Error: '+e}$('go').disabled=false}['t','qt','lim','kd'].forEach(id=>$(id).addEventListener('change',sync));sync();</script></body></html>`);
+return res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ZETA-CORE API</title><style>*{box-sizing:border-box}body{background:#0a0e14;color:#fff;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;padding:16px}.card{background:#12161f;border:1px solid #232936;border-radius:20px;padding:32px;max-width:640px;width:100%}h1{margin:0 0 4px;font-size:26px}h1 span{color:#6366f1}p.sub{margin:0 0 18px;color:#8b93a7;font-size:14px}label{display:block;font-size:12px;color:#8b93a7;margin:12px 0 4px;text-transform:uppercase;letter-spacing:1px}input,select,button{width:100%;padding:12px;border-radius:10px;border:1px solid #232936;background:#0d1117;color:#fff;font-size:14px}button{background:#6366f1;border:none;font-weight:700;cursor:pointer;margin-top:16px}button:disabled{opacity:.6;cursor:wait}pre{color:#9cdcfe;text-align:left;white-space:pre-wrap;word-break:break-all;max-height:420px;overflow:auto;background:#0d1117;padding:12px;border-radius:10px;margin:16px 0 0;font-size:12px}.status{margin-top:10px;font-size:13px;min-height:18px}.ok{color:#4ade80}.err{color:#f87171}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:#8b93a7;margin-top:16px}.grid code{color:#9cdcfe}</style></head><body><div class="card"><h1>ZETA<span>-CORE</span> API</h1><p class="sub">Scraper puro: YouTube, TikTok y X/Twitter. Sin APIs internas.</p><label>Endpoint</label><select id="t"><option value="/ytmp4">Video MP4 (/ytmp4)</option><option value="/ytmp3">Audio MP3 (/ytmp3)</option><option value="/ytsearch">Buscar en YouTube (/ytsearch)</option><option value="/tiktok">Video de TikTok (/tiktok)</option><option value="/ttsearch">Buscar en TikTok (/ttsearch)</option><option value="/xvideo">Video de X/Twitter (/xvideo)</option><option value="/instagram">Video de Instagram (/instagram)</option><option value="/facebook">Video de Facebook (/facebook)</option><option value="/dl">Descarga directa (/dl)</option></select><label id="ql">Consulta o enlace</label><input id="q" placeholder="Texto de busqueda o enlace del video"><label id="kl" style="display:none">Tipo (/dl)</label><select id="kd" style="display:none"><option value="video">Video de YouTube</option><option value="audio">Audio de YouTube</option><option value="tiktok">TikTok</option><option value="x">X/Twitter</option><option value="instagram">Instagram</option><option value="facebook">Facebook</option></select><label id="qll">Calidad (solo YouTube)</label><select id="qt"><option value="best">best</option><option value="360p">360p</option><option value="480p">480p</option><option value="720p" selected>720p</option><option value="1080p">1080p</option></select><label id="liml">Limite (solo busquedas)</label><input id="lim" type="number" min="1" max="20" value="5"><button class="btn" id="go" onclick="test()">Probar API</button><div class="status" id="st"></div><pre id="out">Esperando peticion...</pre><div class="grid"><span>GET <code>/ytmp3?query=</code></span><span>GET <code>/ytmp4?query=&quality=</code></span><span>GET <code>/ytsearch?query=&limit=</code></span><span>GET <code>/tiktok?query=</code></span><span>GET <code>/ttsearch?query=&limit=</code></span><span>GET <code>/xvideo?query=</code></span><span>GET <code>/instagram?query=</code></span><span>GET <code>/facebook?query=</code></span><span>GET <code>/dl?query=&kind=&key=</code></span><span>GET <code>/status</code></span></div></div><script>const $=id=>document.getElementById(id);const isSearch=()=>['/ytsearch','/ttsearch'].includes($('t').value);const isYt=()=>['/ytmp3','/ytmp4','/ytsearch'].includes($('t').value)||($('t').value==='/dl'&&['video','audio'].includes($('kd').value));const isUrlOnly=()=>['/tiktok','/xvideo','/instagram','/facebook'].includes($('t').value);const isDl=()=>$('t').value==='/dl';function sync(){$('kl').style.display=isDl()?'':'none';$('kd').style.display=isDl()?'':'none';$('qt').style.display=isYt()?'':'none';$('qll').style.display=isYt()?'':'none';$('lim').style.display=isSearch()?'':'none';$('liml').style.display=isSearch()?'':'none';$('q').placeholder=isUrlOnly()?'https://... enlace del video':isSearch()?'Texto a buscar':'Texto o enlace de YouTube'}async function test(){const t=$('t').value,q=$('q').value.trim();if(!q){$('st').className='status err';$('st').textContent='Escribe una consulta o enlace.';return}let url=t+'?query='+encodeURIComponent(q);if(isDl())url+='&kind='+encodeURIComponent($('kd').value);if(isYt()&&!isDl())url+='&quality='+encodeURIComponent($('qt').value);if(isYt()&&isDl()&&['video','audio'].includes($('kd').value))url+='&quality='+encodeURIComponent($('qt').value);if(isSearch())url+='&limit='+encodeURIComponent($('lim').value||'5');$('go').disabled=true;$('st').className='status';$('st').textContent='Procesando...';$('out').textContent='Procesando '+q+'...';try{const r=await fetch(url);const ct=r.headers.get('content-type')||'';if(ct.includes('application/json')){const j=await r.json();$('out').textContent=JSON.stringify(j,null,2)}else{$('out').textContent='Respuesta binaria: '+ct+' ('+r.status+')'}$('st').className='status '+(r.ok?'ok':'err');$('st').textContent='HTTP '+r.status}catch(e){$('st').className='status err';$('st').textContent='Error: '+e}$('go').disabled=false}['t','qt','lim','kd'].forEach(id=>$(id).addEventListener('change',sync));sync();</script></body></html>`);
 }
 // Diagnostico de carga de modulos: si secure-api no cargo, las rutas que lo
 // usan devuelven el error real en JSON en lugar de un 500 opaco de Vercel.
@@ -347,7 +368,7 @@ return sendJson(401,{ok:false,message:'Clave invalida o ausente. Pasa ?key= o el
 }
 const kind=(parsedUrl.searchParams.get('kind')||'video').toLowerCase();
 if(!DL_KINDS.includes(kind)){
-return sendJson(400,{ok:false,message:'Parametro kind invalido. Usa audio, video, tiktok o x.'});
+return sendJson(400,{ok:false,message:'Parametro kind invalido. Usa audio, video, tiktok, x, instagram o facebook.'});
 }
 if(kind==='tiktok'||kind==='x'){
 const {extractTikTokVideo}=require('./documentos/tiktok');
@@ -389,6 +410,53 @@ reScrapeado=true;
 }else break;
 }
 return sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:'Ningun cliente pudo descargar desde este hosting.'});
+}
+// kind instagram|facebook: resuelve el media con el MISMO scraping de los
+// endpoints /instagram y /facebook y streamea con el pipeline de rangos
+// paralelos. Sin proxy: los CDN de Meta amarran la URL a la IP que la pidio
+// (la de Vercel en el scraping de esta misma invocacion), asi que la descarga
+// debe salir por la misma ruta directa.
+if(kind==='instagram'||kind==='facebook'){
+const {fetchInstagramVideo,headersDePeticion}=require('./documentos/instagram');
+const {fetchFacebookVideo,headersDeDescarga}=require('./documentos/facebook');
+const referer=kind==='instagram'?'https://www.instagram.com/':'https://www.facebook.com/';
+const scrapeHeaders=kind==='instagram'?headersDePeticion():headersDeDescarga();
+// Para descargar hay que usar el MISMO User-Agent (y cookie, si hay) del
+// scraping: los CDN de Meta amarran la respuesta a como fue pedida y con otro
+// UA devuelven HTML o 403.
+const resolver=()=>kind==='instagram'?fetchInstagramVideo(query):fetchFacebookVideo(query);
+let ultimoError=null;
+// Dos rondas: si los candidatos no pasan el probe (el lookaside de Facebook
+// alterna entre servir el video y un HTML de redirect), re-scrapear una vez
+// antes de fallar; la segunda vuelta suele exponer URLs de video.xx.fbcdn.net.
+for(let ronda=0;ronda<2;ronda+=1){
+if(ronda>0)await new Promise(r=>setTimeout(r,1500));
+let data;
+try{
+data=await resolver();
+}catch(e){
+ultimoError=e;
+break;
+}
+if(!data||data.tipo!=='video'||!data.descarga_directa){
+return sendJson(404,{ok:false,error:'SIN_VIDEO',message:'El post no contiene un video descargable (es una imagen, es privado o la plataforma no expuso el archivo).'});
+}
+const candidatos=[data.descarga_directa,...(Array.isArray(data.candidatos)?data.candidatos:[])]
+.filter((u,i,a)=>typeof u==='string'&&/^https?:\/\//.test(u)&&a.indexOf(u)===i);
+for(const mediaUrl of candidatos){
+// Mismos headers exactos que los probes internos del scraping (sin Referer
+// extra): cualquier diferencia entre el probe y la descarga es una chance de
+// que el CDN de Meta cambie la respuesta.
+const probe=await probeMediaTipo(mediaUrl,scrapeHeaders);
+if(probe.ok){
+return streamMedia(req,res,sendJson,requestId,mediaUrl,{sinProxy:true,headers:scrapeHeaders,exigirVideo:true,mensajeBloqueo:'El CDN de '+(kind==='instagram'?'Instagram':'Facebook')+' rechazo la descarga desde este hosting (HTTP 403).'});
+}
+}
+}
+if(ultimoError){
+return sendJson(404,{ok:false,error:'SIN_MEDIA',message:String(ultimoError&&ultimoError.message||ultimoError).slice(0,200)});
+}
+return sendJson(404,{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'La plataforma expuso el video pero el archivo no responde como video descargable desde este hosting (puede requerir sesion iniciada).'});
 }
 // kind audio|video -> YouTube: prueba de 1 KB por candidato; solo transmite
 // cuando la prueba responde 200/206. Orden: web (con cookies), web (sin

@@ -58,6 +58,7 @@ test('elige formatos directos válidos de YouTube según calidad y tipo', async 
     url: formats[2].url,
     quality: 'audio-128kbps',
     bitrate: 128000,
+    esAudioPuro: true,
   });
   await assert.rejects(() => secureApi.selectYoutubeMediaFormat([], 'audio', '720p'), {
     statusCode: 502,
@@ -80,6 +81,7 @@ test('descifra formatos con signature_cipher usando el reproductor', async () =>
     url: 'https://rr2.googlevideo.com/videoplayback?itag=140&sig=ok',
     quality: 'audio-128kbps',
     bitrate: 128000,
+    esAudioPuro: true,
   });
 
   await assert.rejects(() => secureApi.selectYoutubeMediaFormat(formats, 'audio', '720p'), {
