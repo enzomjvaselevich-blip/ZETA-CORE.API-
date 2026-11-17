@@ -593,7 +593,9 @@ if(!media||!media.url){
 if(errorCapa1){
 errorCapa1.reintentar=true;
 if(errorCapa1.code==='REQUEST_TIMEOUT'||errorCapa1.statusCode===504){
-errorCapa1=secureApi.apiError(502,'YouTube no respondio a tiempo. Reintentar suele funcionar (Vercel rota la IP de salida).',{code:'YOUTUBE_TIMEOUT'});
+const reemplazo=secureApi.apiError(502,'YouTube no respondio a tiempo. Reintentar suele funcionar (Vercel rota la IP de salida).',{code:'YOUTUBE_TIMEOUT'});
+reemplazo.reintentar=true;
+errorCapa1=reemplazo;
 }
 }
 throw errorCapa1||secureApi.apiError(502,'No se pudo obtener el enlace de descarga desde este hosting: reintentar suele funcionar (Vercel rota la IP de salida).',{code:'IP_BLOQUEADA'});
