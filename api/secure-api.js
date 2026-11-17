@@ -886,7 +886,7 @@ async function fetchTikTokVideo(initialUrl, parentSignal) {
         timeoutMs: 4500,
       }));
     } catch (error) {
-      if (error.statusCode === 400 || error.statusCode === 504) throw error;
+      if (error.statusCode) throw error;
       lastError = error;
       continue;
     }
@@ -918,25 +918,27 @@ async function fetchTikTokVideo(initialUrl, parentSignal) {
           wm: download,
           mp3: videoData.music?.playUrl || '',
         },
-      author: {
-        username: videoData.author?.uniqueId || '',
-        nickname: videoData.author?.nickname || '',
-        avatar: videoData.author?.avatarLarger || '',
+        author: {
+          username: videoData.author?.uniqueId || '',
+          nickname: videoData.author?.nickname || '',
+          avatar: videoData.author?.avatarLarger || '',
+        },
+        music: {
+          title: videoData.music?.title || '',
+          author: videoData.music?.authorName || '',
+          cover: videoData.music?.coverLarge || '',
+        },
+        stats: {
+          views: Number(videoData.stats?.playCount) || 0,
+          likes: Number(videoData.stats?.diggCount) || 0,
+          comments: Number(videoData.stats?.commentCount) || 0,
+          shares: Number(videoData.stats?.shareCount) || 0,
+          downloads: Number(videoData.stats?.downloadCount) || 0,
+        },
       },
-      music: {
-        title: videoData.music?.title || '',
-        author: videoData.music?.authorName || '',
-        cover: videoData.music?.coverLarge || '',
-      },
-      stats: {
-        views: Number(videoData.stats?.playCount) || 0,
-        likes: Number(videoData.stats?.diggCount) || 0,
-        comments: Number(videoData.stats?.commentCount) || 0,
-        shares: Number(videoData.stats?.shareCount) || 0,
-        downloads: Number(videoData.stats?.downloadCount) || 0,
-      },
-    },
-  };
+    };
+  }
+  throw lastError || apiError(502, 'TikTok no devolvió metadatos de video reconocibles.');
 }
 
 // Tweet-video extraction lives in `api/documentos/xvideo.js`. It reuses
