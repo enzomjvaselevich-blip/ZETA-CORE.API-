@@ -125,7 +125,28 @@ if(!upstream.ok&&upstream.status!==206){
 try{await upstream.body?.cancel();}catch(e){}
 return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+upstream.status+').'});
 }
-applyMediaHeaders(upstream.status,upstream.headers.get('content-type'),{acceptRanges:upstream.headers.get('accept-ranges'),contentLength:upstream.headers.get('content-length'),contentRange:upstream.headers.get('content-range')});
+const tipoUpstream=upstream.headers.get('content-type');
+const cr=upstream.headers.get('content-range')||'';
+const tamanioTotal=Number(String(cr).split('/')[1])||Number(upstream.headers.get('content-length'))||0;
+const aceptaRangos=(upstream.headers.get('accept-ranges')||'').includes('bytes');
+applyMediaHeaders(upstream.status,tipoUpstream,{acceptRanges:upstream.headers.get('accept-ranges'),contentLength:upstream.headers.get('content-length'),contentRange:upstream.headers.get('content-range')});
+if(!range&&aceptaRangos&&tamanioTotal>3*1024*1024&&upstream.status===200){
+try{await upstream.body?.cancel();}catch(e){}
+console.log('[dl] stream por rangos paralelos ('+Math.round(tamanioTotal/1048576)+'MB)');
+try{
+await streamRangosParalelos(req,res,mediaUrl,fetchHeaders,tamanioTotal,tipoUpstream);
+return;
+}catch(eRangos){
+console.log('[dl] rangos paralelos fallo, fallback 1 stream:',(eRangos&&eRangos.message||eRangos).toString().slice(0,120));
+try{
+upstream=await fetch(mediaUrl,{headers:fetchHeaders,redirect:'follow'});
+if(upstream.status===403){try{await upstream.body?.cancel();}catch(e2){}return ipBlocked();}
+if(!upstream.ok&&upstream.status!==206){try{await upstream.body?.cancel();}catch(e2){}return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+upstream.status+').'});}
+}catch(e2){
+return sendJson(502,{ok:false,message:'No se pudo conectar con el servidor de medios.'});
+}
+}
+}
 try{
 if(upstream.body&&typeof upstream.body.getReader==='function'){
 const reader=upstream.body.getReader();
@@ -177,6 +198,66 @@ return {ok,status:respuesta.statusCode,tipo};
 }catch(e){return {ok:false,status:0,tipo:''};}
 }
 
+// Streaming por rangos paralelos (misma tecnica que usaba la era del proxy):
+// el streaming undo single-stream desde Vercel a googlevideo a veces cae a
+// ~250KB/s y muere a mitad por el maxDuration de 60s de la funcion. Con N
+// rangos en paralelo (ventana de 3 in-flight, escritura en orden, sin buffer
+// completo en memoria) el archivo entero llega dentro del limite.
+async function streamRangosParalelos(req,res,mediaUrl,fetchHeaders,total,tipo){
+const N=Math.min(16,Math.max(4,Math.ceil(total/(8*1024*1024))));
+const tamanio=Math.ceil(total/N);
+const enVuelo=new Map();
+let fallo=null;
+const pedirStream=async(i)=>{
+const cab={...fetchHeaders,Range:'bytes='+(i*tamanio)+'-'+(Math.min(total-1,(i+1)*tamanio-1))};
+for(let intento=1;intento<=2;intento+=1){
+try{
+const r=await fetch(mediaUrl,{headers:cab,redirect:'follow'});
+if((r.status===200||r.status===206)&&r.body)return r;
+try{await r.body?.cancel();}catch(e){}
+throw new Error('HTTP '+r.status);
+}catch(e){
+if(intento===2)throw e;
+await new Promise((x)=>setTimeout(x,400));
+}
+}
+};
+const lanzar=(i)=>{enVuelo.set(i,pedirStream(i).catch((e)=>{fallo=fallo||e;throw e;}));};
+res.on('close',()=>{for(const[,p]of enVuelo){p.then((r)=>{try{r.body?.cancel();}catch(e){}}).catch(()=>{});}});
+const drain=()=>new Promise((ok)=>res.once('drain',ok));
+try{
+let primer=null;
+for(let i=0;i<N;i+=1){
+if(fallo)throw fallo;
+if(!enVuelo.has(i)){lanzar(i);if(enVuelo.size>=3)break;}
+}
+for(let i=0;i<N;i+=1){
+if(fallo)throw fallo;
+if(!enVuelo.has(i))lanzar(i);
+const r=await enVuelo.get(i);
+enVuelo.delete(i);
+if(i===0){
+primer=r;
+res.statusCode=200;
+res.setHeader('Content-Type',tipo||'application/octet-stream');
+res.setHeader('Content-Length',String(total));
+res.setHeader('Accept-Ranges','bytes');
+}else{
+for(let j=i+1;j<N&&enVuelo.size<3;j+=1){if(!enVuelo.has(j))lanzar(j);}
+}
+const reader=r.body.getReader();
+for(;;){
+const c=await reader.read();
+if(c.done)break;
+if(!res.write(Buffer.from(c.value)))await drain();
+}
+}
+res.end();
+}catch(e){
+for(const[,p]of enVuelo){p.then((r)=>{try{r.body?.cancel();}catch(e2){}}).catch(()=>{});}
+try{res.destroy();}catch(e2){}
+}
+}
 module.exports=async function handler(req,res){
 const requestId=randomUUID();
 const sendJson=(status,payload)=>{
