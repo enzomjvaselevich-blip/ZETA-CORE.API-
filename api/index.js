@@ -33,83 +33,8 @@ const dlMediaCache=new Map();
 // Memoria del cliente que paso el probe por videoId|kind (TTL 6h): la proxima
 // resolucion prueba ESE cliente primero en vez de arrancar del candidato 1.
 const dlClienteCache=new Map();
-// Relay del usuario (IP residencial de su casa): resuelve y streamea YouTube
-// desde ahi, donde googlevideo no bloquea. Salud cacheada 60s.
-const RELAY_URL=(()=>{const u=String(process.env.RELAY_URL||process.env.relay_url||'').trim().replace(/\/+$/,'');return /^https?:\/\//.test(u)?u:'';})();
-const RELAY_KEY=String(process.env.RELAY_KEY||process.env.relay_key||'');
-const relaySalud={estado:null,checkedAt:0};
-async function relayEstado(){
-if(!RELAY_URL||!RELAY_KEY)return null;
-const ahora=Date.now();
-if(relaySalud.estado&&ahora-relaySalud.checkedAt<60000)return relaySalud.estado;
-try{
-const rta=await fetch(RELAY_URL+'/ping',{headers:{'x-relay-key':RELAY_KEY,'bypass-tunnel-reminder':'true'},signal:AbortSignal.timeout(4000)});
-relaySalud.estado=rta.ok?'OK':'CAIDO';
-}catch(e){relaySalud.estado='CAIDO';}
-relaySalud.checkedAt=Date.now();
-return relaySalud.estado;
-}
-function proxyDeStream(options){
-if(options.sinProxy)return null;
-if(options.proxy!==undefined&&options.proxy!==null)return options.proxy;
-if(secureApi&&typeof secureApi.listaProxies==='function'){
-const lista=secureApi.listaProxies();
-return lista[0]||null;
-}
-const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
-return proxyRaw?parseDlProxy(proxyRaw.split(',')[0].trim()):null;
-}
 const IP_BLOCKED_MESSAGE='El hosting (Vercel) está bloqueado por YouTube/TikTok para descargas. La descarga debe hacerse desde una IP residencial.';
 
-function parseDlProxy(raw){
-try{
-const u=new URL(raw);
-if(u.protocol!=='http:'||!u.hostname)return null;
-const auth=(u.username||u.password)?'Basic '+Buffer.from(decodeURIComponent(u.username)+':'+decodeURIComponent(u.password)).toString('base64'):null;
-return {host:u.hostname,port:Number(u.port)||80,auth};
-}catch(e){return null;}
-}
-
-function requestMediaViaProxy(proxy,targetUrl,headers){
-return new Promise((resolve,reject)=>{
-const target=new URL(targetUrl);
-if(target.protocol!=='https:')return reject(new Error('El proxy de salida solo soporta destinos https.'));
-const connectReq=http.request({
-host:proxy.host,
-port:proxy.port,
-method:'CONNECT',
-path:target.host+':443',
-headers:{Host:target.host+':443',...(proxy.auth?{'Proxy-Authorization':proxy.auth}:{})},
-timeout:15000,
-});
-connectReq.on('connect',(proxyRes,socket)=>{
-if(proxyRes.statusCode!==200){
-socket.destroy();
-return reject(new Error('El proxy rechazo la conexion (HTTP '+proxyRes.statusCode+').'));
-}
-const tlsSocket=tls.connect({socket,servername:target.hostname});
-tlsSocket.once('secureConnect',()=>{
-const mediaReq=https.request(targetUrl,{
-method:'GET',
-headers,
-agent:false,
-createConnection:()=>tlsSocket,
-},(mediaRes)=>resolve({mediaRes,cleanup:()=>{try{mediaReq.destroy();}catch(e){}try{tlsSocket.destroy();}catch(e){}}}));
-mediaReq.on('error',(e)=>{try{tlsSocket.destroy();}catch(e2){}reject(e);});
-mediaReq.end();
-});
-tlsSocket.once('error',(e)=>{try{socket.destroy();}catch(e2){}reject(e);});
-});
-connectReq.on('timeout',()=>connectReq.destroy(new Error('El proxy tardo demasiado en responder.')));
-connectReq.on('error',(e)=>reject(e));
-connectReq.end();
-});
-}
-
-// Pedido HTTPS directo con node:https y agent:false: conexion nueva por
-// pedido, sin el pool keep-alive de undici. Los CDN de Meta (lookaside de
-// Facebook) contestan con su HTML de redirect cuando el pedido reutiliza una
-// conexion donde la respuesta anterior se aborto.
 function pedirHttps(targetUrl,headers,timeoutMs=10000){
 return new Promise((resolve,reject)=>{
 const pedido=https.request(targetUrl,{method:'GET',headers,agent:false},(respuesta)=>resolve(respuesta));
@@ -142,140 +67,6 @@ if(extra.contentLength)res.setHeader('Content-Length',extra.contentLength);
 if(extra.contentRange)res.setHeader('Content-Range',extra.contentRange);
 if(options.filename)res.setHeader('Content-Disposition','attachment; filename="'+String(options.filename).replace(/[^a-zA-Z0-9._-]/g,'_')+'"');
 };
-const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
-const proxy=proxyDeStream(options);
-if(proxyRaw&&!proxy&&!options.sinProxy){
-return sendJson(500,{ok:false,error:'PROXY_INVALIDO',message:'DL_PROXY_URL no es una URL de proxy valida. Formato esperado: http://usuario:pass@host:puerto (se permiten varios separados por coma).'});
-}
-if(proxy){
-let destino=mediaUrl;
-let resultado=null;
-try{
-for(let salto=0;salto<4;salto+=1){
-resultado=await requestMediaViaProxy(proxy,destino,{...fetchHeaders,Range:range||'bytes=0-0'});
-const st=resultado.mediaRes.statusCode;
-const loc=resultado.mediaRes.headers.location;
-if([301,302,303,307,308].includes(st)&&loc){
-resultado.cleanup();
-destino=new URL(loc,destino).href;
-continue;
-}
-break;
-}
-}catch(e){
-return sendJson(502,{ok:false,message:'No se pudo descargar a traves del proxy de salida.',error:String(e&&e.message||e).slice(0,140)});
-}
-const up0=resultado.mediaRes;
-if(up0.statusCode===403){
-resultado.cleanup();
-return ipBlocked();
-}
-if(up0.statusCode!==200&&up0.statusCode!==206){
-const status=up0.statusCode;
-resultado.cleanup();
-return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+status+').'});
-}
-const totalCrudo=String(up0.headers['content-range']||'').match(/\/(\d+)\s*$/);
-const total=totalCrudo?Number(totalCrudo[1]):0;
-const porRangos=!range&&up0.statusCode===206&&total>1024*1024;
-try{resultado.cleanup();}catch(e){}
-if(porRangos){
-// Descarga por rangos en paralelo: 6-8 tramos pedidos a la vez por el proxy
-// (cada uno con su tunel CONNECT) y entregados al cliente EN ORDEN. Multiplica
-// el throughput del proxy sin cambiar el contrato: el cliente recibe un 200
-// con el archivo completo.
-const partes=total>8*1024*1024?8:6;
-const tam=Math.ceil(total/partes);
-const tramos=[];
-for(let i=0;i<partes;i+=1){
-const desde=i*tam;
-if(desde>total-1)break;
-tramos.push({desde,hasta:Math.min(total-1,desde+tam-1)});
-}
-const limpiezas=tramos.map(()=>null);
-const pedidos=tramos.map(({desde,hasta},i)=>new Promise((resolverParte)=>{
-let cerrado=false;
-const fin=(valor)=>{if(!cerrado){cerrado=true;clearTimeout(temporizador);resolverParte(valor);}};
-const temporizador=setTimeout(()=>fin(null),40000);
-let destinoParte=destino;
-(async()=>{
-try{
-for(let salto=0;salto<4;salto+=1){
-const parte=await requestMediaViaProxy(proxy,destinoParte,{...fetchHeaders,Range:'bytes='+desde+'-'+hasta});
-limpiezas[i]=parte.cleanup;
-const st=parte.mediaRes.statusCode;
-const loc=parte.mediaRes.headers.location;
-if([301,302,303,307,308].includes(st)&&loc&&salto<3){
-parte.cleanup();
-limpiezas[i]=null;
-destinoParte=new URL(loc,destinoParte).href;
-continue;
-}
-fin(parte);
-return;
-}
-fin(null);
-}catch(e){fin(null);}
-})();
-}));
-const parte0=await pedidos[0];
-if(!parte0||![200,206].includes(parte0.mediaRes.statusCode)){
-for(const limpieza of limpiezas)try{limpieza&&limpieza();}catch(e){}
-return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga por rangos.'});
-}
-applyMediaHeaders(200,parte0.mediaRes.headers['content-type'],{acceptRanges:'bytes',contentLength:total});
-res.on('close',()=>{for(const limpieza of limpiezas)try{limpieza&&limpieza();}catch(e){}});
-for(let i=0;i<pedidos.length;i+=1){
-const parte=i===0?parte0:await pedidos[i];
-if(!parte||![200,206].includes(parte.mediaRes.statusCode)){
-try{res.destroy();}catch(e){}
-return;
-}
-const up=parte.mediaRes;
-await new Promise((terminar,romper)=>{
-up.on('data',(chunk)=>{
-if(!res.write(chunk))up.pause();
-});
-res.on('drain',()=>up.resume());
-up.on('end',terminar);
-up.on('error',romper);
-res.on('close',terminar);
-});
-try{parte.cleanup();}catch(e){}
-limpiezas[i]=null;
-}
-res.end();
-return;
-}
-let up=up0;
-if(range||up0.statusCode===200){
-try{
-resultado.cleanup();
-resultado=await requestMediaViaProxy(proxy,destino,fetchHeaders);
-up=resultado.mediaRes;
-if(up.statusCode===403){
-resultado.cleanup();
-return ipBlocked();
-}
-if(up.statusCode!==200&&up.statusCode!==206){
-const status=up.statusCode;
-resultado.cleanup();
-return sendJson(502,{ok:false,message:'El servidor de medios rechazo la descarga (HTTP '+status+').'});
-}
-}catch(e){
-return sendJson(502,{ok:false,message:'No se pudo descargar a traves del proxy de salida.',error:String(e&&e.message||e).slice(0,140)});
-}
-}
-applyMediaHeaders(up.statusCode,up.headers['content-type'],{acceptRanges:up.headers['accept-ranges'],contentLength:up.headers['content-length'],contentRange:up.headers['content-range']});
-res.on('close',resultado.cleanup);
-up.on('data',(chunk)=>{
-if(!res.write(chunk))up.pause();
-});
-res.on('drain',()=>up.resume());
-up.on('end',()=>res.end());
-up.on('error',()=>{try{res.destroy();}catch(e){}});
-return;
-}
 if(options.exigirVideo){
 // Stream por node:https con agent:false: misma conexion fresca que el probe;
 // por undici (pool reutilizado) el lookaside de Facebook contesta HTML.
@@ -354,58 +145,8 @@ try{res.destroy();}catch(e2){}
 }
 }
 
-// Descarga a traves del relay del usuario (su IP de casa). El relay resuelve
-// el player y streamea el archivo; aca solo se le pasa videoId/kind. Devuelve
-// {ok,status}: si ok, la respuesta ya se le mando al cliente.
-function streamDesdeRelay(req,res,videoId,kind,cookie){
-return new Promise((resolve)=>{
-const destino=new URL(RELAY_URL+'/descarga?video='+encodeURIComponent(videoId)+'&kind='+kind);
-const mod=destino.protocol==='https:'?require('node:https'):require('node:http');
-const cabeceras={'x-relay-key':RELAY_KEY,Accept:'*/*','bypass-tunnel-reminder':'true'};
-if(cookie)cabeceras['x-yt-cookie']=cookie;
-if(req.headers.range)cabeceras.Range=req.headers.range;
-const pedido=mod.request(destino,{method:'GET',headers:cabeceras},(rta)=>{
-if(rta.statusCode!==200&&rta.statusCode!==206){rta.resume();resolve({ok:false,status:rta.statusCode});return;}
-pedido.setTimeout(30000);
-const sal={'Content-Type':rta.headers['content-type']||(kind==='audio'?'audio/mp4':'video/mp4'),'Accept-Ranges':'bytes','Cache-Control':'no-store'};
-if(rta.headers['content-length'])sal['Content-Length']=rta.headers['content-length'];
-if(rta.headers['content-range'])sal['Content-Range']=rta.headers['content-range'];
-sal['Content-Disposition']='inline; filename="'+videoId+'.'+(kind==='audio'?'m4a':'mp4')+'"';
-res.writeHead(rta.statusCode,sal);
-rta.pipe(res);
-rta.on('end',()=>resolve({ok:true,status:rta.statusCode}));
-rta.on('error',()=>resolve({ok:false,status:0}));
-});
-pedido.setTimeout(8000,()=>{pedido.destroy(new Error('relay no respondio en 8s'));});
-pedido.on('error',()=>{try{if(!res.headersSent)resolve({ok:false,status:0});else resolve({ok:false,status:0});}catch(e){resolve({ok:false,status:0});}});
-pedido.end();
-});
-}
-
-async function probeMedia(mediaUrl,headers,options={}){
+async function probeMedia(mediaUrl,headers){
 const probeHeaders={...headers,Range:'bytes=0-0'};
-const proxyRaw=(process.env.DL_PROXY_URL||process.env.dl_proxy_url||'').trim();
-const proxy=proxyDeStream(options);
-if(proxy){
-// googlevideo suele responder 302: hay que seguir el redirect dentro del
-// mismo tunel, igual que hace streamMedia, para no descartar URLs validas.
-let destino=mediaUrl;
-try{
-for(let salto=0;salto<4;salto+=1){
-const {mediaRes,cleanup}=await requestMediaViaProxy(proxy,destino,probeHeaders);
-const status=mediaRes.statusCode;
-const loc=mediaRes.headers.location;
-if([301,302,303,307,308].includes(status)&&loc){
-cleanup();
-destino=new URL(loc,destino).href;
-continue;
-}
-cleanup();
-return status;
-}
-return 0;
-}catch(e){return 0;}
-}
 try{
 const r=await fetch(mediaUrl,{headers:probeHeaders,redirect:'follow'});
 try{await r.body?.cancel();}catch(e){}
@@ -593,10 +334,13 @@ return sendJson(404,{ok:false,error:'SIN_MEDIA',message:String(ultimoError&&ulti
 }
 return sendJson(404,debugProbes?{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'La plataforma expuso el video pero el archivo no responde como video descargable desde este hosting (puede requerir sesion iniciada).',probes:debugProbes}:{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'La plataforma expuso el video pero el archivo no responde como video descargable desde este hosting (puede requerir sesion iniciada).'});
 }
-// kind audio|video -> YouTube: prueba de 1 KB por candidato; solo transmite
-// cuando la prueba responde 200/206. Orden: web (con cookies), web (sin
-// cookies), WEB_EMBEDDED, TV_SIMPLY (TVHTML5_SIMPLY_EMBEDDED_PLAYER),
-// ANDROID_VR, IOS, ANDROID, mweb.
+// kind audio|video -> YouTube: sistema 100% scraping en 3 capas, sin proxy.
+// CAPA 1: clientes Innertube directos desde la IP de salida de Vercel.
+// CAPA 2: instancias publicas (cobalt/Invidious/Piped) en paralelo, para
+//   rescatar la descarga cuando la IP de Vercel esta bloqueada por googlevideo.
+// CAPA 3: clientes sin cookie (WEB_EMBEDDED/TV_SIMPLY) al final de la capa 1.
+// Ambas capas arrancan en paralelo; gana la capa 1 si llega a tiempo. Si todo
+// falla se responde rapido con reintentar:true (Vercel rota la IP de salida).
 let videoId=query;
 const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
 if(match){
@@ -623,120 +367,110 @@ videoId=String(primerVideo.id);
 const cookieHeader=secureApi.normalizeYoutubeCookie(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie||'');
 const hayCookie=!!cookieHeader;
 const cacheKey=videoId+'|'+kind+'|'+(qualityParam==='best'?'best':qualityParam);
+const dlHeadersBase=hayCookie?{Cookie:cookieHeader}:{};
+const dlDeadline=Date.now()+35000;
+const tInicioDl=Date.now();
+const tipoMedia=kind==='audio'?'audio':'video';
+const calidadMedia=qualityParam==='best'?'best':qualityParam;
+const extDefault=kind==='audio'?'m4a':'mp4';
 const cacheado=dlMediaCache.get(cacheKey);
 if(cacheado&&cacheado.expiresAt>Date.now()){
-if(cacheado.relay){
-const rtaRelay=await streamDesdeRelay(req,res,videoId,kind,cookieHeader);
-if(rtaRelay.ok)return;
-dlMediaCache.delete(cacheKey);
-}else{
-const opcionesCache=cacheado.sinProxy?{sinProxy:true}:(cacheado.proxy?{proxy:cacheado.proxy}:{});
-const probeCacheado=await probeMedia(cacheado.url,cacheado.headers,opcionesCache);
+const probeCacheado=await probeMedia(cacheado.url,cacheado.headers||{});
 if(probeCacheado===200||probeCacheado===206){
-return streamMedia(req,res,sendJson,requestId,cacheado.url,{referer:'https://www.youtube.com/',headers:cacheado.headers,...opcionesCache,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
+console.log('[dl] cache hit ('+(cacheado.fuente||'-')+') probe='+probeCacheado);
+return streamMedia(req,res,sendJson,requestId,cacheado.url,{referer:'https://www.youtube.com/',headers:cacheado.headers||{},filename:videoId+'.'+(cacheado.ext||extDefault)});
 }
 dlMediaCache.delete(cacheKey);
 }
-}
-const candidatos=[];
-// PRIMERO el relay del usuario (IP residencial): si esta vivo, resuelve y
-// streamea desde ahi, donde googlevideo no bloquea.
-const relayVivo=RELAY_URL&&RELAY_KEY&&(await relayEstado())==='OK';
-if(RELAY_URL)console.log('[dl] relay='+(relayVivo?'OK':'CAIDO/no configurado'));
-if(relayVivo)candidatos.push({relay:true});
-candidatos.push(
-{cliente:'WEB',cookie:true},
-...(hayCookie?[{cliente:'WEB',cookie:false}]:[]),
-{cliente:'WEB_EMBEDDED',cookie:true},
-{cliente:'TV_SIMPLY',cookie:true},
-{cliente:'ANDROID_VR',cookie:true},
-{cliente:'IOS',cookie:true},
-{cliente:'ANDROID',cookie:true},
-{cliente:'MWEB',cookie:true},
-{cliente:null,cookie:true},
-);
-// Ultimo candidato: resolucion y descarga DIRECTAS desde la IP de salida de
-// Vercel, sin proxy. Esa IP rota por region y a veces no esta bloqueada.
-candidatos.push({cliente:'WEB',cookie:true,sinProxy:true});
-// Recordar el cliente que funciono la ultima vez (TTL 6h) y probarlo primero.
 const claveCliente=videoId+'|'+kind;
 const recordado=dlClienteCache.get(claveCliente);
-if(recordado&&recordado.expiresAt>Date.now()){
-const idx=candidatos.findIndex((c)=>c.cliente===recordado.cliente&&c.cookie===recordado.cookie&&!!c.sinProxy===!!recordado.sinProxy);
-if(idx>0){
-const elegido=candidatos.splice(idx,1)[0];
-candidatos.unshift(elegido);
-console.log('[dl] cliente recordado primero: '+(recordado.cliente||'auto')+(recordado.sinProxy?' (sinProxy)':''));
-}
-}else if(recordado){
-dlClienteCache.delete(claveCliente);
-}
-// Salud de los proxies (health check con TTL 60s, probe max 5s por proxy).
-const proxiesLista=(secureApi&&typeof secureApi.listaProxies==='function')?secureApi.listaProxies():[];
-let todosBloqueados=false;
-if(proxiesLista.length){
+if(recordado&&recordado.expiresAt<Date.now())dlClienteCache.delete(claveCliente);
+// CAPA 1: scraping directo. Intento A = camino completo de youtubei.js
+// (clientes en paralelo + PO token bgutil + watch page), recortado a 8s.
+// Intento B = clientes puntuales en paralelo (capa 1 + capa 3 sin cookie),
+// probe en orden de prioridad.
+const intentoCapa1=(async()=>{
+const conTimeout=(promesa,ms)=>Promise.race([promesa,new Promise((_,rechazar)=>setTimeout(()=>rechazar(new Error('timeout '+ms+'ms')),ms))]);
 try{
-const ordenados=await secureApi.proxiesSaludables();
-todosBloqueados=ordenados.length>0&&ordenados.every((p)=>p.sano===false);
-console.log('[dl] salud de proxies: '+JSON.stringify(secureApi.estadoSaludProxies())+(todosBloqueados?' -> TODOS BLOQUEADOS: solo se prueba el candidato directo':''));
+const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidadMedia,null,{sinProxy:true}),8000);
+if(media&&media.url){
+const probeStatus=await probeMedia(media.url,dlHeadersBase);
+console.log('[dl][capa1] auto probe='+probeStatus+' ('+(Date.now()-tInicioDl)+'ms)');
+if(probeStatus===200||probeStatus===206){
+dlClienteCache.set(claveCliente,{cliente:null,cookie:true,expiresAt:Date.now()+6*60*60*1000});
+return {ok:true,url:media.url,headers:dlHeadersBase,detalle:'auto',ext:extDefault};
+}
+}
 }catch(e){
-console.log('[dl] health check de proxies fallo: '+String(e&&e.message||e).slice(0,120));
+console.log('[dl][capa1] auto fallo: '+String(e&&e.message||e).slice(0,100)+' ('+(Date.now()-tInicioDl)+'ms)');
 }
+let instanciaConCookie=null,instanciaSinCookie=null;
+try{instanciaConCookie=await secureApi.getYoutubeInstance(true);}catch(e){console.log('[dl][capa1] instancia con cookie fallo: '+String(e&&e.message||e).slice(0,80));}
+if(hayCookie){try{instanciaSinCookie=await secureApi.getYoutubeInstance(false);}catch(e){}}
+if(!instanciaConCookie&&!instanciaSinCookie)return {ok:false};
+const construirCandidatos=()=>{
+const base=[
+{cliente:'WEB',cookie:true,capa:1},
+...(hayCookie?[{cliente:'WEB',cookie:false,capa:1}]:[]),
+{cliente:'WEB_EMBEDDED',cookie:true,capa:1},
+{cliente:'TV_SIMPLY',cookie:true,capa:1},
+{cliente:'ANDROID_VR',cookie:true,capa:1},
+{cliente:'IOS',cookie:true,capa:1},
+{cliente:'MWEB',cookie:true,capa:1},
+{cliente:'ANDROID',cookie:true,capa:1},
+{cliente:'WEB_EMBEDDED',cookie:false,capa:3},
+{cliente:'TV_SIMPLY',cookie:false,capa:3},
+];
+if(recordado){
+const idx=base.findIndex((c)=>c.cliente===recordado.cliente&&c.cookie===recordado.cookie);
+if(idx>0){const elegido=base.splice(idx,1)[0];base.unshift(elegido);console.log('[dl] cliente recordado primero: '+recordado.cliente);}
 }
-const dlDeadline=Date.now()+45000;
-for(const c of candidatos){
+return base.filter((c)=>(c.cookie!==false?instanciaConCookie:instanciaSinCookie));
+};
+const candidatos=construirCandidatos();
+const resultados=await Promise.allSettled(candidatos.map((c)=>conTimeout(
+secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidadMedia,null,{client:c.cliente,cookie:c.cookie,sinProxy:true,youtube:c.cookie!==false?instanciaConCookie:instanciaSinCookie}),
+8000,
+)));
+for(let i=0;i<candidatos.length;i+=1){
 if(Date.now()>dlDeadline)break;
-if(c.relay){
-const rtaRelay=await streamDesdeRelay(req,res,videoId,kind,cookieHeader);
-if(rtaRelay.ok){
-dlMediaCache.set(cacheKey,{relay:true,expiresAt:Date.now()+30*60*1000});
-dlClienteCache.set(claveCliente,{cliente:'RELAY',relay:true,expiresAt:Date.now()+6*60*60*1000});
-return;
-}
-console.log('[dl] relay fallo (HTTP '+rtaRelay.status+') -> sigo con los proxies');
-relaySalud.estado='CAIDO';relaySalud.checkedAt=Date.now();
-continue;
-}
-// Fail fast: con todos los proxies bloqueados, los 9 candidatos por proxy
-// usarian la misma IP bloqueada; solo tiene sentido el camino directo.
-if(todosBloqueados&&!c.sinProxy)continue;
-let proxyDelCandidato=null;
-if(!c.sinProxy&&proxiesLista.length){
-try{
-const ordenados=await secureApi.proxiesSaludables();
-const primero=ordenados[0]||null;
-proxyDelCandidato=primero&&primero.sano!==false?primero:null;
-}catch(e){proxyDelCandidato=null;}
-if(!proxyDelCandidato){
-console.log('[dl] cliente='+(c.cliente||'auto')+' salteado: no hay proxy sano');
-continue;
-}
-}
-let media;
-try{
-const opcionesMedia=c.cliente?{client:c.cliente,cookie:c.cookie}:{};
-if(c.sinProxy)opcionesMedia.sinProxy=true;
-media=await secureApi.fetchYoutubeMedia(videoId,kind==='audio'?'audio':'video',qualityParam==='best'?'best':qualityParam,null,opcionesMedia);
-}catch(e){
-console.log('[dl] cliente='+(c.cliente||'auto')+(c.sinProxy?' sinProxy':' proxy='+(proxyDelCandidato?proxyDelCandidato.id:'-'))+' player fallo: '+String(e&&e.message||e).slice(0,100));
-continue;
-}
-if(!media||!media.url)continue;
-const dlHeaders=c.cookie&&hayCookie?{Cookie:cookieHeader}:{};
-const probeStatus=await probeMedia(media.url,dlHeaders,c.sinProxy?{sinProxy:true}:{proxy:proxyDelCandidato});
-console.log('[dl] cliente='+(c.cliente||'auto')+(c.sinProxy?' sinProxy':' proxy='+(proxyDelCandidato?proxyDelCandidato.id:'-'))+' probe='+probeStatus);
-if(probeStatus===403&&proxyDelCandidato){
-secureApi.marcarProxyBloqueado(proxyDelCandidato);
-continue;
-}
-if(probeStatus!==200&&probeStatus!==206)continue;
-dlMediaCache.set(cacheKey,{url:media.url,headers:dlHeaders,proxy:c.sinProxy?null:proxyDelCandidato,sinProxy:!!c.sinProxy,expiresAt:Date.now()+30*60*1000});
-if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
-dlClienteCache.set(claveCliente,{cliente:c.cliente,cookie:c.cookie,sinProxy:!!c.sinProxy,expiresAt:Date.now()+6*60*60*1000});
+const r=resultados[i];
+if(r.status!=='fulfilled'||!r.value||!r.value.url)continue;
+const c=candidatos[i];
+const headers=c.cookie&&hayCookie?{Cookie:cookieHeader}:{};
+const probeStatus=await probeMedia(r.value.url,headers);
+console.log('[dl][capa'+c.capa+'] cliente='+c.cliente+(c.cookie?' +cookie':' sincookie')+' probe='+probeStatus+' ('+(Date.now()-tInicioDl)+'ms)');
+if(probeStatus===200||probeStatus===206){
+dlClienteCache.set(claveCliente,{cliente:c.cliente,cookie:c.cookie,expiresAt:Date.now()+6*60*60*1000});
 if(dlClienteCache.size>200)dlClienteCache.delete(dlClienteCache.keys().next().value);
-return streamMedia(req,res,sendJson,requestId,media.url,{referer:'https://www.youtube.com/',headers:dlHeaders,sinProxy:!!c.sinProxy,proxy:c.sinProxy?undefined:proxyDelCandidato,filename:videoId+'.'+(kind==='audio'?'m4a':'mp4')});
+return {ok:true,url:r.value.url,headers,detalle:'capa'+c.capa+' '+c.cliente,ext:extDefault};
 }
-return sendJson(502,{ok:false,error:'IP_BLOQUEADA',message:'Ningun cliente pudo descargar desde este hosting.'});
+}
+return {ok:false};
+})();
+// CAPA 2: instancias publicas en paralelo (arranca YA, sin esperar a capa 1).
+const intentoCapa2=secureApi.resolverViaInstanciasPublicas(videoId,tipoMedia,9000).catch(()=>null);
+// Prioridad capa 1: hasta 8s. Si no llega, se usa capa 2 si ya esta lista.
+let r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),8000))]);
+if(!(r1&&r1.ok)){
+const restante2=Math.max(0,9500-(Date.now()-tInicioDl));
+const r2=await Promise.race([intentoCapa2,new Promise((r)=>setTimeout(()=>r(null),restante2))]);
+if(r2&&r2.url){
+dlMediaCache.set(cacheKey,{url:r2.url,headers:{},fuente:'capa2:'+r2.fuente+':'+r2.instancia,ext:r2.ext,expiresAt:Date.now()+30*60*1000});
+if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
+console.log('[dl] salida por CAPA 2 ('+r2.fuente+':'+r2.instancia+') a los '+(Date.now()-tInicioDl)+'ms');
+return streamMedia(req,res,sendJson,requestId,r2.url,{referer:'https://www.youtube.com/',headers:{},filename:videoId+'.'+r2.ext});
+}
+const restante1=Math.max(0,10000-(Date.now()-tInicioDl));
+r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),restante1))]);
+}
+if(r1&&r1.ok){
+dlMediaCache.set(cacheKey,{url:r1.url,headers:r1.headers,fuente:'capa1:'+r1.detalle,ext:r1.ext,expiresAt:Date.now()+30*60*1000});
+if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
+console.log('[dl] salida por CAPA 1 ('+r1.detalle+') a los '+(Date.now()-tInicioDl)+'ms');
+return streamMedia(req,res,sendJson,requestId,r1.url,{referer:'https://www.youtube.com/',headers:r1.headers,filename:videoId+'.'+r1.ext});
+}
+return sendJson(502,{ok:false,error:'IP_BLOQUEADA',reintentar:true,message:'Ningun cliente ni instancia publica pudo descargar desde este hosting. Vercel rota la IP de salida: reintentar suele funcionar.'});
 }
 if(pathname==='/ytmp3'||pathname==='/ytmp4'||pathname==='/youtube'||pathname==='/ytsearch'){
 let Innertube;
@@ -781,7 +515,27 @@ thumbnail:`https://i.ytimg.com/vi/${v.id}/maxresdefault.jpg`
 return sendJson(200,{ok:true,source:'youtube',query,total_resultados:results.length,resultados:results});
 }
 const isAudio=pathname==='/ytmp3';
-const media=await secureApi.fetchYoutubeMedia(videoId,isAudio?'audio':'video',qualityParam==='best'?'best':qualityParam);
+// CAPA 1: scraping directo desde la IP de Vercel. Si esta bloqueada, CAPA 2:
+// instancias publicas (sus URLs de tunnel no quedan amarradas a nuestra IP).
+let media=null;
+let errorCapa1=null;
+try{
+media=await secureApi.fetchYoutubeMedia(videoId,isAudio?'audio':'video',qualityParam==='best'?'best':qualityParam);
+}catch(e){
+errorCapa1=e;
+console.log('[ytmp] capa1 fallo: '+String(e&&e.message||e).slice(0,120));
+}
+let altCapa2=null;
+if(!media||!media.url){
+altCapa2=await secureApi.resolverViaInstanciasPublicas(videoId,isAudio?'audio':'video',12000).catch(()=>null);
+if(altCapa2&&altCapa2.url){
+console.log('[ytmp] respaldo por CAPA 2 via '+altCapa2.fuente+':'+altCapa2.instancia);
+media={url:altCapa2.url,quality:altCapa2.calidad||'',basic_info:{}};
+}
+}
+if(!media||!media.url){
+throw errorCapa1||secureApi.apiError(502,'No se pudo obtener el enlace de descarga desde este hosting.',{code:'IP_BLOQUEADA'});
+}
 const basic=media.basic_info||{};
 const canal=(typeof basic.author==='string'&&basic.author)?basic.author:(searchMeta?.canal||'Desconocido');
 const titulo=(typeof basic.title==='string'&&basic.title)?basic.title:(searchMeta?.titulo||'Desconocido');
@@ -800,9 +554,9 @@ tipo:isAudio?'Audio MP3':'Video MP4',
 titulo:tituloFinal,
 canal:canalFinal,
 link,
-visitas:Number(basic.view_count)||searchMeta?.visitas||0,
-likes:Number(basic.like_count)||0,
-duracion_segundos:Number(basic.duration)||searchMeta?.duracion||0,
+visitas:Number(basic.view_count)||altCapa2?.meta?.visitas||searchMeta?.visitas||0,
+likes:Number(basic.like_count)||altCapa2?.meta?.likes||0,
+duracion_segundos:Number(basic.duration)||altCapa2?.meta?.duracion||searchMeta?.duracion||0,
 videoId:videoId,
 url_original:link,
 descarga_directa:media.url,
@@ -835,25 +589,7 @@ return sendJson(404,{ok:false,error:{message:String(e&&e.message||e).slice(0,220
 }
 }
 if(pathname==='/status'){
-let proxySalud='no configurado';
-let proxiesDetalle;
-try{
-const pl=(secureApi&&typeof secureApi.listaProxies==='function')?secureApi.listaProxies():[];
-if(pl.length){
-const ordenados=await secureApi.proxiesSaludables();
-proxySalud=ordenados.some((p)=>p.sano===true)?'OK':(ordenados.every((p)=>p.sano===false)?'BLOQUEADO':'sin verificar');
-proxiesDetalle=secureApi.estadoSaludProxies();
-// A nivel MEDIA (403 de googlevideo en descargas): si todos los proxies
-// recibieron un 403 de medios en los ultimos 5 min, el bloqueo es real aunque
-// el probe de conectividad (generate_204) pase.
-const conMedia=proxiesDetalle.filter((p)=>typeof p.media_bloqueado_hace_s==='number'&&p.media_bloqueado_hace_s<=300);
-if(conMedia.length===proxiesDetalle.length)proxySalud='BLOQUEADO (media)';
-}
-}catch(e){
-proxySalud='sin verificar';
-}
-const relayTxt=RELAY_URL?(RELAY_KEY?((await relayEstado())==='OK'?'OK':'CAIDO'):'sin clave'):'no configurado';
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),youtube_visitor_data_como:'Recomendada: sube el exito del cliente WEB con PO Token. Conseguila de un navegador logueado en YouTube: F12 > Console > ytcfg.get("VISITOR_DATA") y pega el valor en la variable YOUTUBE_VISITOR_DATA.',dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),dl_proxy_configurada:!!(process.env.DL_PROXY_URL||process.env.dl_proxy_url),proxy:proxySalud,proxies_detalle:proxiesDetalle,relay:relayTxt,relay_url_configurada:!!RELAY_URL,relay_verificado_hace_s:RELAY_URL?Math.round((Date.now()-relaySalud.checkedAt)/1000):null,admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),youtube_visitor_data_como:'Recomendada: sube el exito del cliente WEB con PO Token. Conseguila de un navegador logueado en YouTube: F12 > Console > ytcfg.get("VISITOR_DATA") y pega el valor en la variable YOUTUBE_VISITOR_DATA.',dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','instancias_publicas'],admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){

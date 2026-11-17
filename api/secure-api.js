@@ -1225,222 +1225,10 @@ async function acquireYoutubePoMinter(youtube) {
   return youtubePoMinterCache;
 }
 
-// Lista de proxies de salida (DL_PROXY_URL acepta varios separados por coma).
-// Se re-lee con TTL de 60s: nada de cache permanente sin vencimiento.
-let listaProxiesCache = { proxies: null, leidoAt: 0 };
-function listaProxies() {
-  if (listaProxiesCache.proxies && Date.now() - listaProxiesCache.leidoAt < 60000) return listaProxiesCache.proxies;
-  const raw = (process.env.DL_PROXY_URL || process.env.dl_proxy_url || '').trim();
-  const proxies = [];
-  if (raw) {
-    for (const parte of raw.split(',')) {
-      const crudo = parte.trim();
-      if (!crudo) continue;
-      try {
-        const u = new URL(crudo);
-        if (u.protocol === 'http:' && u.hostname) {
-          proxies.push({
-            host: u.hostname,
-            port: Number(u.port) || 80,
-            auth: (u.username || u.password)
-              ? 'Basic ' + Buffer.from(decodeURIComponent(u.username) + ':' + decodeURIComponent(u.password)).toString('base64')
-              : null,
-            id: u.hostname + ':' + (Number(u.port) || 80),
-          });
-        }
-      } catch {}
-    }
-  }
-  listaProxiesCache = { proxies, leidoAt: Date.now() };
-  return proxies;
-}
-
-// Salud de cada proxy: se verifica con un probe liviano por el tunel CONNECT
-// (max 5s) y se recuerda 60s. Un 403 de googlevideo tambien lo marca bloqueado.
-const TTL_SALUD_PROXY = 60000;
-const saludProxies = new Map();
-
-// Bloqueos a nivel MEDIA (403 de googlevideo en el probe de /dl): se recuerdan
-// aparte porque el probe de conectividad (generate_204) no los detecta.
-const mediosBloqueados = new Map();
-
-function marcarProxyBloqueado(proxy) {
-  if (proxy && proxy.id) {
-    saludProxies.set(proxy.id, { sano: false, checkedAt: Date.now() });
-    mediosBloqueados.set(proxy.id, Date.now());
-  }
-}
-
-function marcarProxySano(proxy) {
-  if (proxy && proxy.id) saludProxies.set(proxy.id, { sano: true, checkedAt: Date.now() });
-}
-
-async function verificarSaludProxy(proxy) {
-  try {
-    const { mediaRes, cleanup } = await requestViaProxy(
-      proxy,
-      'https://www.youtube.com/generate_204',
-      { method: 'GET', headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' }, timeoutMs: 5000 },
-    );
-    const status = mediaRes.statusCode;
-    cleanup();
-    const ok = status >= 200 && status < 400;
-    saludProxies.set(proxy.id, { sano: ok, checkedAt: Date.now() });
-    return ok;
-  } catch {
-    saludProxies.set(proxy.id, { sano: false, checkedAt: Date.now() });
-    return false;
-  }
-}
-
-// Devuelve la lista ordenada: sanos primero, luego sin verificar, bloqueados
-// al final. Refresca perezosamente la salud de los que tienen el TTL vencido.
-async function proxiesSaludables() {
-  const proxies = listaProxies();
-  if (!proxies.length) return [];
-  const ahora = Date.now();
-  const sinChequear = proxies.filter((p) => {
-    const estado = saludProxies.get(p.id);
-    return !estado || ahora - estado.checkedAt > TTL_SALUD_PROXY;
-  });
-  if (sinChequear.length) {
-    await Promise.all(sinChequear.slice(0, 4).map((p) => verificarSaludProxy(p)));
-  }
-  const conSalud = (p) => {
-    const estado = saludProxies.get(p.id);
-    return { ...p, sano: estado ? estado.sano : undefined };
-  };
-  const sanos = proxies.filter((p) => {
-    const estado = saludProxies.get(p.id);
-    return estado && estado.sano && ahora - estado.checkedAt <= TTL_SALUD_PROXY;
-  });
-  const desconocidos = proxies.filter((p) => !saludProxies.get(p.id));
-  const bloqueados = proxies.filter((p) => {
-    const estado = saludProxies.get(p.id);
-    return estado && !estado.sano;
-  });
-  return [...sanos, ...desconocidos, ...bloqueados].map(conSalud);
-}
-
-function estadoSaludProxies() {
-  const proxies = listaProxies();
-  const ahora = Date.now();
-  return proxies.map((p) => {
-    const estado = saludProxies.get(p.id);
-    const mediaAt = mediosBloqueados.get(p.id);
-    return {
-      proxy: p.id,
-      sano: estado ? estado.sano : null,
-      verificado_hace_s: estado ? Math.round((ahora - estado.checkedAt) / 1000) : null,
-      media_bloqueado_hace_s: mediaAt ? Math.round((ahora - mediaAt) / 1000) : null,
-    };
-  });
-}
-
-function headersToPlainObject(headers) {
-  if (!headers) return {};
-  if (typeof Headers !== 'undefined' && headers instanceof Headers) return Object.fromEntries(headers.entries());
-  if (Array.isArray(headers)) return Object.fromEntries(headers);
-  return { ...headers };
-}
-
-// Peticion HTTPS a traves del tunel CONNECT del proxy de salida. Devuelve la
-// respuesta cruda de node (mediaRes) para que el llamador la consuma.
-function requestViaProxy(proxy, targetUrl, { method = 'GET', headers = {}, body = null, signal = null, timeoutMs = 20000 }) {
-  return new Promise((resolve, reject) => {
-    const target = new URL(targetUrl);
-    if (target.protocol !== 'https:') return reject(new Error('El proxy de salida solo soporta destinos https.'));
-    let tlsSocket = null;
-    let mediaReq = null;
-    let settled = false;
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      try { mediaReq && mediaReq.destroy(); } catch {}
-      try { tlsSocket && tlsSocket.destroy(); } catch {}
-      reject(error);
-    };
-    const onAbort = () => fail(new Error('La solicitud a traves del proxy fue abortada.'));
-    if (signal) {
-      if (signal.aborted) return fail(new Error('La solicitud a traves del proxy fue abortada.'));
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-    const connectReq = http.request({
-      host: proxy.host,
-      port: proxy.port,
-      method: 'CONNECT',
-      path: target.host + ':443',
-      headers: { Host: target.host + ':443', ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
-      timeout: timeoutMs,
-    });
-    connectReq.on('timeout', () => connectReq.destroy(new Error('El proxy tardo demasiado en responder.')));
-    connectReq.on('error', fail);
-    connectReq.on('connect', (proxyRes, socket) => {
-      if (proxyRes.statusCode !== 200) {
-        socket.destroy();
-        return fail(new Error('El proxy rechazo la conexion (HTTP ' + proxyRes.statusCode + ').'));
-      }
-      tlsSocket = tls.connect({ socket, servername: target.hostname });
-      tlsSocket.once('error', fail);
-      tlsSocket.once('secureConnect', () => {
-        mediaReq = https.request(targetUrl, { method, headers, agent: false, createConnection: () => tlsSocket });
-        mediaReq.on('error', fail);
-        mediaReq.on('response', (mediaRes) => {
-          if (settled) { mediaRes.destroy(); return; }
-          settled = true;
-          if (signal) signal.removeEventListener('abort', onAbort);
-          resolve({
-            mediaRes,
-            cleanup: () => {
-              try { mediaReq.destroy(); } catch {}
-              try { tlsSocket.destroy(); } catch {}
-            },
-          });
-        });
-        if (body != null) mediaReq.write(body);
-        mediaReq.end();
-      });
-    });
-    connectReq.end();
-  });
-}
-
-const PROXIED_RESPONSE_MAX_BYTES = 25 * 1024 * 1024;
-
-async function fetchViaProxy(proxy, targetUrl, { method, headers, body, signal, timeoutMs }) {
-  const { mediaRes, cleanup } = await requestViaProxy(proxy, targetUrl, { method, headers, body, signal, timeoutMs });
-  try {
-    const chunks = [];
-    let total = 0;
-    const buffered = await new Promise((resolve, reject) => {
-      mediaRes.on('data', (chunk) => {
-        total += chunk.length;
-        if (total > PROXIED_RESPONSE_MAX_BYTES) {
-          mediaRes.destroy();
-          reject(new Error('La respuesta del proveedor excedio el tamano maximo.'));
-          return;
-        }
-        chunks.push(chunk);
-      });
-      mediaRes.on('end', resolve);
-      mediaRes.on('error', reject);
-    });
-    const flatHeaders = {};
-    for (const [name, value] of Object.entries(mediaRes.headers)) {
-      flatHeaders[name] = Array.isArray(value) ? value.join(', ') : String(value);
-    }
-    return new Response(Buffer.concat(chunks), {
-      status: mediaRes.statusCode,
-      statusText: mediaRes.statusMessage || '',
-      headers: flatHeaders,
-    });
-  } finally {
-    cleanup();
-  }
-}
-
-function makeStableFetch(opciones = {}) {
-  const sinProxyFijo = !!opciones.sinProxy;
+function makeStableFetch() {
+  // Scraping 100% directo desde la IP de salida de Vercel (sin proxy, sin
+  // relay): la URL firmada de googlevideo queda amarrada a esa IP y el probe y
+  // el stream de /dl salen por la misma ruta.
   return async (input, init = {}) => {
     let requestUrl;
     try {
@@ -1465,41 +1253,6 @@ function makeStableFetch(opciones = {}) {
       outer.addEventListener('abort', () => controller.abort(outer.reason), { once: true });
     }
     try {
-      if (sinProxyFijo) {
-        // Camino directo desde la IP de salida de Vercel (ultimo candidato de
-        // /dl): la URL firmada queda amarrada a esa IP, y probe/stream de ese
-        // candidato tambien salen sin proxy.
-        return await fetch(input, { ...init, signal: controller.signal });
-      }
-      const proxiesOrdenados = await proxiesSaludables();
-      const proxy = proxiesOrdenados[0] || null;
-      if (proxy) {
-        if (proxy.sano === false) {
-          // Todos los proxies estan marcados bloqueados: fallar rapido en lugar
-          // de perder 20s contra una IP bloqueada.
-          throw apiError(502, 'Todos los proxies de salida estan bloqueados por el proveedor en este momento.', { code: 'IP_BLOQUEADA' });
-        }
-        // Con DL_PROXY_URL configurada, TODO el trafico del player sale por el
-        // primer proxy SANO: asi la URL firmada de googlevideo queda amarrada a
-        // la IP del proxy, la misma IP por la que descarga probeMedia/streamMedia.
-        // Si el proxy actual se bloquea, la proxima llamada rota al siguiente sano.
-        const method = (init.method || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase();
-        const headers = headersToPlainObject(init.headers || (input instanceof Request ? input.headers : undefined));
-        let body = init.body != null ? init.body : null;
-        if (body == null && input instanceof Request && input.method !== 'GET' && input.body != null) {
-          try { body = Buffer.from(await input.arrayBuffer()); } catch {}
-        }
-        if (body != null && typeof body !== 'string' && !Buffer.isBuffer(body) && typeof body.arrayBuffer === 'function') {
-          try { body = Buffer.from(await body.arrayBuffer()); } catch {}
-        }
-        return await fetchViaProxy(proxy, requestUrl.href, {
-          method,
-          headers,
-          body,
-          signal: controller.signal,
-          timeoutMs: 20000,
-        });
-      }
       return await fetch(input, { ...init, signal: controller.signal });
     } finally {
       clearTimeout(timer);
@@ -1507,10 +1260,10 @@ function makeStableFetch(opciones = {}) {
   };
 }
 
-const youtubeInstanceCache = { conCookie: null, sinCookie: null, conCookieDirecto: null, sinCookieDirecto: null };
+const youtubeInstanceCache = { conCookie: null, sinCookie: null };
 
-async function getYoutubeInstance(usarCookie, sinProxy = false) {
-  const key = (usarCookie ? 'conCookie' : 'sinCookie') + (sinProxy ? 'Directo' : '');
+async function getYoutubeInstance(usarCookie) {
+  const key = usarCookie ? 'conCookie' : 'sinCookie';
   const cached = youtubeInstanceCache[key];
   if (cached && cached.expiresAt > Date.now()) return cached.instance;
   const ytjs = await import('youtubei.js');
@@ -1518,7 +1271,7 @@ async function getYoutubeInstance(usarCookie, sinProxy = false) {
   const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
   const visitorRaw = process.env.YOUTUBE_VISITOR_DATA || process.env.youtube_visitor_data || '';
   const instance = await ytjs.Innertube.create({
-    fetch: makeStableFetch({ sinProxy }),
+    fetch: makeStableFetch(),
     ...(usarCookie && cookieRaw ? { cookie: normalizeYoutubeCookie(cookieRaw) } : {}),
     ...(usarCookie && visitorRaw ? { visitor_data: visitorRaw } : {}),
   });
@@ -1541,7 +1294,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
   const timer = setTimeout(() => controller.abort(timeoutError), 24000);
   if (parentSignal) parentSignal.addEventListener('abort', abortFromParent, { once: true });
   try {
-    const youtube = options.youtube || await getYoutubeInstance(options.cookie !== false, !!options.sinProxy);
+    const youtube = options.youtube || await getYoutubeInstance(options.cookie !== false);
     const clients = ['IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
     const deadline = Date.now() + 21000;
     let lastFormatError;
@@ -1941,6 +1694,344 @@ function publicErrorMessage(error) {
   }
 }
 
+// ============================================================================
+// CAPA 2 - Instancias publicas gratuitas de respaldo (sin clave, sin proxy).
+// Se usan cuando el scraping directo desde la IP de Vercel esta bloqueado por
+// googlevideo. Cada instancia se valida con un probe de 1 KB antes de usarla;
+// las caidas se recuerdan 15 minutos y se saltan automaticamente.
+// ============================================================================
+const INSTANCIAS_INVIDIOUS = [
+  'https://inv.nadeko.net',
+  'https://invidious.nerdvpn.de',
+  'https://yewtu.be',
+  'https://invidious.private.coffee',
+  'https://iv.melmac.space',
+  'https://invidious.f5.si',
+  'https://yt.chocolatemoo53.com',
+  'https://invidious.materialio.us',
+];
+const INSTANCIAS_PIPED = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.private.coffee',
+  'https://pipedapi.ducks.party',
+  'https://pipedapi.leptons.xyz',
+  'https://pipedapi.moomoo.me',
+  'https://pipedapi.r4fo.com',
+  'https://pipedapi.owo.si',
+];
+// Instancias comunitarias de cobalt (publicas, sin clave): devuelven una URL
+// de tunnel con el archivo ya resuelto. co.otomir23.me verificada en vivo.
+const INSTANCIAS_COBALT = [
+  'https://co.otomir23.me',
+  'https://cobalt-api.ayo.tf',
+  'https://cobalt-api.kwiatekmiki.com',
+  'https://capi.oak.li',
+];
+const TTL_SALUD_INSTANCIA = 15 * 60 * 1000;
+const saludInstancias = new Map();
+
+function marcarInstancia(nombre, viva) {
+  if (nombre) saludInstancias.set(nombre, { viva: !!viva, checkedAt: Date.now() });
+}
+
+function instanciaDisponible(nombre) {
+  const estado = saludInstancias.get(nombre);
+  if (!estado) return true;
+  if (Date.now() - estado.checkedAt > TTL_SALUD_INSTANCIA) return true;
+  return estado.viva;
+}
+
+function estadoSaludInstancias() {
+  const ahora = Date.now();
+  return [...saludInstancias.entries()].map(([nombre, estado]) => ({
+    instancia: nombre,
+    viva: estado.viva,
+    verificado_hace_s: Math.round((ahora - estado.checkedAt) / 1000),
+  }));
+}
+
+function alturaDeCalidad(texto) {
+  const m = String(texto || '').match(/(\d{3,4})p/);
+  return m ? Number(m[1]) : 0;
+}
+
+// Funcion pura: elige el formato de una respuesta de Invidious
+// (GET /api/v1/videos/<id>). audio -> itag 140 (m4a); video -> mp4 hasta 720p.
+function elegirFormatoInvidious(json, kind) {
+  if (!json || typeof json !== 'object' || json.error) return null;
+  const adaptive = Array.isArray(json.adaptiveFormats)
+    ? json.adaptiveFormats.filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'))
+    : [];
+  const progresivos = Array.isArray(json.formats)
+    ? json.formats.filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'))
+    : [];
+  if (kind === 'audio') {
+    const audios = adaptive.filter((f) => String(f.type || f.mimeType || '').includes('audio/'));
+    const m4a = audios.filter((f) => String(f.type || f.mimeType || '').includes('audio/mp4'));
+    const itag140 = m4a.find((f) => String(f.itag) === '140');
+    const elegido = itag140
+      || m4a.slice().sort((a, b) => (b.bitrate || b.bitRate || 0) - (a.bitrate || a.bitRate || 0))[0]
+      || audios.slice().sort((a, b) => (b.bitrate || b.bitRate || 0) - (a.bitrate || a.bitRate || 0))[0];
+    if (elegido) {
+      return { url: elegido.url, itag: String(elegido.itag || ''), tipo: 'audio/mp4', calidad: elegido.audioQuality || 'm4a' };
+    }
+    return null;
+  }
+  const mp4 = adaptive.filter(
+    (f) => String(f.type || f.mimeType || '').includes('video/mp4') && (alturaDeCalidad(f.qualityLabel) || 0) <= 720,
+  );
+  const mejor = mp4.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
+  if (mejor) {
+    return { url: mejor.url, itag: String(mejor.itag || ''), tipo: 'video/mp4', calidad: mejor.qualityLabel || '' };
+  }
+  const prog = progresivos
+    .filter((f) => String(f.type || f.mimeType || '').includes('video/mp4'))
+    .sort((a, b) => alturaDeCalidad(b.qualityLabel) - alturaDeCalidad(a.qualityLabel))[0] || null;
+  if (prog) return { url: prog.url, itag: String(prog.itag || ''), tipo: 'video/mp4', calidad: prog.qualityLabel || '360p' };
+  return null;
+}
+
+// Funcion pura: elige el formato de una respuesta de Piped
+// (GET /api/v1/streams/<id>). Prefiere video muxed (con audio); si no hay,
+// video-only mp4 hasta 720p. Audio: m4a de mayor bitrate cercano a 128k.
+function elegirFormatoPiped(json, kind) {
+  if (!json || typeof json !== 'object' || json.error) return null;
+  if (kind === 'audio') {
+    const audios = (Array.isArray(json.audioStreams) ? json.audioStreams : [])
+      .filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'));
+    const m4a = audios.filter((f) => String(f.mimeType || '').includes('audio/mp4'));
+    const itag140 = m4a.find((f) => String(f.itag) === '140');
+    const elegido = itag140
+      || m4a.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0]
+      || audios.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    if (elegido) return { url: elegido.url, itag: String(elegido.itag || ''), tipo: 'audio/mp4', calidad: elegido.quality || 'm4a' };
+    return null;
+  }
+  const videos = (Array.isArray(json.videoStreams) ? json.videoStreams : [])
+    .filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'))
+    .filter((f) => String(f.mimeType || '').includes('video/mp4'))
+    .filter((f) => (alturaDeCalidad(f.quality) || 0) <= 720 && (alturaDeCalidad(f.quality) || 0) > 0);
+  const muxed = videos.filter((f) => f.videoOnly === false);
+  const mejorMuxed = muxed.slice().sort((a, b) => alturaDeCalidad(b.quality) - alturaDeCalidad(a.quality))[0] || null;
+  if (mejorMuxed) return { url: mejorMuxed.url, itag: String(mejorMuxed.itag || ''), tipo: 'video/mp4', calidad: mejorMuxed.quality || '' };
+  const mejorSolo = videos.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
+  if (mejorSolo) return { url: mejorSolo.url, itag: String(mejorSolo.itag || ''), tipo: 'video/mp4', calidad: mejorSolo.quality || '', sin_audio: true };
+  return null;
+}
+
+async function fetchJsonInstancia(url, timeoutMs) {
+  const r = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      Accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return await r.json();
+}
+
+// Probe de 1 KB directo: valida que la URL responde 200/206 con media real
+// (no HTML de error). Igual que probeMedia de index.js pero para capa 2.
+async function probeUrlMedia(mediaUrl, timeoutMs = 5000) {
+  try {
+    const r = await fetch(mediaUrl, {
+      headers: { Range: 'bytes=0-1023', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const tipo = String(r.headers.get('content-type') || '');
+    if (r.status !== 200 && r.status !== 206) {
+      try { await r.body?.cancel(); } catch {}
+      return { ok: false, status: r.status, tipo };
+    }
+    // Leer al menos un chunk: algunas instancias responden 200 con cuerpo
+    // vacio (0 bytes) cuando googlevideo les fallo por dentro; entregar eso
+    // seria un archivo roto.
+    let bytes = 0;
+    if (r.body && typeof r.body.getReader === 'function') {
+      const reader = r.body.getReader();
+      try {
+        const primer = await reader.read();
+        bytes = primer.done ? 0 : primer.value.length;
+      } catch {}
+      try { await reader.cancel(); } catch {}
+    }
+    const ok = !tipo.includes('text/html') && (bytes > 0 || Number(r.headers.get('content-length') || 0) > 0);
+    return { ok, status: r.status, tipo, bytes };
+  } catch (e) {
+    return { ok: false, status: 0, tipo: '' };
+  }
+}
+
+async function resolverViaInvidious(videoId, kind, presupuestoMs = 9000) {
+  const deadline = Date.now() + presupuestoMs;
+  for (const base of INSTANCIAS_INVIDIOUS) {
+    if (Date.now() > deadline - 500) break;
+    let host = '';
+    try { host = new URL(base).host; } catch { continue; }
+    const nombre = 'invidious:' + host;
+    if (!instanciaDisponible(nombre)) continue;
+    const t0 = Date.now();
+    try {
+      const json = await fetchJsonInstancia(base + '/api/v1/videos/' + videoId + '?local=true', 6000);
+      const elegido = elegirFormatoInvidious(json, kind);
+      if (!elegido) {
+        marcarInstancia(nombre, true);
+        console.log('[dl][capa2] invidious:' + host + ' sin formato util (' + (Date.now() - t0) + 'ms)');
+        continue;
+      }
+      const probe = await probeUrlMedia(elegido.url);
+      console.log('[dl][capa2] invidious:' + host + ' probe=' + probe.status + ' itag=' + elegido.itag + ' (' + (Date.now() - t0) + 'ms)');
+      if (!probe.ok) continue;
+      marcarInstancia(nombre, true);
+      return {
+        url: elegido.url,
+        headers: {},
+        fuente: 'invidious',
+        instancia: host,
+        calidad: elegido.calidad,
+        ext: kind === 'audio' ? 'm4a' : 'mp4',
+        meta: {
+          titulo: typeof json.title === 'string' ? json.title : '',
+          canal: typeof json.author === 'string' ? json.author : '',
+          duracion: Number(json.lengthSeconds) || 0,
+          visitas: Number(json.viewCount) || 0,
+          likes: Number(json.likeCount) || 0,
+        },
+      };
+    } catch (e) {
+      marcarInstancia(nombre, false);
+      console.log('[dl][capa2] invidious:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
+    }
+  }
+  return null;
+}
+
+async function resolverViaPiped(videoId, kind, presupuestoMs = 9000) {
+  const deadline = Date.now() + presupuestoMs;
+  for (const base of INSTANCIAS_PIPED) {
+    if (Date.now() > deadline - 500) break;
+    let host = '';
+    try { host = new URL(base).host; } catch { continue; }
+    const nombre = 'piped:' + host;
+    if (!instanciaDisponible(nombre)) continue;
+    const t0 = Date.now();
+    try {
+      const json = await fetchJsonInstancia(base + '/streams/' + videoId, 6000);
+      const elegido = elegirFormatoPiped(json, kind);
+      if (!elegido) {
+        marcarInstancia(nombre, true);
+        console.log('[dl][capa2] piped:' + host + ' sin formato util (' + (Date.now() - t0) + 'ms)');
+        continue;
+      }
+      const probe = await probeUrlMedia(elegido.url);
+      console.log('[dl][capa2] piped:' + host + ' probe=' + probe.status + ' calidad=' + elegido.calidad + ' (' + (Date.now() - t0) + 'ms)');
+      if (!probe.ok) continue;
+      marcarInstancia(nombre, true);
+      return {
+        url: elegido.url,
+        headers: {},
+        fuente: 'piped',
+        instancia: host,
+        calidad: elegido.calidad,
+        ext: kind === 'audio' ? 'm4a' : 'mp4',
+        meta: {
+          titulo: typeof json.title === 'string' ? json.title : '',
+          canal: typeof json.uploader === 'string' ? json.uploader : '',
+          duracion: Number(json.duration) || 0,
+          visitas: Number(json.views) || 0,
+          likes: Number(json.likes) || 0,
+        },
+      };
+    } catch (e) {
+      marcarInstancia(nombre, false);
+      console.log('[dl][capa2] piped:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
+    }
+  }
+  return null;
+}
+
+async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
+  const deadline = Date.now() + presupuestoMs;
+  for (const base of INSTANCIAS_COBALT) {
+    if (Date.now() > deadline - 500) break;
+    let host = '';
+    try { host = new URL(base).host; } catch { continue; }
+    const nombre = 'cobalt:' + host;
+    if (!instanciaDisponible(nombre)) continue;
+    const t0 = Date.now();
+    try {
+      const cuerpo = kind === 'audio'
+        ? { url: 'https://www.youtube.com/watch?v=' + videoId, downloadMode: 'audio', audioFormat: 'mp3' }
+        : { url: 'https://www.youtube.com/watch?v=' + videoId, downloadMode: 'auto', videoQuality: '720', youtubeVideoCodec: 'h264' };
+      const r = await fetch(base + '/', {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
+        body: JSON.stringify(cuerpo),
+        signal: AbortSignal.timeout(6000),
+      });
+      const json = await r.json().catch(() => null);
+      if (!json || json.status === 'error' || !json.url) {
+        marcarInstancia(nombre, false);
+        console.log('[dl][capa2] cobalt:' + host + ' rechazo: ' + String(json && (json.error && json.error.code || json.status) || 'HTTP ' + r.status).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
+        continue;
+      }
+      if (json.status !== 'tunnel' && json.status !== 'stream' && json.status !== 'redirect') {
+        marcarInstancia(nombre, false);
+        console.log('[dl][capa2] cobalt:' + host + ' status no usable: ' + json.status + ' (' + (Date.now() - t0) + 'ms)');
+        continue;
+      }
+      const probe = await probeUrlMedia(json.url);
+      console.log('[dl][capa2] cobalt:' + host + ' probe=' + probe.status + ' tipo=' + (probe.tipo || '-') + ' (' + (Date.now() - t0) + 'ms)');
+      if (!probe.ok) continue;
+      marcarInstancia(nombre, true);
+      return {
+        url: json.url,
+        headers: {},
+        fuente: 'cobalt',
+        instancia: host,
+        calidad: kind === 'audio' ? 'mp3' : '720p',
+        ext: kind === 'audio' ? 'mp3' : 'mp4',
+        meta: { titulo: typeof json.filename === 'string' ? json.filename.replace(/\.[a-z0-9]+$/i, '') : '' },
+      };
+    } catch (e) {
+      marcarInstancia(nombre, false);
+      console.log('[dl][capa2] cobalt:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
+    }
+  }
+  return null;
+}
+
+// Lanza los tres resolvers en paralelo (cobalt primero: es el verificado vivo)
+// y devuelve el primer resultado validado, con presupuesto global.
+async function resolverViaInstanciasPublicas(videoId, kind, presupuestoMs = 9000) {
+  const t0 = Date.now();
+  const promesas = [
+    resolverViaCobalt(videoId, kind, presupuestoMs).catch(() => null),
+    resolverViaInvidious(videoId, kind, presupuestoMs).catch(() => null),
+    resolverViaPiped(videoId, kind, presupuestoMs).catch(() => null),
+  ];
+  const resultado = await new Promise((resolver) => {
+    let terminado = false;
+    let pendientes = promesas.length;
+    const fin = (v) => { if (!terminado) { terminado = true; clearTimeout(timer); resolver(v); } };
+    const timer = setTimeout(() => fin(null), presupuestoMs);
+    promesas.forEach((p) => p.then((v) => {
+      pendientes -= 1;
+      if (v) return fin(v);
+      if (pendientes <= 0) fin(null);
+    }).catch(() => { pendientes -= 1; if (pendientes <= 0) fin(null); }));
+  });
+  if (resultado) {
+    console.log('[dl][capa2] exito via ' + resultado.fuente + ':' + resultado.instancia + ' (' + (Date.now() - t0) + 'ms)');
+  } else {
+    console.log('[dl][capa2] ninguna instancia publica pudo entregar el archivo (' + (Date.now() - t0) + 'ms)');
+  }
+  return resultado;
+}
+
 module.exports = {
   apiError,
   fetchTextSafe,
@@ -1953,12 +2044,11 @@ module.exports = {
   fetchTikTokVideo,
   obtenerDiagnosticoTikTok,
   normalizeYoutubeCookie,
-  listaProxies,
-  proxiesSaludables,
-  marcarProxyBloqueado,
-  marcarProxySano,
-  estadoSaludProxies,
   getYoutubeInstance,
+  elegirFormatoInvidious,
+  elegirFormatoPiped,
+  resolverViaInstanciasPublicas,
+  estadoSaludInstancias,
   fetchYoutubeMedia,
   fetchYoutubeWatchPageMedia,
   selectYoutubeMediaFormat,
