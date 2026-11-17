@@ -16,11 +16,11 @@ secureApiLoadError=e;
 let adminApi=null;
 let adminApiLoadError=null;
 try{
-adminApi=require('./admin');
+adminApi=require('../lib/admin');
 }catch(e){
 adminApiLoadError=e;
 }
-const { paginaDocs }=require('./paginas');
+const { paginaDocs }=require('../lib/paginas');
 const VALID_QUALITY=/^(?:best|\d{3,4}p)$/;
 const VALID_LIMIT=/^\d+$/;
 const LIMIT_MIN=1;
