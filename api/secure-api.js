@@ -1186,6 +1186,7 @@ async function selectYoutubeMediaFormat(formats, type, quality, player) {
         url: selected.url,
         quality: selected.format.height ? `${selected.format.height}p` : quality,
         bitrate: selected.format.bitrate || null,
+        conAudio: !!selected.format.has_audio,
       };
     }
   }
@@ -1548,16 +1549,26 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     // ultimo recurso si NINGUN cliente da audio puro.
     const preferirAudioPuro = type === 'audio';
     let audioFallback = null;
+    // Video: un formato video-only (sin audio, ej. itag 137/133 hermano del
+    // esquema altern) solo se acepta como ULTIMO recurso si ningun cliente dio
+    // uno con audio; para audio no se toca el comportamiento de antes.
+    const mediaAceptable = (media) => {
+      if (!media) return false;
+      if (preferirAudioPuro) return media.esAudioPuro;
+      return media.conAudio !== false;
+    };
     const aceptarMedia = (media) => {
       if (!media) return null;
-      if (!preferirAudioPuro || media.esAudioPuro) return media;
+      if (mediaAceptable(media)) return media;
       if (!audioFallback) audioFallback = media;
       return null;
     };
     const attemptInParallel = async (clientList, poToken) => {
       const results = await Promise.allSettled(clientList.map((client) => attemptClient(client, poToken)));
       const ok = results.filter((r) => r.status === 'fulfilled' && r.value).map((r) => r.value);
-      return ok.find((m) => m.esAudioPuro) || ok[0] || null;
+      // Audio: preferir formato audio puro; video: preferir formato CON audio
+      // (progresivo, ej. itag 18) en vez del primer video-only que llegue.
+      return ok.find((m) => m.esAudioPuro) || ok.find((m) => m.conAudio) || ok[0] || null;
     };
     if (typeof options.client === 'string' && options.client) {
       const media = await attemptClient(options.client);

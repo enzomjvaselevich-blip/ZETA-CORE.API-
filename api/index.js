@@ -747,7 +747,25 @@ likes:Number(basic.like_count)||altCapa2?.meta?.likes||0,
 duracion_segundos:Number(basic.duration)||altCapa2?.meta?.duracion||searchMeta?.duracion||0,
 videoId:videoId,
 url_original:link,
-descarga_directa:media.url,
+// Los URLs de googlevideo vienen amarrados a la IP que los resolvio
+// (parametro ip=...; verificado en vivo: descargarlos desde otra IP da HTTP
+// 403 text/plain, justo el fallo que reporta el bot con "enlace directo").
+// Si el resolvedor fue googlevideo, se entrega la descarga pasando por /dl
+// (el bot baja desde la misma API, que streamea y reintentara con otra IP si hace falta); si fue
+// un tunnel de instancia publica (no amarrado), se deja el URL directo.
+descarga_directa:(()=>{
+try{
+if(typeof media.url==='string'&&/googlevideo\.com/.test(new URL(media.url).host)){
+const hostCab=(req.headers&&typeof req.headers.host==='string')?req.headers.host.trim():'';
+if(hostCab&&!hostCab.includes(' ')){
+const proto=(req.headers['x-forwarded-proto']||'').toString().split(',')[0].trim()==='http'?'http':'https';
+const claveReq=parsedUrl.searchParams.get('key')||(Array.isArray(req.headers['x-api-key'])?req.headers['x-api-key'][0]:req.headers['x-api-key'])||'';
+return proto+'://'+hostCab+'/dl?query='+encodeURIComponent(videoId)+'&kind='+encodeURIComponent(isAudio?'audio':'video')+'&key='+encodeURIComponent(String(claveReq||''));
+}
+}
+}catch(e){console.log("[ytmp] wrapper descarga_directa fallo: "+String(e&&e.message||e).slice(0,120));}
+return media.url;
+})(),
 calidad:media.quality||'Audio/Best',
 miniatura:`https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`
 });
