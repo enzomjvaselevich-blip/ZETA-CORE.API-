@@ -713,7 +713,12 @@ if(pathname==='/tiktok'||pathname==='/ttsearch'){
 try{
 const {searchTikTok,obtenerDiagnosticoTikTok}=require('./documentos/ttsearch');
 const {extractTikTokVideo}=require('./documentos/tiktok');
-if(pathname==='/ttsearch'){let r;try{r=await searchTikTok(query,limit);}catch(e){r=[];}const diag=parsedUrl.searchParams.get('debug')==='1'?obtenerDiagnosticoTikTok():undefined;return sendJson(200,diag?{ok:true,results:Array.isArray(r)?r:[],diagnostico:diag}:{ok:true,results:Array.isArray(r)?r:[]});}
+if(pathname==='/ttsearch'){let r;try{r=await searchTikTok(query,limit);}catch(e){r=[];}const rLista=Array.isArray(r)?r:[];const diag=obtenerDiagnosticoTikTok();
+if(rLista.length===0&&diag&&diag.todo_fallo){
+console.log('[ttsearch] http 502 BUSQUEDA_INESTABLE (todas las fuentes vacias) query="'+String(query).slice(0,60)+'"');
+return sendJson(502,{ok:false,error:'BUSQUEDA_INESTABLE',reintentar:true,message:'Todas las fuentes de busqueda de TikTok fallaron en este intento. El bot debe reintentar: es intermitente, no falta de resultados.',diagnostico:diag});
+}
+return sendJson(200,{ok:true,results:rLista,...(parsedUrl.searchParams.get('debug')==='1'?{diagnostico:diag}:{})});}
 return sendJson(200,{ok:true,...(await extractTikTokVideo(query))});
 }catch(e){return sendJson(502,{ok:false,message:'Modulo TikTok no disponible',error:e.message});}
 }

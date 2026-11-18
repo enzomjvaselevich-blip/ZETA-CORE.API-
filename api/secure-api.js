@@ -890,28 +890,49 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
     fuentes.push(['zenith', { status: 'fulfilled', value: null }]);
   }
   if (!candidatos.length) {
-    const [directaR, tikwmR, searxR, ddgR, ddgLtR, bingR] = await Promise.all([
-      medir('directa', buscarTikTokDirecta(query, limit, parentSignal)),
-      medir('tikwm', buscarTikwmSearch(query, limit, parentSignal)),
-      medir('searx', buscarSearxTikTok(query, limit, parentSignal)),
-      medir('ddg', buscarEnMotorTikTok('ddg', query, limit, parentSignal)),
-      medir('ddglite', buscarEnMotorTikTok('ddglite', query, limit, parentSignal)),
-      medir('bing', buscarEnMotorTikTok('bing', query, limit, parentSignal)),
+    // Carrera de la ronda 1 contra un tope de 6.5s: si una fuente se clava,
+    // se prosigue con lo que haya y el resto del presupuesto va a la ronda 2.
+    const ronda1 = await Promise.race([
+      Promise.all([
+        medir('directa', buscarTikTokDirecta(query, limit, parentSignal)),
+        medir('tikwm', buscarTikwmSearch(query, limit, parentSignal)),
+        medir('searx', buscarSearxTikTok(query, limit, parentSignal)),
+        medir('ddg', buscarEnMotorTikTok('ddg', query, limit, parentSignal)),
+        medir('ddglite', buscarEnMotorTikTok('ddglite', query, limit, parentSignal)),
+        medir('bing', buscarEnMotorTikTok('bing', query, limit, parentSignal)),
+      ]),
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 6500)),
     ]);
-    fuentes.push(['directa', directaR], ['tikwm', tikwmR], ['searx', searxR], ['ddg', ddgR], ['ddglite', ddgLtR], ['bing', bingR]);
-    for (const [, fuente] of fuentes) juntar(fuente.value);
-    // Segunda pasada solo si queda presupuesto: las fuentes upstream son
-    // intermitentes y un reintento corto suele recuperar resultados.
-    if (!candidatos.length && Date.now() - t0 < 7000) {
+    if (Array.isArray(ronda1)) {
+      const nombres = ['directa', 'tikwm', 'searx', 'ddg', 'ddglite', 'bing'];
+      nombres.forEach((nombre, i) => fuentes.push([nombre, ronda1[i] || { status: 'rejected', reason: new Error('sin resultado') }]));
+    } else {
+      fuentes.push(['ronda1', { status: 'rejected', reason: new Error('ronda 1 supero 6.5s') }]);
+    }
+    for (const [, fuente] of fuentes) juntar(fuente && fuente.value);
+    // Segunda ronda (FALLA 2/3): se reintentan TODAS las fuentes dentro del
+    // mismo pedido, con el presupuesto restante (~11.5s totales). Las fuentes
+    // upstream son intermitentes y un reintento corto suele recuperar
+    // resultados.
+    if (!candidatos.length && Date.now() - t0 < 8500) {
       await new Promise((resolve) => setTimeout(resolve, 800));
-      const restante = Math.max(3000, 11000 - (Date.now() - t0));
-      const [tikwmR2, searxR2] = await Promise.all([
-        medir('tikwm2', buscarTikwmSearch(query, limit, parentSignal)),
-        medir('searx2', buscarSearxTikTok(query, limit, parentSignal, restante)),
+      const restante = Math.max(2500, 11500 - (Date.now() - t0));
+      const segunda = [
+        ['directa2', buscarTikTokDirecta(query, limit, parentSignal)],
+        ['tikwm2', buscarTikwmSearch(query, limit, parentSignal)],
+        ['searx2', buscarSearxTikTok(query, limit, parentSignal, restante)],
+        ['ddg2', buscarEnMotorTikTok('ddg', query, limit, parentSignal)],
+        ['ddglite2', buscarEnMotorTikTok('ddglite', query, limit, parentSignal)],
+        ['bing2', buscarEnMotorTikTok('bing', query, limit, parentSignal)],
+      ].map(([nombre, promesa]) => medir(nombre, promesa));
+      const lote = await Promise.race([
+        Promise.all(segunda),
+        new Promise((resolve) => setTimeout(() => resolve([]), restante)),
       ]);
-      fuentes.push(['tikwm2', tikwmR2], ['searx2', searxR2]);
-      juntar(tikwmR2.value);
-      juntar(searxR2.value);
+      if (Array.isArray(lote)) {
+        for (const fuente of lote) if (fuente) fuentes.push(fuente);
+        for (const [, fuente] of lote) juntar(fuente && fuente.value);
+      }
     }
   }
 
@@ -936,6 +957,17 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
     .map(([nombre, fuente]) => `${nombre}=${fuente.status === 'fulfilled' && Array.isArray(fuente.value) ? fuente.value.length : 'X'}(${tiempos[nombre] || 0}ms)`)
     .join(' ');
   console.log(`[ttsearch] query="${qNorm.slice(0, 80)}" fuentes: ${conteo} -> resultados=${results.length} total=${Date.now() - t0}ms`);
+  // FALLA 2: si TODO fallo o vino vacio (cada fuente con 0 resultados o
+  // rechazada), se marca todoFallo para que /ttsearch responda
+  // BUSQUEDA_INESTABLE con reintentar:true en vez de un 200 vacio que esconde
+  // el fallo. En ese caso NO se cachea: el reintento corre las fuentes de
+  // vuelta (nueva ronda, nueva suerte).
+  const fuenteVacia = (f) => (!f || f.status === 'fulfilled'
+    ? (!f || !Array.isArray(f.value) || f.value.length === 0)
+    : true);
+  const fuentesReales = fuentes.filter(([nombre]) => nombre !== 'zenith');
+  const todoFallo = results.length === 0 && fuentesReales.length > 0 && fuentesReales.every(([, fuente]) => fuenteVacia(fuente));
+
   diagnosticoTikTok = {
     query: qNorm.slice(0, 80),
     fuentes: Object.fromEntries(fuentes.map(([nombre, fuente]) => [
@@ -948,12 +980,13 @@ async function buscarTikTokMultiFuente(query, limit, parentSignal) {
     tiempos_fuente: { ...tiempos },
     tiempo_total_ms: Date.now() - t0,
     resultados: results.length,
+    todo_fallo: todoFallo,
   };
 
-  if (TT_SEARCH_CACHE.size > 100) TT_SEARCH_CACHE.clear();
-  // Los resultados vacios se cachean poco tiempo: las fuentes son intermitentes
-  // y una mala ronda no debe dejar la busqueda en cero durante el TTL completo.
-  TT_SEARCH_CACHE.set(cacheKey, { results, expiresAt: Date.now() + (results.length ? TT_SEARCH_CACHE_TTL : 30 * 1000) });
+  if (results.length) {
+    if (TT_SEARCH_CACHE.size > 100) TT_SEARCH_CACHE.clear();
+    TT_SEARCH_CACHE.set(cacheKey, { results, expiresAt: Date.now() + TT_SEARCH_CACHE_TTL });
+  }
   return results;
 }
 
