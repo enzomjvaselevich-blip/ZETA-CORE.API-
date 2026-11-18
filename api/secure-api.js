@@ -1560,6 +1560,29 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     if (typeof options.client === 'string' && options.client) {
       const media = await attemptClient(options.client);
       if (media) return media;
+      if (type === 'video') {
+        // PO token TAMBIEN para video en el camino de cliente puntual: los
+        // URLs de video de googlevideo suelen exigir pot y devuelven 403 sin
+        // el (el audio itag 140 pasa sin el; por eso audio sale y video no).
+        try {
+          const minterData = await acquireYoutubePoMinter(youtube);
+          if (debug) {
+            console.log(`[dl][capa1][debug] cliente=${options.client} minter bgutil ${minterData ? 'ok' : 'no disponible'}: minteo PO token para video`);
+          }
+          if (minterData) {
+            const token = await minterData.minter.mintAsWebsafeString(videoId);
+            const mediaPo = await attemptClient(options.client, token);
+            if (debug) {
+              console.log(`[dl][capa1][debug] cliente=${options.client} con PO token: ${mediaPo ? 'seleccionado ' + mediaPo.quality : 'sin formato util'}`);
+            }
+            if (mediaPo) return mediaPo;
+          }
+        } catch (poError) {
+          if (debug) {
+            console.log(`[dl][capa1][debug] cliente=${options.client} PO video fallo: ${String(poError && poError.message || poError).slice(0, 120)}`);
+          }
+        }
+      }
       throw apiError(502, `El cliente ${options.client} no pudo obtener un enlace descargable.`, { code: 'YOUTUBE_CLIENT_FAILED' });
     }
     for (let round = 0; round < 3; round += 1) {
@@ -1574,8 +1597,15 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
       if (media) return media;
     }
     if (audioFallback) return audioFallback;
-    if (loginRequiredCount > 0 && Date.now() < deadline - 9000) {
+    // PO token para video SIEMPRE (no solo bajo LOGIN_REQUIRED): playability
+    // OK no garantiza que googlevideo acepte las URLs de video sin pot; ese
+    // es el sintoma visto (audio probe 200, video probe 403 en la misma IP).
+    const necesitaPo = loginRequiredCount > 0 || type === 'video';
+    if (necesitaPo && Date.now() < deadline - 9000) {
       try {
+        if (debug) {
+          console.log(`[dl][capa1][debug] ronda PO token (type=${type} loginRequired=${loginRequiredCount})`);
+        }
         const minterData = await acquireYoutubePoMinter(youtube);
         if (minterData) {
           diagnostics.push({ cliente: 'PO_TOKEN', ok: true });
@@ -2256,7 +2286,7 @@ function escaleraCalidades(kind, calidad) {
   // formato combinado menos bloqueado por googlevideo y que no necesita
   // DASH ni separar streams). Si itag 18 sale, se streamea ese. El audio
   // NO se toca (su escalera vive arriba).
-  const escalera = ['18', 'best', '480', '360'];
+  const escalera = ['18', 'best', '480', '360', '240', '144'];
   if (pedido && pedido !== 'best' && pedido !== '18' && /^\d+$/.test(pedido)) {
     const salida = ['18', pedido];
     for (const q of escalera) {
