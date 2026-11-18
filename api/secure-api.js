@@ -1924,8 +1924,16 @@ const INSTANCIAS_COBALT = [
 const TTL_SALUD_INSTANCIA = 15 * 60 * 1000;
 const saludInstancias = new Map();
 
+// viva: true=ok, false=caida, 'limitada'=responde pero no entrega archivos
+// (probe 200 con 0 bytes). Una limitada sigue intentandose: la limite puede
+// ser del video (ej. cobalt con videos largos); con videos cortos sirve.
 function marcarInstancia(nombre, viva) {
-  if (nombre) saludInstancias.set(nombre, { viva: !!viva, checkedAt: Date.now() });
+  if (!nombre) return;
+  if (viva === 'limitada') {
+    saludInstancias.set(nombre, { viva: true, limitada: true, checkedAt: Date.now() });
+    return;
+  }
+  saludInstancias.set(nombre, { viva: !!viva, limitada: false, checkedAt: Date.now() });
 }
 
 function instanciaDisponible(nombre) {
@@ -1975,7 +1983,7 @@ function listadoInstanciasPublicas() {
       const entrada = { nombre: host, servicio, salud: 'sin_probar' };
       const estado = saludInstancias.get(servicio + ':' + host);
       if (estado) {
-        entrada.salud = estado.viva ? 'ok' : 'caida';
+        entrada.salud = estado.viva ? (estado.limitada ? 'limitada' : 'ok') : 'caida';
         entrada.verificado_hace_s = Math.round((Date.now() - estado.checkedAt) / 1000);
       }
       salida.push(entrada);
@@ -2001,7 +2009,23 @@ function normalizarHostInstancia(valor) {
   try {
     const crudo = String(valor || '').trim();
     if (!crudo) return '';
-    return new URL(crudo.startsWith('http') ? crudo : 'https://' + crudo).host.toLowerCase();
+    const url = new URL(crudo.startsWith('http') ? crudo : 'https://' + crudo);
+    const host = url.host.toLowerCase();
+    const hostname = (url.hostname || '').toLowerCase();
+    if (!hostname.includes('.')) return '';
+    const simboloRed = hostname.match(/\.(onion|ygg|i2p|loki|bit|lock|exit|eth|zil)$/) || hostname.endsWith('.dyn.onion') || hostname.includes('.onion.')
+      // etiquetas DNS que marcan red garlic/I2P en dominios publicos del operador (ej. inv-ygg.nadeko.net)
+      || hostname.split('.').some((etiqueta) => /(^|-)(ygg|i2p)(-|$)/.test(etiqueta));
+    if (simboloRed) return '';
+    const ip = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ip) {
+      const o = [Number(ip[1]), Number(ip[2]), Number(ip[3]), Number(ip[4])];
+      if (o.some((n) => n > 255)) return '';
+      const [a, b] = o;
+      // privadas/loopback/link-local/multicast/reservadas: inalcanzable o inutiles desde Vercel
+      if (a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224) return '';
+    }
+    return host;
   } catch {
     return '';
   }
@@ -2064,6 +2088,59 @@ async function fetchJsonPublico(url, timeoutMs = 6000) {
   return await r.json();
 }
 
+// Validación con descarga REAL de un video corto (19s, verificado vivo):
+// no basta con que la instancia responda; debe entregar el archivo. Se corre
+// en segundo plano para no sumar latencia a /dl; el resultado alimenta el
+// health-check (ok/caida/limitada) que ya salta las instancias muertas.
+const VIDEO_VALIDACION = 'jNQXAC9IVRw';
+async function validarInstanciaReal(servicio, host) {
+  try {
+    let url = '';
+    if (servicio === 'invidious') {
+      const json = await fetchJsonInstancia('https://' + host + '/api/v1/videos/' + VIDEO_VALIDACION + '?local=true', 6000).catch(() => null);
+      const elegido = json && elegirFormatoInvidious(json, 'video');
+      if (!elegido) return 'caida';
+      url = elegido.url;
+    } else if (servicio === 'piped') {
+      const json = await fetchJsonInstancia('https://' + host + '/streams/' + VIDEO_VALIDACION, 6000).catch(() => null);
+      const elegido = json && elegirFormatoPiped(json, 'video');
+      if (!elegido) return 'caida';
+      url = elegido.url;
+    } else if (servicio === 'cobalt') {
+      const r = await fetch('https://' + host + '/', {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': NAVEGADOR_UA },
+        body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=' + VIDEO_VALIDACION, downloadMode: 'auto', videoQuality: '720', youtubeVideoCodec: 'h264' }),
+        signal: AbortSignal.timeout(6000),
+      }).catch(() => null);
+      const json = r ? await r.json().catch(() => null) : null;
+      if (!json || !json.url || (json.status !== 'tunnel' && json.status !== 'stream' && json.status !== 'redirect')) return 'caida';
+      url = json.url;
+    } else return 'caida';
+    const probe = await probeUrlMedia(url, 6000);
+    if (probe.ok) return 'ok';
+    if (probe.status === 200) return 'limitada';
+    return 'caida';
+  } catch {
+    return 'caida';
+  }
+}
+function validarEnSegundoPlano(servicio, hosts) {
+  (async () => {
+    let ok = 0, limitada = 0, caida = 0;
+    await Promise.all(hosts.map(async (host) => {
+      const clave = servicio + ':' + host;
+      const previo = saludInstancias.get(clave);
+      if (previo && Date.now() - previo.checkedAt < TTL_SALUD_INSTANCIA) return;
+      const resultado = await validarInstanciaReal(servicio, host);
+      if (resultado === 'ok') { marcarInstancia(clave, true); ok += 1; }
+      else if (resultado === 'limitada') { marcarInstancia(clave, 'limitada'); limitada += 1; }
+      else { marcarInstancia(clave, false); caida += 1; }
+    }));
+    console.log('[inst] validacion real ' + servicio + ': ok=' + ok + ' limitada=' + limitada + ' caida=' + caida);
+  })().catch(() => {});
+}
+
 async function descubrirInstancias(forzar = false) {
   if (!forzar && instanciasDescubiertas.leidoAt && Date.now() - instanciasDescubiertas.leidoAt < TTL_LISTAS_INSTANCIAS) return instanciasDescubiertas;
   if (instanciasDescubiertas.renovando) return instanciasDescubiertas.renovando;
@@ -2079,6 +2156,9 @@ async function descubrirInstancias(forzar = false) {
       if (cobalt.status === 'fulfilled') instanciasDescubiertas.cobalt = hostsDeCobalt(cobalt.value);
       instanciasDescubiertas.leidoAt = Date.now();
       console.log('[inst] descubiertas: invidious=' + instanciasDescubiertas.invidious.length + ' piped=' + instanciasDescubiertas.piped.length + ' cobalt=' + instanciasDescubiertas.cobalt.length);
+      validarEnSegundoPlano('invidious', instanciasDescubiertas.invidious.slice(0, 12));
+      validarEnSegundoPlano('piped', instanciasDescubiertas.piped.slice(0, 12));
+      validarEnSegundoPlano('cobalt', instanciasDescubiertas.cobalt.slice(0, 12));
       return instanciasDescubiertas;
     } finally {
       instanciasDescubiertas.renovando = null;
@@ -2271,7 +2351,7 @@ async function resolverViaInvidious(videoId, kind, presupuestoMs = 9000) {
       }
       const probe = await probeUrlMedia(elegido.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
       console.log('[dl][capa2] invidious:' + host + ' probe=' + probe.status + ' itag=' + elegido.itag + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) { registrarIntentoCapa2('invidious:' + host, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0); continue; }
+      if (!probe.ok) { registrarIntentoCapa2('invidious:' + host, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0); if (probe.status === 200) marcarInstancia(nombre, 'limitada'); continue; }
       marcarInstancia(nombre, true);
       return {
         url: elegido.url,
@@ -2317,7 +2397,7 @@ async function resolverViaPiped(videoId, kind, presupuestoMs = 9000) {
       }
       const probe = await probeUrlMedia(elegido.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
       console.log('[dl][capa2] piped:' + host + ' probe=' + probe.status + ' calidad=' + elegido.calidad + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) { registrarIntentoCapa2('piped:' + host, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0); continue; }
+      if (!probe.ok) { registrarIntentoCapa2('piped:' + host, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0); if (probe.status === 200) marcarInstancia(nombre, 'limitada'); continue; }
       marcarInstancia(nombre, true);
       return {
         url: elegido.url,
@@ -2377,7 +2457,7 @@ async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
       }
       const probe = await probeUrlMedia(json.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
       console.log('[dl][capa2] cobalt:' + host + ' probe=' + probe.status + ' tipo=' + (probe.tipo || '-') + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) { registrarIntentoCapa2('cobalt:' + host, 'probe ' + probe.status + ' bytes=' + (probe.bytes ?? '-') + ' ' + (probe.tipo || '-'), Date.now() - t0); continue; }
+      if (!probe.ok) { registrarIntentoCapa2('cobalt:' + host, 'probe ' + probe.status + ' bytes=' + (probe.bytes ?? '-') + ' ' + (probe.tipo || '-'), Date.now() - t0); if (probe.status === 200) marcarInstancia(nombre, 'limitada'); continue; }
       marcarInstancia(nombre, true);
       return {
         url: json.url,
@@ -2443,6 +2523,11 @@ module.exports = {
   parseSetCookies,
   extraerVisitorData,
   escaleraCalidades,
+  normalizarHostInstancia,
+  hostsDeInvidious,
+  hostsDePiped,
+  hostsDeCobalt,
+  validarInstanciaReal,
   descubrirInstancias,
   estadoInstanciasDescubiertas,
   instanciasPara,
