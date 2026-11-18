@@ -130,7 +130,7 @@ const cr=upstream.headers.get('content-range')||'';
 const tamanioTotal=Number(String(cr).split('/')[1])||Number(upstream.headers.get('content-length'))||0;
 const aceptaRangos=(upstream.headers.get('accept-ranges')||'').includes('bytes');
 applyMediaHeaders(upstream.status,tipoUpstream,{acceptRanges:upstream.headers.get('accept-ranges'),contentLength:upstream.headers.get('content-length'),contentRange:upstream.headers.get('content-range')});
-if(!range&&aceptaRangos&&tamanioTotal>3*1024*1024&&upstream.status===200){
+if(!options.sinRangos&&!range&&aceptaRangos&&tamanioTotal>3*1024*1024&&upstream.status===200){
 try{await upstream.body?.cancel();}catch(e){}
 console.log('[dl] stream por rangos paralelos ('+Math.round(tamanioTotal/1048576)+'MB)');
 try{
@@ -172,6 +172,25 @@ try{
 const r=await fetch(mediaUrl,{headers:probeHeaders,redirect:'follow'});
 try{await r.body?.cancel();}catch(e){}
 return r.status;
+}catch(e){return 0;}
+}
+// Probe alternativo (flujo real sin Range ni Cookie): googlevideo a veces
+// rechaza el probe de Range/cookie con 403 en URLs de VIDEO aunque el stream
+// normal si sirve (el audio itag 140 pasa, las de video no; evidencia: /ytmp4
+// resuelve el mismo video 200 y el enlace directo con ip= amarrada da 403).
+// Hace GET completo, lee UN chunk y corta. Devuelve el status si sirve.
+async function probeMediaFlujo(mediaUrl){
+try{
+const r=await fetch(mediaUrl,{headers:{'User-Agent':BROWSER_UA,Referer:'https://www.youtube.com/'},redirect:'follow'});
+if(r.status!==200&&r.status!==206){try{await r.body?.cancel();}catch(e){}return 0;}
+const tipo=String(r.headers.get('content-type')||'');
+let bytes=0;
+if(r.body&&typeof r.body.getReader==='function'){
+const reader=r.body.getReader();
+try{const p=await reader.read();bytes=p.done?0:p.value.length;}catch(e){}
+try{await reader.cancel();}catch(e){}
+}else{try{await r.body?.cancel();}catch(e){}}
+return bytes>0&&!tipo.includes('text/html')?r.status:0;
 }catch(e){return 0;}
 }
 
@@ -464,10 +483,10 @@ const extDefault=kind==='audio'?'m4a':'mp4';
 const cacheKey=videoId+'|'+kind+'|'+calidadPedido;
 const cacheado=dlMediaCache.get(cacheKey);
 if(cacheado&&cacheado.expiresAt>Date.now()){
-const probeCacheado=await probeMedia(cacheado.url,cacheado.headers||{});
+const probeCacheado=cacheado.sinRangos?await probeMediaFlujo(cacheado.url):await probeMedia(cacheado.url,cacheado.headers||{});
 if(probeCacheado===200||probeCacheado===206){
 console.log('[dl] cache hit ('+(cacheado.fuente||'-')+') probe='+probeCacheado);
-return streamMedia(req,res,sendJson,requestId,cacheado.url,{referer:'https://www.youtube.com/',headers:cacheado.headers||{},filename:videoId+'.'+(cacheado.ext||extDefault)});
+return streamMedia(req,res,sendJson,requestId,cacheado.url,{referer:'https://www.youtube.com/',headers:cacheado.headers||{},filename:videoId+'.'+(cacheado.ext||extDefault),sinRangos:cacheado.sinRangos});
 }
 dlMediaCache.delete(cacheKey);
 }
@@ -493,7 +512,15 @@ const conTimeout=(promesa,ms)=>Promise.race([promesa,new Promise((_,rechazar)=>s
 try{
 const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{sinProxy:true,debug:debugDl}),8000);
 if(media&&media.url){
-const probeStatus=await probeMedia(media.url,dlHeadersBase);
+let probeStatus=await probeMedia(media.url,dlHeadersBase);
+if(probeStatus!==200&&probeStatus!==206){
+const porFlujo=await probeMediaFlujo(media.url);
+if(porFlujo){
+probeStatus=porFlujo;
+console.log('[dl] probe Range/Cookie 403 pero flujo directo OK (video sin DASH): streameando sin rangos');
+return {ok:true,url:media.url,headers:{},detalle:'auto flujo',ext:extDefault,sinRangos:true};
+}
+}
 if(probeStatus!==200&&probeStatus!==206&&debugDl&&media.diagnostico){
 console.log('[dl][capa1][debug] auto probe='+probeStatus+' diagnostico: '+JSON.stringify(media.diagnostico).slice(0,400));
 }
@@ -542,7 +569,17 @@ const r=resultados[i];
 if(r.status!=='fulfilled'||!r.value||!r.value.url)continue;
 const c=candidatos[i];
 const headers=c.cookie&&hayCookie?{Cookie:cookieHeader}:{};
-const probeStatus=await probeMedia(r.value.url,headers);
+let probeStatus=await probeMedia(r.value.url,headers);
+if(probeStatus!==200&&probeStatus!==206){
+const porFlujo=await probeMediaFlujo(r.value.url);
+if(porFlujo){
+probeStatus=porFlujo;
+dlClienteCache.set(claveCliente,{cliente:c.cliente,cookie:c.cookie,expiresAt:Date.now()+6*60*60*1000});
+if(dlClienteCache.size>200)dlClienteCache.delete(dlClienteCache.keys().next().value);
+console.log('[dl] probe Range/Cookie 403 pero flujo directo OK ('+c.cliente+'): streameando sin rangos');
+return {ok:true,url:r.value.url,headers:{},detalle:'capa'+c.capa+' '+c.cliente+' flujo',ext:extDefault,sinRangos:true};
+}
+}
 intentos.push(Object.assign({capa:c.capa,objetivo:c.cliente+(c.cookie?'+cookie':'-sincookie'),resultado:'probe '+probeStatus,ms:Date.now()-t0Pasada},debugDl&&r.value.diagnostico?{detalles:r.value.diagnostico.slice(-4)}:{}));
 console.log('[dl][capa'+c.capa+'] cliente='+c.cliente+(c.cookie?' +cookie':' sincookie')+' probe='+probeStatus+' ('+(Date.now()-t0Pasada)+'ms)');
 if(probeStatus===200||probeStatus===206){
@@ -569,10 +606,10 @@ const restante1=Math.max(0,9000-(Date.now()-t0Pasada));
 r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),restante1))]);
 }
 if(r1&&r1.ok){
-dlMediaCache.set(videoId+'|'+kind+'|'+calidad,{url:r1.url,headers:r1.headers,fuente:'capa1:'+r1.detalle,ext:r1.ext,expiresAt:Date.now()+30*60*1000});
+dlMediaCache.set(videoId+'|'+kind+'|'+calidad,{url:r1.url,headers:r1.headers,fuente:'capa1:'+r1.detalle,ext:r1.ext,sinRangos:!!r1.sinRangos,expiresAt:Date.now()+30*60*1000});
 if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
 console.log('[dl] salida por CAPA 1 ('+r1.detalle+' calidad='+calidad+') a los '+(Date.now()-t0Pasada)+'ms');
-return {ok:true,url:r1.url,headers:r1.headers,detalle:r1.detalle,ext:r1.ext};
+return {ok:true,url:r1.url,headers:r1.headers,detalle:r1.detalle,ext:r1.ext,sinRangos:!!r1.sinRangos};
 }
 return null;
 };
@@ -594,7 +631,7 @@ if(salida)calidadUsada=kind==='audio'?calidadPedido:'18';
 }
 if(salida){
 console.log('[dl] entregado calidad='+calidadUsada+' fuente='+salida.detalle+' total='+(Date.now()-tInicioDl)+'ms');
-return streamMedia(req,res,sendJson,requestId,salida.url,{referer:'https://www.youtube.com/',headers:salida.headers,filename:videoId+'.'+salida.ext});
+return streamMedia(req,res,sendJson,requestId,salida.url,{referer:'https://www.youtube.com/',headers:salida.headers,filename:videoId+'.'+salida.ext,sinRangos:!!salida.sinRangos});
 }
 return sendJson(502,{ok:false,error:'IP_BLOQUEADA',reintentar:true,message:'Ningun cliente ni instancia publica pudo descargar desde este hosting. Vercel rota la IP de salida: reintentar suele funcionar.',intentos:[...intentos.slice(-6),...(secureApi.obtenerRegistroCapa2?secureApi.obtenerRegistroCapa2():[]).slice(-9)]});
 }
