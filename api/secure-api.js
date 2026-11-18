@@ -1530,7 +1530,9 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
         }
         clientDiag.ok = true;
         diagnostics.push(clientDiag);
-        return { ...selected, basic_info: basicInfo };
+        // Con debug: exponer el diagnostico por cliente (conteos de formatos,
+        // playability, PO token) para ver en el JSON donde muere el video.
+        return { ...selected, basic_info: basicInfo, ...(debug ? { diagnostico: diagnostics } : {}) };
       } catch (error) {
         if (parentSignal?.aborted || controller.signal.aborted) {
           throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });

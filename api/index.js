@@ -494,7 +494,10 @@ try{
 const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{sinProxy:true,debug:debugDl}),8000);
 if(media&&media.url){
 const probeStatus=await probeMedia(media.url,dlHeadersBase);
-intentos.push({capa:1,objetivo:'auto',resultado:'probe '+probeStatus,ms:Date.now()-t0Pasada});
+if(probeStatus!==200&&probeStatus!==206&&debugDl&&media.diagnostico){
+console.log('[dl][capa1][debug] auto probe='+probeStatus+' diagnostico: '+JSON.stringify(media.diagnostico).slice(0,400));
+}
+intentos.push(Object.assign({capa:1,objetivo:'auto',resultado:'probe '+probeStatus,ms:Date.now()-t0Pasada},debugDl&&media.diagnostico?{detalles:media.diagnostico}:{}));
 console.log('[dl][capa1] auto probe='+probeStatus+' ('+(Date.now()-t0Pasada)+'ms)');
 if(probeStatus===200||probeStatus===206){
 dlClienteCache.set(claveCliente,{cliente:null,cookie:true,expiresAt:Date.now()+6*60*60*1000});
@@ -540,7 +543,7 @@ if(r.status!=='fulfilled'||!r.value||!r.value.url)continue;
 const c=candidatos[i];
 const headers=c.cookie&&hayCookie?{Cookie:cookieHeader}:{};
 const probeStatus=await probeMedia(r.value.url,headers);
-intentos.push({capa:c.capa,objetivo:c.cliente+(c.cookie?'+cookie':'-sincookie'),resultado:'probe '+probeStatus,ms:Date.now()-t0Pasada});
+intentos.push(Object.assign({capa:c.capa,objetivo:c.cliente+(c.cookie?'+cookie':'-sincookie'),resultado:'probe '+probeStatus,ms:Date.now()-t0Pasada},debugDl&&r.value.diagnostico?{detalles:r.value.diagnostico.slice(-4)}:{}));
 console.log('[dl][capa'+c.capa+'] cliente='+c.cliente+(c.cookie?' +cookie':' sincookie')+' probe='+probeStatus+' ('+(Date.now()-t0Pasada)+'ms)');
 if(probeStatus===200||probeStatus===206){
 dlClienteCache.set(claveCliente,{cliente:c.cliente,cookie:c.cookie,expiresAt:Date.now()+6*60*60*1000});
