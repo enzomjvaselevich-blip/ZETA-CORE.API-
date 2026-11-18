@@ -455,6 +455,9 @@ const dlHeadersBase=hayCookie?{Cookie:cookieHeader}:{};
 const dlDeadline=Date.now()+9500;
 const tInicioDl=Date.now();
 const intentos=[];
+// debug=1: loguea y expone el diagnostico por cliente de la capa 1 (conteo
+// de formatos total/soloVideo/progresivos, playability, PO token).
+const debugDl=parsedUrl.searchParams.get('debug')==='1';
 const tipoMedia=kind==='audio'?'audio':'video';
 const calidadPedido=qualityParam==='best'?'best':qualityParam;
 const extDefault=kind==='audio'?'m4a':'mp4';
@@ -488,7 +491,7 @@ console.log('[dl] pasada calidad='+calidad+' con sesion anonima renovada');}catc
 const intentoCapa1=(async()=>{
 const conTimeout=(promesa,ms)=>Promise.race([promesa,new Promise((_,rechazar)=>setTimeout(()=>rechazar(new Error('timeout '+ms+'ms')),ms))]);
 try{
-const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{sinProxy:true}),8000);
+const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{sinProxy:true,debug:debugDl}),8000);
 if(media&&media.url){
 const probeStatus=await probeMedia(media.url,dlHeadersBase);
 intentos.push({capa:1,objetivo:'auto',resultado:'probe '+probeStatus,ms:Date.now()-t0Pasada});
@@ -499,8 +502,8 @@ return {ok:true,url:media.url,headers:dlHeadersBase,detalle:'auto',ext:extDefaul
 }
 }
 }catch(e){
-intentos.push({capa:1,objetivo:'auto',resultado:'fallo: '+String(e&&e.message||e).slice(0,110),ms:Date.now()-t0Pasada});
-console.log('[dl][capa1] auto fallo: '+String(e&&e.message||e).slice(0,100)+' ('+(Date.now()-t0Pasada)+'ms)');
+intentos.push(Object.assign({capa:1,objetivo:'auto',resultado:'fallo: '+String(e&&e.message||e).slice(0,110),ms:Date.now()-t0Pasada},debugDl&&e&&e.detalles?{detalles:e.detalles}:{}));
+console.log('[dl][capa1] auto fallo: '+String(e&&e.message||e).slice(0,100)+' (debug='+(debugDl?'si':'no')+') ('+(Date.now()-t0Pasada)+'ms)');
 }
 let instanciaConCookie=null,instanciaSinCookie=null;
 try{instanciaConCookie=await secureApi.getYoutubeInstance(true);}catch(e){console.log('[dl][capa1] instancia con cookie fallo: '+String(e&&e.message||e).slice(0,80));}
@@ -527,7 +530,7 @@ return base.filter((c)=>(c.cookie!==false?instanciaConCookie:instanciaSinCookie)
 };
 const candidatos=construirCandidatos();
 const resultados=await Promise.allSettled(candidatos.map((c)=>conTimeout(
-secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{client:c.cliente,cookie:c.cookie,sinProxy:true,youtube:c.cookie!==false?instanciaConCookie:instanciaSinCookie}),
+secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{client:c.cliente,cookie:c.cookie,sinProxy:true,debug:debugDl,youtube:c.cookie!==false?instanciaConCookie:instanciaSinCookie}),
 8000,
 )));
 for(let i=0;i<candidatos.length;i+=1){
@@ -590,7 +593,7 @@ if(salida){
 console.log('[dl] entregado calidad='+calidadUsada+' fuente='+salida.detalle+' total='+(Date.now()-tInicioDl)+'ms');
 return streamMedia(req,res,sendJson,requestId,salida.url,{referer:'https://www.youtube.com/',headers:salida.headers,filename:videoId+'.'+salida.ext});
 }
-return sendJson(502,{ok:false,error:'IP_BLOQUEADA',reintentar:true,message:'Ningun cliente ni instancia publica pudo descargar desde este hosting. Vercel rota la IP de salida: reintentar suele funcionar.',intentos:[...intentos,...secureApi.obtenerRegistroCapa2?secureApi.obtenerRegistroCapa2():[]].slice(-15)});
+return sendJson(502,{ok:false,error:'IP_BLOQUEADA',reintentar:true,message:'Ningun cliente ni instancia publica pudo descargar desde este hosting. Vercel rota la IP de salida: reintentar suele funcionar.',intentos:[...intentos.slice(-6),...(secureApi.obtenerRegistroCapa2?secureApi.obtenerRegistroCapa2():[]).slice(-9)]});
 }
 if(pathname==='/ytmp3'||pathname==='/ytmp4'||pathname==='/youtube'||pathname==='/ytsearch'){
 let Innertube;

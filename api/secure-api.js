@@ -1159,6 +1159,23 @@ async function selectYoutubeMediaFormat(formats, type, quality, player) {
     const requestedHeight = Number.parseInt(quality, 10) || 720;
     const candidates = available.filter(({ format }) => format.mime_type?.startsWith('video/'));
     const progressive = candidates.filter(({ format }) => format.has_audio);
+    // Pedido itag 18 (mp4 360p progresivo con audio integrado): elegirlo
+    // explicitamente si existe. Nunca entregar un video-only sin audio en
+    // este camino; si no hay progresivo, cae a la logica general de abajo.
+    if (requestedHeight === 18) {
+      const especifico = available.find(({ format }) => String(format.itag) === '18')
+        || progressive.slice().sort((a, b) => (b.format.height || 0) - (a.format.height || 0))[0];
+      if (especifico) {
+        return {
+          url: especifico.url,
+          quality: especifico.format.height ? `${especifico.format.height}p` : '360p',
+          bitrate: especifico.format.bitrate || null,
+        };
+      }
+      throw apiError(502, 'No hay un enlace multimedia directo compatible disponible para este video.', {
+        code: 'YOUTUBE_FORMAT_UNAVAILABLE',
+      });
+    }
     const pool = progressive.length ? progressive : candidates;
     const selected = pool.find(({ format }) => format.height === requestedHeight) ||
       pool.filter(({ format }) => format.height && format.height <= requestedHeight)
@@ -1468,6 +1485,10 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
   const timeoutError = apiError(504, 'REQUEST_TIMEOUT', 'La solicitud excedió el tiempo límite.');
   const abortFromParent = () => controller.abort(parentSignal.reason || timeoutError);
   const presupuesto = Math.max(3000, Number(options.presupuestoMs) || 24000);
+  // Debug (solo con debug=1 en la URL): loguea por cliente el conteo de
+  // formatos (total/soloVideo/progresivos), playability y si se uso PO token:
+  // permite ver por que la capa 1 produce audio pero no video.
+  const debug = options.debug === true;
   const timer = setTimeout(() => controller.abort(timeoutError), presupuesto);
   if (parentSignal) parentSignal.addEventListener('abort', abortFromParent, { once: true });
   try {
@@ -1495,8 +1516,18 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
         if (playerData.playability_status?.reason) clientDiag.razon = String(playerData.playability_status.reason).slice(0, 100);
         clientDiag.formatos = formats.length;
         clientDiag.directos = formats.filter((f) => f.url).length;
+        // Diagnostico de video (solo en debug): conteos por tipo para ver por
+        // que cliente la capa 1 no produce formatos de video (solo audio).
+        clientDiag.soloVideo = formats.filter((f) => f.mime_type?.startsWith('video/') && !f.has_audio && f.url).length;
+        clientDiag.progresivos = formats.filter((f) => f.mime_type?.startsWith('video/') && f.has_audio && f.url).length;
+        if (debug) {
+          console.log(`[dl][capa1][debug] cliente=${client} type=${type} quality=${quality} playability=${clientDiag.playability} formatos=${clientDiag.formatos} directos=${clientDiag.directos} soloVideo=${clientDiag.soloVideo} progresivos=${clientDiag.progresivos} po_token=${poToken ? 'si' : 'no'} (${Date.now() - inicioMs}ms)`);
+        }
         if (clientDiag.playability === 'LOGIN_REQUIRED') loginRequiredCount += 1;
         const selected = await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
+        if (debug) {
+          console.log(`[dl][capa1][debug] cliente=${client} seleccionado quality=${selected.quality} bitrate=${selected.bitrate || '-'}`);
+        }
         clientDiag.ok = true;
         diagnostics.push(clientDiag);
         return { ...selected, basic_info: basicInfo };
@@ -1921,7 +1952,11 @@ const INSTANCIAS_COBALT = [
   'https://cobalt-api.kwiatekmiki.com',
   'https://capi.oak.li',
 ];
-const TTL_SALUD_INSTANCIA = 15 * 60 * 1000;
+const TTL_SALUD_INSTANCIA_OK = 15 * 60 * 1000;
+// Cache NEGATIVA de a lo sumo 60s: si una instancia fallo o resulto limitada,
+// se reintenta despues de 60s (pedirle al usuario reintentar a los 2 min debe
+// reintentar TODO, incluso si Vercel roto IP y las instancias cambiaron).
+const TTL_SALUD_INSTANCIA_NEGATIVA = 60 * 1000;
 const saludInstancias = new Map();
 
 // viva: true=ok, false=caida, 'limitada'=responde pero no entrega archivos
@@ -1939,7 +1974,10 @@ function marcarInstancia(nombre, viva) {
 function instanciaDisponible(nombre) {
   const estado = saludInstancias.get(nombre);
   if (!estado) return true;
-  if (Date.now() - estado.checkedAt > TTL_SALUD_INSTANCIA) return true;
+  // Las caidas solo se saltan durante el TTL negativo de 60s; las ok (y las
+  // limitadas, que siempre se siguen intentando) valen su TTL largo.
+  const ttl = estado.viva ? TTL_SALUD_INSTANCIA_OK : TTL_SALUD_INSTANCIA_NEGATIVA;
+  if (Date.now() - estado.checkedAt > ttl) return true;
   return estado.viva;
 }
 
@@ -2131,7 +2169,7 @@ function validarEnSegundoPlano(servicio, hosts) {
     await Promise.all(hosts.map(async (host) => {
       const clave = servicio + ':' + host;
       const previo = saludInstancias.get(clave);
-      if (previo && Date.now() - previo.checkedAt < TTL_SALUD_INSTANCIA) return;
+      if (previo && previo.viva && Date.now() - previo.checkedAt < TTL_SALUD_INSTANCIA_OK) return;
       const resultado = await validarInstanciaReal(servicio, host);
       if (resultado === 'ok') { marcarInstancia(clave, true); ok += 1; }
       else if (resultado === 'limitada') { marcarInstancia(clave, 'limitada'); limitada += 1; }
@@ -2214,10 +2252,17 @@ function escaleraCalidades(kind, calidad) {
   if (kind === 'audio') {
     return pedido && pedido !== 'best' ? [pedido, 'best'] : ['best'];
   }
-  const escalera = ['best', '480', '360', '18'];
-  if (pedido && pedido !== 'best' && /^\d+$/.test(pedido)) {
-    const previas = escalera.filter((q) => q === 'best' || (Number(q) && Number(q) < Number(pedido)));
-    return [pedido, ...previas];
+  // Video: itag 18 PRIMERO (mp4 360p progresivo con audio integrado: el
+  // formato combinado menos bloqueado por googlevideo y que no necesita
+  // DASH ni separar streams). Si itag 18 sale, se streamea ese. El audio
+  // NO se toca (su escalera vive arriba).
+  const escalera = ['18', 'best', '480', '360'];
+  if (pedido && pedido !== 'best' && pedido !== '18' && /^\d+$/.test(pedido)) {
+    const salida = ['18', pedido];
+    for (const q of escalera) {
+      if (q !== '18' && q !== pedido) salida.push(q);
+    }
+    return salida;
   }
   return escalera;
 }
