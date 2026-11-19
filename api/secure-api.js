@@ -1345,6 +1345,65 @@ function estadoSesionAnonima() {
   return { activa: true, version: sesionAnonima.version, edad_min: Math.round((Date.now() - sesionAnonima.createdAt) / 60000) };
 }
 
+// ============================================================================
+// Cookie manual vencida (TAREA 1b): si la cookie configurada por variable de
+// entorno ya no tiene sesion (o provoca LOGIN_REQUIRED en todo), se marca como
+// invalida por 30 minutos y las peticiones pasan a la sesion anonima
+// auto-generada sin envolvernos en errores que la cookie ni siquiera arregla.
+// Cero configuracion del dueno: si la cookie vuelve a servir sesion, se reusa.
+// ============================================================================
+const COOKIE_INVALIDA_TTL = 30 * 60 * 1000;
+let cookieManualInvalidoHasta = 0;
+
+function marcarCookieManualInvalida() {
+  cookieManualInvalidoHasta = Date.now() + COOKIE_INVALIDA_TTL;
+  console.log('[cookie-manual] vencida o sin sesion: desactivada 30 min (la sesion anonima toma el relevo)');
+}
+
+// true = usable (o sin senal todavia), false = no usable (no hay cookie o esta
+// marcada invalida). Nunca lanza.
+function cookieManualVigente() {
+  if (!(process.env.YOUTUBE_COOKIE || process.env.youtube_cookie)) return false;
+  if (Date.now() < cookieManualInvalidoHasta) return false;
+  return true;
+}
+
+// Validacion pasiva: NO pide inicio de sesion a nadie, solo mira si la cookie
+// configurada sigue sosteniendo una sesion de YouTube. Si el marcador dice
+// logged out, se desactiva por TTL y todo sigue con la sesion anonima.
+async function validarCookieManual(cookieRaw) {
+  try {
+    const cookie = normalizeYoutubeCookie(cookieRaw);
+    if (!cookie) {
+      marcarCookieManualInvalida();
+      return false;
+    }
+    const res = await fetch('https://www.youtube.com/?hl=es&gl=US', {
+      headers: {
+        'user-agent': UA_SESION_ANONIMA,
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'es-ES,es;q=0.9,en;q=0.8',
+        cookie,
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.status !== 200) {
+      try { await res.body?.cancel(); } catch {}
+      return null;
+    }
+    const body = await res.text();
+    if (body.includes('"loggedIn":true')) return true;
+    if (body.includes('"loggedIn":false')) {
+      marcarCookieManualInvalida();
+      return false;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 let youtubePoMinterCache = null;
 
 async function acquireYoutubePoMinter(youtube) {
@@ -1432,7 +1491,7 @@ const youtubeInstanceCache = { conCookie: null, sinCookie: null, anonima: new Ma
 
 async function getYoutubeInstance(usarCookie, opciones = {}) {
   const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
-  if (!(usarCookie && cookieRaw)) {
+  if (!(usarCookie && cookieRaw && cookieManualVigente())) {
     // Instancia anónima con la sesión auto-generada (cero configuración del
     // dueño). La instancia se cachea por versión de sesión: al renovar la
     // sesión, se crea una instancia nueva.
@@ -1670,6 +1729,13 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
       }
     }
     if (loginRequiredCount >= clients.length - 1) {
+      // Si se estaba usando la instancia con cookie manual y TODO devolvio
+      // LOGIN_REQUIRED, lo mas probable es que la cookie este vencida: se
+      // desactiva por TTL y el proximo pedido (y la CAPA 4 de aqui abajo) va
+      // con la sesion anonima auto-generada.
+      if (options.cookie !== false && cookieManualVigente()) {
+        marcarCookieManualInvalida();
+      }
       const loginError = apiError(502, 'Este video tiene restriccion de edad o verificacion anti-bot: YouTube exige inicio de sesion para descargarlo.', {
         code: 'YOUTUBE_LOGIN_REQUIRED',
       });
@@ -2610,6 +2676,69 @@ async function resolverViaInstanciasPublicas(videoId, kind, presupuestoMs = 9000
   return resultado;
 }
 
+// ============================================================================
+// Precalentamiento (TAREA 1 + TAREA 2): se corre UNA vez por proceso (cold
+// start de Vercel) en segundo plano, sin bloquear la primera peticion. Deja:
+//  1. la sesion anonima auto-generada lista (visitor data + cookies),
+//  2. la cookie manual validada (si esta vencida, desactivada por TTL),
+//  3. la Capa 2 viva: listas publicas descargadas y TODAS las instancias
+//     (hardcodeadas + descubiertas) con health-check REAL en segundo plano.
+// ============================================================================
+let precalentamiento = null;
+let precalentamientoEstado = null;
+
+function precalentar() {
+  if (precalentamiento) return precalentamiento;
+  const t0 = Date.now();
+  precalentamientoEstado = { iniciado: true, listo: false };
+  precalentamiento = (async () => {
+    const resultados = await Promise.allSettled([
+      obtenerSesionAnonima(true)
+        .then((s) => {
+          console.log('[precal] sesion anonima lista v' + s.version);
+          return 'ok';
+        })
+        .catch((e) => {
+          console.log('[precal] sesion anonima fallo: ' + String(e && e.message || e).slice(0, 100));
+          return 'fallo';
+        }),
+      (async () => {
+        const cookieRaw = process.env.YOUTUBE_COOKIE || process.env.youtube_cookie || '';
+        if (!cookieRaw) return 'sin cookie';
+        const vigente = await validarCookieManual(cookieRaw);
+        console.log('[precal] cookie manual validada: ' + (vigente === true ? 'sesion activa' : vigente === false ? 'vencida -> desactivada' : 'sin senal'));
+        return vigente === false ? 'invalida' : 'ok';
+      })(),
+      descubrirInstancias(true)
+        .then((d) => {
+          console.log('[precal] instancias descubiertas: invidious=' + d.invidious.length + ' piped=' + d.piped.length + ' cobalt=' + d.cobalt.length);
+          validarEnSegundoPlano('invidious', INSTANCIAS_INVIDIOUS.map(normalizarHostInstancia).filter(Boolean).slice(0, 12));
+          validarEnSegundoPlano('piped', INSTANCIAS_PIPED.map(normalizarHostInstancia).filter(Boolean).slice(0, 12));
+          validarEnSegundoPlano('cobalt', INSTANCIAS_COBALT.map(normalizarHostInstancia).filter(Boolean).slice(0, 12));
+          return 'ok';
+        })
+        .catch((e) => {
+          console.log('[precal] descubrimiento de instancias fallo: ' + String(e && e.message || e).slice(0, 100));
+          return 'fallo';
+        }),
+    ]);
+    precalentamientoEstado = {
+      iniciado: true,
+      listo: true,
+      ms: Date.now() - t0,
+      sesion: resultados[0].status === 'fulfilled' ? resultados[0].value : 'fallo',
+      cookie: resultados[1].status === 'fulfilled' ? resultados[1].value : 'fallo',
+      instancias: resultados[2].status === 'fulfilled' ? resultados[2].value : 'fallo',
+    };
+    return precalentamientoEstado;
+  })();
+  return precalentamiento;
+}
+
+function estadoPrecalentamiento() {
+  return precalentamientoEstado || { iniciado: false };
+}
+
 module.exports = {
   apiError,
   fetchTextSafe,
@@ -2625,6 +2754,11 @@ module.exports = {
   getYoutubeInstance,
   obtenerSesionAnonima,
   estadoSesionAnonima,
+  validarCookieManual,
+  marcarCookieManualInvalida,
+  cookieManualVigente,
+  precalentar,
+  estadoPrecalentamiento,
   parseSetCookies,
   extraerVisitorData,
   escaleraCalidades,
