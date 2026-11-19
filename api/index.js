@@ -21,7 +21,10 @@ adminApi=require('../lib/admin');
 adminApiLoadError=e;
 }
 const { paginaDocs }=require('../lib/paginas');
-const VALID_QUALITY=/^(?:best|\d{3,4}p)$/;
+// Cualquier "999p" pasaba el filtro y despues degradaba a 360p en silencio:
+// solo se aceptan las calidades que la API realmente resuelve.
+const CALIDADES_VALIDAS=['best','144p','240p','360p','480p','720p','1080p','1440p','2160p'];
+const VALID_QUALITY=new RegExp('^(?:'+CALIDADES_VALIDAS.join('|')+')$');
 const VALID_LIMIT=/^\d+$/;
 const LIMIT_MIN=1;
 const LIMIT_MAX=20;
@@ -325,7 +328,7 @@ if(!query&&['/ytmp3','/ytmp4','/youtube','/ytsearch','/tiktok','/ttsearch','/xvi
 return sendJson(400,{ok:false,message:'Falta el parametro query o url'});
 }
 if(!isSearchRoute&&pathname!=='/'&&!VALID_QUALITY.test(qualityParam)){
-return sendJson(400,{ok:false,message:`Calidad invalida: "${qualityParam}". Usa best, 360p, 480p, 720p, 1080p, 1440p o 2160p.`});
+return sendJson(400,{ok:false,message:`Calidad invalida: "${qualityParam}". Usa ${CALIDADES_VALIDAS.join(', ')}.`});
 }
 let limit=Number(limitParam);
 if(!VALID_LIMIT.test(limitParam)||limit<LIMIT_MIN||limit>LIMIT_MAX){
@@ -337,7 +340,7 @@ const dlKey=process.env.DL_KEY||'';
 if(dlKey){
 const provided=parsedUrl.searchParams.get('key')||(Array.isArray(req.headers['x-api-key'])?req.headers['x-api-key'][0]:req.headers['x-api-key'])||'';
 if(provided!==dlKey){
-return sendJson(401,{ok:false,message:'Clave invalida o ausente. Pasa ?key= o el header x-api-key.'});
+return sendJson(401,{ok:false,dl_key_requerida:true,message:'Clave invalida o ausente. Pasa ?key= o el header x-api-key (la misma clave que mandes al pedir /ytmp4 o /ytmp3).'});
 }
 }
 const kind=(parsedUrl.searchParams.get('kind')||'video').toLowerCase();
@@ -728,6 +731,12 @@ const basic=media.basic_info||{};
 const canal=(typeof basic.author==='string'&&basic.author)?basic.author:(searchMeta?.canal||'Desconocido');
 const titulo=(typeof basic.title==='string'&&basic.title)?basic.title:(searchMeta?.titulo||'Desconocido');
 const link=`https://www.youtube.com/watch?v=${videoId}`;
+// El wrapper de descarga_directa apunta a /dl y /dl exige la clave. Si esta
+// llamada no trae la clave correcta, ese enlace responde 401: se avisa en el
+// JSON (requiere_key) en vez de devolver un link que muere sin explicacion.
+const dlKeyServidor=process.env.DL_KEY||'';
+const claveEnviada=parsedUrl.searchParams.get('key')||(Array.isArray(req.headers['x-api-key'])?req.headers['x-api-key'][0]:req.headers['x-api-key'])||'';
+const faltaClaveDl=!!dlKeyServidor&&claveEnviada!==dlKeyServidor;
 let tituloFinal=titulo,canalFinal=canal;
 if(tituloFinal==='Desconocido'||canalFinal==='Desconocido'){
 try{
@@ -767,6 +776,7 @@ return proto+'://'+hostCab+'/dl?query='+encodeURIComponent(videoId)+'&kind='+enc
 return media.url;
 })(),
 calidad:media.quality||'Audio/Best',
+...(faltaClaveDl?{requiere_key:true,aviso:'descarga_directa pasa por /dl: agrega ?key= (o el header x-api-key) a esta misma llamada para que el enlace funcione.'}:{}),
 miniatura:`https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`
 });
 }
