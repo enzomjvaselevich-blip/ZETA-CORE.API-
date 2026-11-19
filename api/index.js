@@ -687,6 +687,10 @@ const isAudio=pathname==='/ytmp3';
 const t0Ytmp=Date.now();
 const restanteYtmp=()=>14500-(Date.now()-t0Ytmp);
 const pedirCapa1Ytmp=async(presupuestoMs,opciones={})=>secureApi.fetchYoutubeMedia(videoId,isAudio?'audio':'video',qualityParam==='best'?'best':qualityParam,null,{presupuestoMs,sesionRenovada:true,...opciones});
+// CAPA 2 arranca EN PARALELO con la capa 1: si la capa 1 se consume los ~14s
+// con LOGIN_REQUIRED, lanzarla despues ya no tiene presupuesto y el pedido
+// muere en 502 aunque la instancia publica podria entregar el archivo.
+const capa2EnParalelo=secureApi.resolverViaInstanciasPublicas(videoId,isAudio?'audio':'video',7000).catch(()=>null);
 let media=null;
 let errorCapa1=null;
 try{
@@ -697,21 +701,23 @@ errorCapa1=e;
 console.log('[ytmp] capa1 fallo: '+String(e&&e.message||e).slice(0,120)+' ('+(Date.now()-t0Ytmp)+'ms)');
 }
 if(!media||!media.url){
+// Con LOGIN_REQUIRED el reintento con otra sesion anonima no cambia nada y se
+// come el presupuesto que necesita la capa 2.
+const loginRequerido=!!(errorCapa1&&(errorCapa1.code==='YOUTUBE_LOGIN_REQUIRED'||/LOGIN_REQUIRED/.test(String(errorCapa1.message||''))));
 // Reintento unico con sesion anonima recien renovada (solo si queda presupuesto).
-if(restanteYtmp()>=6000){
+if(!loginRequerido&&restanteYtmp()>=6000){
 try{await secureApi.obtenerSesionAnonima(true);console.log('[ytmp] reintento con sesion anonima renovada (restante '+restanteYtmp()+'ms)');}catch(e){}
 try{media=await pedirCapa1Ytmp(Math.min(5500,Math.max(3000,restanteYtmp()-500)),{cookie:false});console.log('[ytmp] reintento OK ('+(Date.now()-t0Ytmp)+'ms)');}catch(e2){console.log('[ytmp] reintento fallo: '+String(e2&&e2.message||e2).slice(0,120));}
 }
 }
 let altCapa2=null;
 if(!media||!media.url){
-const presupuestoCapa2=Math.min(4500,restanteYtmp()-500);
-if(presupuestoCapa2>=2000){
-altCapa2=await secureApi.resolverViaInstanciasPublicas(videoId,isAudio?'audio':'video',presupuestoCapa2).catch(()=>null);
+// Se cosecha la capa 2 que ya venia corriendo (no se relanza).
+const esperaCapa2=Math.max(1200,restanteYtmp()-300);
+altCapa2=await Promise.race([capa2EnParalelo,new Promise((r)=>setTimeout(()=>r(null),esperaCapa2))]);
 if(altCapa2&&altCapa2.url){
 console.log('[ytmp] respaldo por CAPA 2 via '+altCapa2.fuente+':'+altCapa2.instancia);
 media={url:altCapa2.url,quality:altCapa2.calidad||'',basic_info:{},proxy_dl:true,...(altCapa2.sin_audio?{sin_audio:true}:{})};
-}
 }
 }
 if(!media||!media.url){
