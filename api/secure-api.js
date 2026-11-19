@@ -2060,6 +2060,8 @@ const INSTANCIAS_PIPED = [
 // de tunnel con el archivo ya resuelto. co.otomir23.me verificada en vivo.
 const INSTANCIAS_COBALT = [
   'https://co.otomir23.me',
+  // Verificada en vivo (sin turnstile, entrega bytes reales probe 200).
+  'https://rue-cobalt.xenon.zone',
   'https://cobalt-api.ayo.tf',
   'https://cobalt-api.kwiatekmiki.com',
   'https://capi.oak.li',
@@ -2242,7 +2244,10 @@ async function fetchJsonPublico(url, timeoutMs = 6000) {
 // no basta con que la instancia responda; debe entregar el archivo. Se corre
 // en segundo plano para no sumar latencia a /dl; el resultado alimenta el
 // health-check (ok/caida/limitada) que ya salta las instancias muertas.
-const VIDEO_VALIDACION = 'jNQXAC9IVRw';
+// Video de validacion de instancias: dQw4w9WgXcQ esta verificado como
+// entregable por las instancias cobalt vivas (jNQXAC9IVRw daba falsos
+// negativos de probe en algunas).
+const VIDEO_VALIDACION = 'dQw4w9WgXcQ';
 async function validarInstanciaReal(servicio, host) {
   try {
     let url = '';
@@ -2677,6 +2682,132 @@ async function resolverViaInstanciasPublicas(videoId, kind, presupuestoMs = 9000
 }
 
 // ============================================================================
+// BUSQUEDA ROBUSTA: la busqueda por texto usaba una instancia Innertube
+// pelada (generate_session:false) que YouTube bloquea con el mismo anti-bot
+// que al player (0 resultados -> 404). Estrategia en cascada:
+//  1) Innertube con la sesion anonima auto-generada (2 intentos, 8s c/u)
+//  2) scraping del HTML de /results (videoRenderer)
+//  3) instancias Invidious activas (/api/v1/search)
+// Nunca lanza: devuelve lista (posiblemente vacia) de {videoId,titulo,...}.
+// ============================================================================
+function parsearDuracionTexto(texto) {
+  const partes = String(texto || '').split(':').map(Number).filter((n) => !Number.isNaN(n));
+  return partes.length >= 2 ? partes.reduce((a, b) => a * 60 + b, 0) : 0;
+}
+
+async function conLimite(promesa, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      promesa,
+      new Promise((_, rechazar) => { timer = setTimeout(() => rechazar(new Error('timeout')), ms); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function buscarYoutubeInnertube(texto, limit) {
+  for (let intento = 0; intento < 2; intento += 1) {
+    if (intento > 0) {
+      try { await conLimite(new Promise((r) => setTimeout(r, 700)), 1000); } catch {}
+    }
+    try {
+      const youtube = await conLimite(getYoutubeInstance(false), 8000);
+      const res = await conLimite(youtube.search(texto, { type: 'video' }), 8000);
+      const lista = (Array.isArray(res.videos) ? res.videos : [])
+        .filter((v) => v && /^[a-zA-Z0-9_-]{11}$/.test(String(v.id || '')));
+      if (lista.length) {
+        return lista.slice(0, limit).map((v) => ({
+          videoId: String(v.id),
+          titulo: v.title?.text || v.title || '',
+          canal: v.author?.name || '',
+          visitas: Number(String(v.view_count?.text || v.view_count || '').replace(/[^0-9]/g, '')) || 0,
+          duracion: parsearDuracionTexto(v.duration?.text) || Number(v.duration?.seconds) || 0,
+        }));
+      }
+    } catch {}
+  }
+  return [];
+}
+
+async function buscarYoutubeHtml(texto, limit) {
+  const url = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(texto) + '&sp=EgIQAQ%3D%3D';
+  const res = await fetch(url, {
+    headers: {
+      'user-agent': UA_SESION_ANONIMA,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'es-ES,es;q=0.9,en;q=0.8',
+      cookie: 'SOCS=CAI',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(10000),
+  });
+  if (res.status !== 200) {
+    try { await res.body?.cancel(); } catch {}
+    return [];
+  }
+  const html = await res.text();
+  const salida = [];
+  const vistos = new Set();
+  const reVideo = /"(?:videoRenderer|compactVideoRenderer)":\{"videoId":"([a-zA-Z0-9_-]{11})"/g;
+  const reTitulo = /"title":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"\}\]/;
+  const reCanal = /"(?:ownerText|longBylineText)":\{"runs":\[\{"text":"((?:[^"\\]|\\.)*)"/;
+  let m;
+  while ((m = reVideo.exec(html)) && salida.length < limit) {
+    const id = m[1];
+    if (vistos.has(id)) continue;
+    const tramo = html.slice(m.index, m.index + 2500);
+    const tm = tramo.match(reTitulo);
+    let titulo = '';
+    if (tm) {
+      try { titulo = JSON.parse('"' + tm[1] + '"'); } catch { titulo = tm[1]; }
+    }
+    const cm = tramo.match(reCanal);
+    vistos.add(id);
+    salida.push({ videoId: id, titulo: titulo || texto, canal: cm ? String(cm[1]) : '', visitas: 0, duracion: 0 });
+  }
+  return salida;
+}
+
+async function buscarYoutubeInvidious(texto, limit) {
+  for (const base of await instanciasPara('invidious', INSTANCIAS_INVIDIOUS)) {
+    let host = '';
+    try { host = new URL(base).host; } catch { continue; }
+    const nombre = 'invidious:' + host;
+    if (!instanciaDisponible(nombre)) continue;
+    try {
+      const json = await fetchJsonInstancia(base + '/api/v1/search?q=' + encodeURIComponent(texto) + '&type=video', 6000);
+      const lista = (Array.isArray(json) ? json : [])
+        .filter((v) => v && v.videoId && /^[a-zA-Z0-9_-]{11}$/.test(String(v.videoId)))
+        .slice(0, limit)
+        .map((v) => ({
+          videoId: String(v.videoId),
+          titulo: v.title || texto,
+          canal: v.author || '',
+          visitas: Number(v.viewCount) || 0,
+          duracion: Number(v.lengthSeconds) || 0,
+        }));
+      if (lista.length) {
+        marcarInstancia(nombre, true);
+        return lista;
+      }
+    } catch {}
+  }
+  return [];
+}
+
+async function buscarVideoYoutube(texto, limit = 5) {
+  const limpio = String(texto || '').trim();
+  if (!limpio || limpio.length > 120) return [];
+  const salida = await buscarYoutubeInnertube(limpio, limit);
+  if (salida.length) return salida;
+  const html = await buscarYoutubeHtml(limpio, limit).catch(() => []);
+  if (html.length) return html;
+  return buscarYoutubeInvidious(limpio, limit).catch(() => []);
+}
+
+// ============================================================================
 // Precalentamiento (TAREA 1 + TAREA 2): se corre UNA vez por proceso (cold
 // start de Vercel) en segundo plano, sin bloquear la primera peticion. Deja:
 //  1. la sesion anonima auto-generada lista (visitor data + cookies),
@@ -2777,6 +2908,7 @@ module.exports = {
   obtenerRegistroCapa2,
   listadoInstanciasPublicas,
   fetchYoutubeMedia,
+  buscarVideoYoutube,
   fetchYoutubeWatchPageMedia,
   selectYoutubeMediaFormat,
   publicErrorMessage,
