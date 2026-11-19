@@ -710,7 +710,7 @@ if(presupuestoCapa2>=2000){
 altCapa2=await secureApi.resolverViaInstanciasPublicas(videoId,isAudio?'audio':'video',presupuestoCapa2).catch(()=>null);
 if(altCapa2&&altCapa2.url){
 console.log('[ytmp] respaldo por CAPA 2 via '+altCapa2.fuente+':'+altCapa2.instancia);
-media={url:altCapa2.url,quality:altCapa2.calidad||'',basic_info:{}};
+media={url:altCapa2.url,quality:altCapa2.calidad||'',basic_info:{},proxy_dl:true,...(altCapa2.sin_audio?{sin_audio:true}:{})};
 }
 }
 }
@@ -764,7 +764,11 @@ url_original:link,
 // un tunnel de instancia publica (no amarrado), se deja el URL directo.
 descarga_directa:(()=>{
 try{
-if(typeof media.url==='string'&&/googlevideo\.com/.test(new URL(media.url).host)){
+// Dos casos necesitan pasar por /dl (que streamea server-side con User-Agent
+// de navegador y reintenta): googlevideo, que ata la URL a la IP que la
+// resolvio, y las instancias publicas (proxy_dl), que devuelven 403 a
+// cualquier UA que no sea de navegador (axios/python/undici incluidos).
+if(typeof media.url==='string'&&(media.proxy_dl===true||/googlevideo\.com/.test(new URL(media.url).host))){
 const hostCab=(req.headers&&typeof req.headers.host==='string')?req.headers.host.trim():'';
 if(hostCab&&!hostCab.includes(' ')){
 const proto=(req.headers['x-forwarded-proto']||'').toString().split(',')[0].trim()==='http'?'http':'https';
@@ -777,6 +781,9 @@ return media.url;
 })(),
 calidad:media.quality||'Audio/Best',
 ...(faltaClaveDl?{requiere_key:true,aviso:'descarga_directa pasa por /dl: agrega ?key= (o el header x-api-key) a esta misma llamada para que el enlace funcione.'}:{}),
+// El respaldo por instancia publica solo expone DASH separado para algunos
+// videos: se avisa para que el bot no entregue un video mudo sin saberlo.
+...(media.sin_audio?{sin_audio:true,aviso_audio:'Este respaldo entrega el video sin pista de audio (la instancia publica solo expone DASH separado para este video).'}:{}),
 miniatura:`https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`
 });
 }

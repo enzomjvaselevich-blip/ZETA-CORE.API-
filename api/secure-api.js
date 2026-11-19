@@ -1967,14 +1967,17 @@ function publicErrorMessage(error) {
 // googlevideo. Cada instancia se valida con un probe de 1 KB antes de usarla;
 // las caidas se recuerdan 15 minutos y se saltan automaticamente.
 // ============================================================================
+// Orden = prioridad del resolver secuencial (el presupuesto de capa 2 es de
+// pocos segundos, asi que la unica instancia verificada viva va PRIMERO; si
+// queda al final nunca se llega a ella).
 const INSTANCIAS_INVIDIOUS = [
+  'https://yt.chocolatemoo53.com',
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
   'https://yewtu.be',
   'https://invidious.private.coffee',
   'https://iv.melmac.space',
   'https://invidious.f5.si',
-  'https://yt.chocolatemoo53.com',
   'https://invidious.materialio.us',
 ];
 const INSTANCIAS_PIPED = [
@@ -2180,12 +2183,15 @@ async function validarInstanciaReal(servicio, host) {
     if (servicio === 'invidious') {
       const json = await fetchJsonInstancia('https://' + host + '/api/v1/videos/' + VIDEO_VALIDACION + '?local=true', 6000).catch(() => null);
       const elegido = json && elegirFormatoInvidious(json, 'video');
-      if (!elegido) return 'caida';
+      // Responde con datos pero sin formato para el video de validacion: puede
+      // ser que ESE video este bloqueado, no que la instancia este muerta. Se
+      // marca 'limitada' para que se le siga probando (caida la saltaria 60s).
+      if (!elegido) return 'limitada';
       url = elegido.url;
     } else if (servicio === 'piped') {
       const json = await fetchJsonInstancia('https://' + host + '/streams/' + VIDEO_VALIDACION, 6000).catch(() => null);
       const elegido = json && elegirFormatoPiped(json, 'video');
-      if (!elegido) return 'caida';
+      if (!elegido) return 'limitada';
       url = elegido.url;
     } else if (servicio === 'cobalt') {
       const r = await fetch('https://' + host + '/', {
@@ -2259,8 +2265,11 @@ async function instanciasPara(servicio, hardcodeadas) {
       finales.push('https://' + host);
     }
   }
+  // Descubrimiento NO bloqueante: consultar las listas publicas tarda hasta 6s
+  // y el presupuesto de capa 2 son pocos segundos, asi que se lanza en segundo
+  // plano y se usa lo que ya este cacheado (las hardcodeadas siempre estan).
+  descubrirInstancias(false).catch(() => {});
   try {
-    await descubrirInstancias(false);
     for (const host of instanciasDescubiertas[servicio] || []) {
       if (!vistas.has(host)) {
         vistas.add(host);
@@ -2317,9 +2326,13 @@ function elegirFormatoInvidious(json, kind) {
   const adaptive = Array.isArray(json.adaptiveFormats)
     ? json.adaptiveFormats.filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'))
     : [];
-  const progresivos = Array.isArray(json.formats)
-    ? json.formats.filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'))
-    : [];
+  // La API de Invidious devuelve los muxed (video+audio) en 'formatStreams';
+  // leer solo 'formats' dejaba esa lista siempre vacia y por eso capa 2
+  // entregaba video sin audio aunque hubiera un progresivo disponible.
+  const listaProgresivos = Array.isArray(json.formatStreams)
+    ? json.formatStreams
+    : Array.isArray(json.formats) ? json.formats : [];
+  const progresivos = listaProgresivos.filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'));
   if (kind === 'audio') {
     const audios = adaptive.filter((f) => String(f.type || f.mimeType || '').includes('audio/'));
     const m4a = audios.filter((f) => String(f.type || f.mimeType || '').includes('audio/mp4'));
@@ -2332,17 +2345,20 @@ function elegirFormatoInvidious(json, kind) {
     }
     return null;
   }
+  // Muxed (video+audio) primero, igual que la capa 1: mejor 360p con audio
+  // que 720p mudo.
+  const prog = progresivos
+    .filter((f) => String(f.type || f.mimeType || '').includes('video/mp4'))
+    .sort((a, b) => alturaDeCalidad(b.qualityLabel) - alturaDeCalidad(a.qualityLabel))[0] || null;
+  if (prog) return { url: prog.url, itag: String(prog.itag || ''), tipo: 'video/mp4', calidad: prog.qualityLabel || '360p' };
   const mp4 = adaptive.filter(
     (f) => String(f.type || f.mimeType || '').includes('video/mp4') && (alturaDeCalidad(f.qualityLabel) || 0) <= 720,
   );
   const mejor = mp4.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
   if (mejor) {
-    return { url: mejor.url, itag: String(mejor.itag || ''), tipo: 'video/mp4', calidad: mejor.qualityLabel || '' };
+    // Ultimo recurso: DASH separado, la instancia no expone el progresivo.
+    return { url: mejor.url, itag: String(mejor.itag || ''), tipo: 'video/mp4', calidad: mejor.qualityLabel || '', sin_audio: true };
   }
-  const prog = progresivos
-    .filter((f) => String(f.type || f.mimeType || '').includes('video/mp4'))
-    .sort((a, b) => alturaDeCalidad(b.qualityLabel) - alturaDeCalidad(a.qualityLabel))[0] || null;
-  if (prog) return { url: prog.url, itag: String(prog.itag || ''), tipo: 'video/mp4', calidad: prog.qualityLabel || '360p' };
   return null;
 }
 
@@ -2448,6 +2464,7 @@ async function resolverViaInvidious(videoId, kind, presupuestoMs = 9000) {
         instancia: host,
         calidad: elegido.calidad,
         ext: kind === 'audio' ? 'm4a' : 'mp4',
+        ...(elegido.sin_audio ? { sin_audio: true } : {}),
         meta: {
           titulo: typeof json.title === 'string' ? json.title : '',
           canal: typeof json.author === 'string' ? json.author : '',
