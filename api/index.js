@@ -659,13 +659,16 @@ return sendJson(502,{ok:false,error:'IP_BLOQUEADA',reintentar:true,message:'Ning
 if(pathname==='/ytmp3'||pathname==='/ytmp4'||pathname==='/youtube'||pathname==='/ytsearch'){
 let videoId=query;
 let searchMeta=null;
+let listaBusqueda=null;
 const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
 if(match){
 videoId=match[1];
 }else if(!/^[a-zA-Z0-9_-]{11}$/.test(query)){
 // BUSQUEDA ROBUSTA: sesion anonima -> HTML de /results -> Invidious.
-// Nunca 404 por bloqueo anti-bot de la instancia pelada de antes.
-const listaBusqueda=await secureApi.buscarVideoYoutube(query,pathname==='/ytsearch'?limit:3).catch(()=>[]);
+// listaBusqueda vive en el scope de la ruta: el plan B la consulta tambien
+// cuando query es un videoId/URL; declararla con const dentro de este bloque
+// producia ReferenceError: listaBusqueda is not defined.
+listaBusqueda=await secureApi.buscarVideoYoutube(query,pathname==='/ytsearch'?limit:3).catch(()=>[]);
 if(!Array.isArray(listaBusqueda)||!listaBusqueda.length){
 return sendJson(404,{ok:false,reintentar:true,message:'No se encontraron resultados para la busqueda: '+query});
 }
