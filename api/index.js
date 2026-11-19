@@ -21,6 +21,11 @@ adminApi=require('../lib/admin');
 adminApiLoadError=e;
 }
 const { paginaDocs }=require('../lib/paginas');
+// Precalentamiento de cold start (sesion anonima + Capa 2 viva) en segundo
+// plano: no bloquea la primera peticion ni cambia su resultado.
+try{
+if(secureApi&&typeof secureApi.precalentar==='function')secureApi.precalentar().catch(()=>{});
+}catch(e){}
 // Cualquier "999p" pasaba el filtro y despues degradaba a 360p en silencio:
 // solo se aceptan las calidades que la API realmente resuelve.
 const CALIDADES_VALIDAS=['best','144p','240p','360p','480p','720p','1080p','1440p','2160p'];
@@ -468,7 +473,9 @@ if(!primerVideo)return sendJson(404,{ok:false,message:'No se encontraron resulta
 videoId=String(primerVideo.id);
 }
 const cookieHeader=secureApi.normalizeYoutubeCookie(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie||'');
-const hayCookie=!!cookieHeader;
+// Solo se mandan cookies de la sesion manual si sigue vigente (si esta vencida
+// se dejo de usar automaticamente: ver cookieManualVigente en secure-api).
+const hayCookie=!!cookieHeader&&secureApi.cookieManualVigente()!==false;
 const dlHeadersBase=hayCookie?{Cookie:cookieHeader}:{};
 // Fail fast (FALLA 1): presupuesto interno de 10s para obtener el primer
 // exito (capa 1 + capa 2 en paralelo). Si a los 10s nada paso el probe, se
@@ -823,7 +830,7 @@ return sendJson(404,{ok:false,error:{message:String(e&&e.message||e).slice(0,220
 }
 }
 if(pathname==='/status'){
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),sesion_anonima:(secureApi.estadoSesionAnonima?typeof secureApi.estadoSesionAnonima==='function'?secureApi.estadoSesionAnonima():{activa:false}:{activa:false}),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','instancias_publicas'],instancias_descubiertas:(secureApi.estadoInstanciasDescubiertas&&typeof secureApi.estadoInstanciasDescubiertas==='function')?secureApi.estadoInstanciasDescubiertas():null,instancias_publicas:(secureApi.listadoInstanciasPublicas&&typeof secureApi.listadoInstanciasPublicas==='function')?secureApi.listadoInstanciasPublicas():null,configuracion_dueno:'no requerida: la API auto-gestiona su sesion anonima y su pool de instancias publicas',admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_cookie_vigente:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie)&&secureApi.cookieManualVigente()!==false,youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),precalentamiento:(secureApi.estadoPrecalentamiento&&typeof secureApi.estadoPrecalentamiento==='function')?secureApi.estadoPrecalentamiento():null,sesion_anonima:(secureApi.estadoSesionAnonima?typeof secureApi.estadoSesionAnonima==='function'?secureApi.estadoSesionAnonima():{activa:false}:{activa:false}),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','instancias_publicas'],instancias_descubiertas:(secureApi.estadoInstanciasDescubiertas&&typeof secureApi.estadoInstanciasDescubiertas==='function')?secureApi.estadoInstanciasDescubiertas():null,instancias_publicas:(secureApi.listadoInstanciasPublicas&&typeof secureApi.listadoInstanciasPublicas==='function')?secureApi.listadoInstanciasPublicas():null,configuracion_dueno:'no requerida: la API auto-gestiona su sesion anonima y su pool de instancias publicas',admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
