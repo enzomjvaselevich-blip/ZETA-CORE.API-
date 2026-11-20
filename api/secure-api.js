@@ -1824,8 +1824,11 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     // Video inexistente/privado/eliminado: el fallo llega aqui SI ningun
     // cliente proceso la respuesta completa (ej. VideoInfo lanza al parsear).
     // Es un fallo PERMANENTE: 404 con reintentar:false, no 502 generico.
+    // Con la misma guarda anti-falso-404: si hay 'Sign in'/'not a bot' en los
+    // diagnosticos, el 'unavailable' es efecto del throttling y NO permanente.
     const msgFallo = String(error?.message || error);
-    if (/unavailable|private|removed|terminated|not found|no longer available|does not exist/i.test(msgFallo)) {
+    const diagLoginActivo = /sign in|not a bot|confirm you|age/i.test(diagnostics.map((d) => String(d.razon || d.error || '')).join(' | '));
+    if (!diagLoginActivo && /unavailable|private|removed|terminated|not found|no longer available|does not exist/i.test(msgFallo)) {
       const noDisponible = apiError(404, 'Este video no esta disponible: fue eliminado, es privado o no existe.', { code: 'YOUTUBE_VIDEO_UNAVAILABLE' });
       noDisponible.reintentar = false;
       noDisponible.detalles = diagnostics;
