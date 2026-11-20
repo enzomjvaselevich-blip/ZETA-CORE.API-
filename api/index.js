@@ -1117,7 +1117,13 @@ if(pathname==='/xvideo'||pathname==='/x'){
 try{
 const {fetchXVideo}=require('./documentos/xvideo');
 return sendJson(200,{ok:true,...(await fetchXVideo(query))});
-}catch(e){return sendJson(502,{ok:false,message:'Modulo X no disponible',error:e.message});}
+}catch(e){
+// apiError trae su statusCode real (400 URL invalida, 404 no existe, 502
+// upstream...): responder 502 a todo plano diagnostico engañoso al bot y
+// activaba reintentos inutiles cuando nada podia cambiar.
+const codigo=Number(e&&e.statusCode)>=400&&Number(e&&e.statusCode)<=599?Number(e.statusCode):502;
+return sendJson(codigo,{ok:false,reintentar:(codigo===502||codigo===504)||undefined,message:codigo===502?'Modulo X no disponible':String(e&&e.message||'Modulo X no disponible').slice(0,200),error:e.message});
+}
 }
 if(pathname==='/instagram'||pathname==='/facebook'){
 try{
