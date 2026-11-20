@@ -2116,28 +2116,28 @@ function publicErrorMessage(error) {
 // Orden = prioridad del resolver secuencial (el presupuesto de capa 2 es de
 // pocos segundos, asi que la unica instancia verificada viva va PRIMERO; si
 // queda al final nunca se llega a ella).
-// Podada en vivo: private.coffee (502), melmac.space (fetch failed), f5.si
-// (530), materialio.us (500), yewtu.be (403 desde datacenter). Las 4 que
-// quedan fueron las unicas que respondieron al directorio oficial
-// api.invidious.io/instances.json en la barrida de hoy.
+// Podada en vivo (barrido 2026-11-20): private.coffee (502), melmac.space
+// (fetch failed), f5.si (530), materialio.us (500), yewtu.be (403 desde
+// datacenter), chocolatemoo53 (403 desde datacenter, es limitada: UNPLAYABLE
+// de ese hosting no significa muerta).
 const INSTANCIAS_INVIDIOUS = [
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
-  'https://yt.chocolatemoo53.com',
   'https://invidious.tiekoetter.com',
+  'https://yt.chocolatemoo53.com',
 ];
 // Todas las fijas verificadas muertas en vivo (502/500/403/fetch failed);
 // descubrirInstancias las reemplaza dinamicamente desde los directorios.
 const INSTANCIAS_PIPED = [];
 // Instancias comunitarias de cobalt (publicas, sin clave): devuelven una URL
-// de tunnel con el archivo ya resuelto. co.otomir23.me verificada en vivo.
+// de tunnel con el archivo ya resuelto. Barrido 2026-11-20 con entrega REAL
+// de bytes (tunnel + probe 200): rue-cobalt primero (resuelve contenido que
+// Vercel no logra directo, ej. Dalex); ayo.tf (530), kwiatekmiki y capi.oak.li
+// (fetch failed desde todo lado) ELIMINADAS; otomir23 viva pero rechaza
+// contenido con error.api.youtube.login -> se marca 'limitada', no caida.
 const INSTANCIAS_COBALT = [
-  'https://co.otomir23.me',
-  // Verificada en vivo (sin turnstile, entrega bytes reales probe 200).
   'https://rue-cobalt.xenon.zone',
-  'https://cobalt-api.ayo.tf',
-  'https://cobalt-api.kwiatekmiki.com',
-  'https://capi.oak.li',
+  'https://co.otomir23.me',
 ];
 const TTL_SALUD_INSTANCIA_OK = 15 * 60 * 1000;
 // Cache NEGATIVA de a lo sumo 60s: si una instancia fallo o resulto limitada,
@@ -2223,9 +2223,15 @@ function listadoInstanciasPublicas() {
 // cobalt) cada 6h y se agregan las instancias https sin clave que respondan.
 // ============================================================================
 const TTL_LISTAS_INSTANCIAS = 6 * 60 * 60 * 1000;
+// Piped: piped-instances.kavin.rocks esta MUERTA (timeout vivo, barrido
+// 2026-11-20). Fuente oficial actual: el doc de instancias publicas del repo
+// TeamPiped/documentation (markdown; se extraen los hosts pipedapi*/api.piped).
+// Cobalt: instances.cobalt.best BLOQUEA user-agents por defecto (lo dice su
+// propia /api), por eso fetchJsonPublico le manda UA de proyecto.
+const UA_PROYECTO = 'zeta-core-api/1.0 (+https://github.com/enzomjvaselevich-blip/zeta-core-api.vercel.app)';
 const LISTAS_INSTANCIAS = {
   invidious: 'https://api.invidious.io/instances.json',
-  piped: 'https://piped-instances.kavin.rocks/',
+  piped: 'https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md',
   cobalt: 'https://instances.cobalt.best/api/instances.json',
 };
 const instanciasDescubiertas = { invidious: [], piped: [], cobalt: [], leidoAt: 0, renovando: null };
@@ -2302,15 +2308,29 @@ function hostsDeCobalt(json) {
   return hosts;
 }
 
-async function fetchJsonPublico(url, timeoutMs = 6000) {
+async function fetchJsonPublico(url, timeoutMs = 6000, ua = '') {
   if (!url.startsWith('https://')) throw new Error('solo https');
   const r = await fetch(url, {
-    headers: { 'User-Agent': UA_SESION_ANONIMA, Accept: 'application/json' },
+    headers: { 'User-Agent': ua || UA_SESION_ANONIMA, Accept: 'application/json' },
     redirect: 'follow',
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return await r.json();
+}
+
+// Piped desde el markdown de TeamPiped/documentation: extrae los hosts de API
+// (pipedapi.* y api.piped.*) mencionados en el documento.
+function hostsDePipedDoc(texto) {
+  if (!texto || typeof texto !== 'string') return [];
+  const hosts = [];
+  for (const m of texto.matchAll(/https?:\/\/([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g)) {
+    const host = normalizarHostInstancia(m[1]);
+    if (!host || host.endsWith('.onion')) continue;
+    if (!/^pipedapi|\.pipedapi|api\.piped/.test(host)) continue;
+    if (!hosts.includes(host)) hosts.push(host);
+  }
+  return hosts;
 }
 
 // Validación con descarga REAL de un video corto (19s, verificado vivo):
@@ -2338,17 +2358,19 @@ async function validarInstanciaReal(servicio, host) {
       if (!elegido) return 'limitada';
       url = elegido.url;
     } else if (servicio === 'cobalt') {
+      // Los tunnels de cobalt tardan 5-9s en resolver (el POST se queda
+        // esperando el video de youtube por dentro): con 6s daba falsos 'caida'.
       const r = await fetch('https://' + host + '/', {
         method: 'POST',
         headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': NAVEGADOR_UA },
         body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=' + VIDEO_VALIDACION, downloadMode: 'auto', videoQuality: '720', youtubeVideoCodec: 'h264' }),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(12000),
       }).catch(() => null);
       const json = r ? await r.json().catch(() => null) : null;
       if (!json || !json.url || (json.status !== 'tunnel' && json.status !== 'stream' && json.status !== 'redirect')) return 'caida';
       url = json.url;
     } else return 'caida';
-    const probe = await probeUrlMedia(url, 6000);
+    const probe = await probeUrlMedia(url, 8000);
     if (probe.ok) return 'ok';
     if (probe.status === 200) return 'limitada';
     return 'caida';
@@ -2379,11 +2401,14 @@ async function descubrirInstancias(forzar = false) {
     try {
       const [inv, piped, cobalt] = await Promise.allSettled([
         fetchJsonPublico(LISTAS_INSTANCIAS.invidious),
-        fetchJsonPublico(LISTAS_INSTANCIAS.piped),
-        fetchJsonPublico(LISTAS_INSTANCIAS.cobalt),
+        fetch(LISTAS_INSTANCIAS.piped, { headers: { 'User-Agent': UA_SESION_ANONIMA }, signal: AbortSignal.timeout(8000) }).then((r) => r.ok ? r.text() : ''),
+        fetchJsonPublico(LISTAS_INSTANCIAS.cobalt, 8000, UA_PROYECTO),
       ]);
       if (inv.status === 'fulfilled') instanciasDescubiertas.invidious = hostsDeInvidious(inv.value);
-      if (piped.status === 'fulfilled') instanciasDescubiertas.piped = hostsDePiped(piped.value);
+      if (piped.status === 'fulfilled') {
+        const porDoc = hostsDePipedDoc(piped.value);
+        instanciasDescubiertas.piped = porDoc.length ? porDoc : hostsDePiped(piped.value);
+      }
       if (cobalt.status === 'fulfilled') instanciasDescubiertas.cobalt = hostsDeCobalt(cobalt.value);
       instanciasDescubiertas.leidoAt = Date.now();
       console.log('[inst] descubiertas: invidious=' + instanciasDescubiertas.invidious.length + ' piped=' + instanciasDescubiertas.piped.length + ' cobalt=' + instanciasDescubiertas.cobalt.length);
@@ -2693,7 +2718,11 @@ async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
       });
       const json = await r.json().catch(() => null);
       if (!json || json.status === 'error' || !json.url) {
-        marcarInstancia(nombre, false);
+        // error.api.youtube.login = la instancia NO puede con ESTE video (su
+        // propia sesion youtube fue throttled), no que este muerta: 'limitada'
+        // para que se le siga probando con otros videos.
+        const rechazo = String(json && json.error && json.error.code || '');
+        marcarInstancia(nombre, rechazo === 'error.api.youtube.login' ? 'limitada' : false);
         registrarIntentoCapa2('cobalt:' + host, 'rechazo: ' + String(json && (json.error && json.error.code || json.status) || 'HTTP ' + r.status).slice(0, 80), Date.now() - t0);
         console.log('[dl][capa2] cobalt:' + host + ' rechazo: ' + String(json && (json.error && json.error.code || json.status) || 'HTTP ' + r.status).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
         continue;
