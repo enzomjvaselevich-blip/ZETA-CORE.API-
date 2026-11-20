@@ -202,6 +202,236 @@ return bytes>0&&!tipo.includes('text/html')?r.status:0;
 }catch(e){return 0;}
 }
 
+// ============================================================================
+// MUX REAL 480p+: YouTube solo entrega 720p/1080p como streams SEPARADOS
+// (video-only + audio-only). Sin combinacion el archivo quedaria sin audio.
+// El binario estatico (ffmpeg-static) corre dentro de la propia funcion
+// serverless; cualquier fallo (binario ausente, sin permisos, sin presupuesto)
+// devuele null y el pedido sigue por la escalera progresiva de calidad.
+// ============================================================================
+const nodeFs=require('node:fs');
+const nodePath=require('node:path');
+const nodeOs=require('node:os');
+let binFfmpegCacheado=null;
+let binFfmpegVerificado=false;
+function binFfmpeg(){
+if(binFfmpegVerificado)return binFfmpegCacheado;
+binFfmpegVerificado=true;
+const candidatos=[];
+try{const p=require('ffmpeg-static');if(p)candidatos.push(p);}catch(e){}
+if(process.env.FFMPEG_PATH)candidatos.push(process.env.FFMPEG_PATH);
+candidatos.push('ffmpeg');
+for(const bin of candidatos){
+try{require('node:child_process').execFileSync(bin,['-version'],{stdio:['ignore','ignore','ignore'],timeout:5000});binFfmpegCacheado=bin;return bin;}
+catch(e){}
+}
+return null;
+}
+
+// Descarga acotada a disco: aborta por timeout o si supera el limite de MB
+// (protege /tmp y la memoria de la funcion). Devuelve el tamano escrito.
+function bajarADisco(url,destino,limiteBytes,recorteMs){
+return new Promise((resolvio,rechazo)=>{
+const controlador=new AbortController();
+const alarma=setTimeout(()=>controlador.abort(new Error('descarga timeout '+recorteMs+'ms')),recorteMs);
+fetch(url,{headers:{'User-Agent':BROWSER_UA,Referer:'https://www.youtube.com/'},redirect:'follow',signal:controlador.signal}).then(async(r)=>{
+if(r.status!==200&&r.status!==206){clearTimeout(alarma);return rechazo(new Error('HTTP '+r.status));}
+if(!r.body){clearTimeout(alarma);return rechazo(new Error('respuesta sin cuerpo'));}
+const archivo=nodeFs.createWriteStream(destino);
+let bytes=0;
+const lector=r.body.getReader();
+const siguiente=async()=>{
+try{
+const p=await lector.read();
+if(p.done){archivo.end(()=>{clearTimeout(alarma);resolvio(bytes);});return;}
+bytes+=p.value.length;
+if(bytes>limiteBytes){
+try{await lector.cancel();}catch(e){}
+archivo.destroy();
+clearTimeout(alarma);
+return rechazo(new Error('supera el limite de '+Math.round(limiteBytes/1048576)+'MB'));
+}
+if(!archivo.write(p.value)){archivo.once('drain',siguiente);}else{setImmediate(siguiente);}
+}catch(e){archivo.destroy();clearTimeout(alarma);rechazo(e);}
+};
+siguiente();
+}).catch((e)=>{clearTimeout(alarma);rechazo(e);});
+});
+}
+
+function borrarCarpetaTemp(carpeta){
+if(!carpeta)return;
+try{nodeFs.rmSync(carpeta,{recursive:true,force:true});}catch(e){}
+}
+
+// Tamano total del stream via Range bytes=0-0 (googlevideo soporta 206).
+// Devuelve 0 si no soporta rangos: la bajada caera a single-stream.
+async function totalStream(mediaUrl){
+try{
+const r=await fetch(mediaUrl,{headers:{'User-Agent':BROWSER_UA,Referer:'https://www.youtube.com/',Range:'bytes=0-0'},redirect:'follow'});
+try{await r.body?.cancel();}catch(e){}
+if(r.status!==206)return 0;
+const m=String(r.headers.get('content-range')||'').match(/\/(\d+)$/);
+return m?Number(m[1]):0;
+}catch(e){return 0;}
+}
+
+// Descarga a disco POR RANGOS EN PARALELO (misma tecnica de streamRangosParalelos):
+// el single-stream desde un datacenter a googlevideo se estrangula y muere;
+// con N rangos en paralelo el archivo completo llega a tiempo. Ventana de 4,
+// reintentos por rango, concatenacion en orden y borrado de partes.
+async function bajarADiscoRangos(mediaUrl,total,destino,limiteMs){
+const t0=Date.now();
+const N=Math.min(10,Math.max(3,Math.ceil(total/(10*1048576))));
+const rango=Math.ceil(total/N);
+const dir=nodePath.dirname(destino);
+const base=nodePath.basename(destino);
+const partes=new Array(N).fill(null);
+const pedirRango=async(i)=>{
+const ini=i*rango,fin=Math.min(total-1,(i+1)*rango-1);
+const esperado=fin-ini+1;
+for(let intento=1;intento<=2;intento+=1){
+if(Date.now()-t0>limiteMs)throw new Error('descarga por rangos sin presupuesto');
+try{
+const r=await fetch(mediaUrl,{headers:{'User-Agent':BROWSER_UA,Referer:'https://www.youtube.com/',Range:'bytes='+ini+'-'+fin},redirect:'follow'});
+if((r.status!==206&&r.status!==200)||!r.body){try{await r.body?.cancel();}catch(e){}throw new Error('HTTP '+r.status);}
+const destinoParte=nodePath.join(dir,base+'.parte'+i);
+const archivo=nodeFs.createWriteStream(destinoParte);
+let escritos=0;
+const lector=r.body.getReader();
+await new Promise((ok,falloArchivo)=>{
+const siguiente=async()=>{
+try{
+const p=await lector.read();
+if(p.done){archivo.end(()=>ok());return;}
+escritos+=p.value.length;
+if(escritos>esperado+1024){archivo.destroy();falloArchivo(new Error('rango '+i+' excedido'));return;}
+if(!archivo.write(Buffer.from(p.value))){archivo.once('drain',siguiente);}else{setImmediate(siguiente);}
+}catch(e){archivo.destroy();falloArchivo(e);}
+};
+siguiente();
+});
+if(escritos!==esperado)throw new Error('rango '+i+' incompleto '+escritos+'/'+esperado);
+partes[i]=destinoParte;
+return;
+}catch(e){
+if(intento===2)throw e;
+await new Promise((x)=>setTimeout(x,400));
+}
+}
+};
+await new Promise((ok,fallo)=>{
+let proximo=0,completos=0,enVuelo=0;
+const lanzar=()=>{
+while(proximo<N&&enVuelo<4){
+enVuelo+=1;
+const i=proximo++;
+pedirRango(i).then(()=>{enVuelo-=1;completos++;if(completos===N)ok();else lanzar();}).catch((e)=>fallo(e));
+}
+};
+lanzar();
+});
+const salida=nodeFs.openSync(destino,'w');
+try{for(let i=0;i<N;i+=1)nodeFs.writeSync(salida,nodeFs.readFileSync(partes[i]));}
+finally{
+nodeFs.closeSync(salida);
+partes.forEach((p)=>{if(p)try{nodeFs.unlinkSync(p);}catch(e){}});
+}
+return total;
+}
+
+// Combina video-only (altura pedida) + audio itag 140 con -c copy (sin
+// recodificar: rapido y sin backlash de calidad). Presupuesto arbitrario
+// para dejar lugar a la escalera si algo falla. Nunca deja procesos ni
+// temporales colgados (SIGKILL + rmSync).
+async function muxVideoCalidad(videoId,alturaPedido,presupuestoMs){
+const bin=binFfmpeg();
+if(!bin)return {ok:false,razon:'ffmpeg no disponible'};
+const t0=Date.now();
+const carpeta=nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(),'mux-'));
+const fVideo=nodePath.join(carpeta,'video.m4s');
+const fAudio=nodePath.join(carpeta,'audio.m4s');
+const fSalida=nodePath.join(carpeta,'salida.mp4');
+try{
+// El stream de video debe ser video-only PURO a la altura exacta pedida:
+// si el camino automatico resuelve un progresivo menor (o su URL no resolvio),
+// se reintenta con clientes puntuales; muxar un itag 18 entregaria 360p
+// disfrazado de 720p. Si nada entrega el stream correcto, se degrada.
+let videoSolo=null;
+for(const clienteMux of [undefined,'WEB','ANDROID_VR','IOS']){
+if(presupuestoMs-(Date.now()-t0)<6000)break;
+try{
+const m=await secureApi.fetchYoutubeMedia(videoId,'video',String(alturaPedido),null,{aceptarSoloVideo:true,presupuestoMs:Math.min(14000,presupuestoMs-(Date.now()-t0)),sinProxy:true,...(clienteMux?{client:clienteMux}:{})});
+if(m&&m.url&&m.soloVideo&&String(m.quality)===alturaPedido+'p'){videoSolo=m;break;}
+}catch(e){}
+}
+if(!videoSolo){borrarCarpetaTemp(carpeta);return {ok:false,razon:'sin stream de video '+alturaPedido+'p disponible'};}
+const audioPuro=await secureApi.fetchYoutubeMedia(videoId,'audio','best',null,{presupuestoMs:Math.min(10000,Math.max(3000,presupuestoMs-(Date.now()-t0))),sinProxy:true});
+if(!audioPuro||!audioPuro.url){borrarCarpetaTemp(carpeta);return {ok:false,razon:'sin stream de audio disponible'};}
+const restante=()=>presupuestoMs-(Date.now()-t0);
+if(restante()<8000){borrarCarpetaTemp(carpeta);return {ok:false,razon:'sin presupuesto para descargar los streams'};}
+// Ambos streams bajan por rangos en paralelo (googlevideo estrangula los
+// single-streams desde datacenter, tambien los de audio). Sin tamano total
+// (respuesta sin 206) cae a single-stream con el mismo presupuesto.
+const totalVideo=await totalStream(videoSolo.url);
+if(totalVideo>0){
+await bajarADiscoRangos(videoSolo.url,totalVideo,fVideo,Math.floor(Math.min(27000,restante()-4000)));
+}else{
+await bajarADisco(videoSolo.url,fVideo,420*1048576,Math.floor(Math.min(27000,restante()-4000)));
+}
+const totalAudio=await totalStream(audioPuro.url);
+if(totalAudio>0){
+await bajarADiscoRangos(audioPuro.url,totalAudio,fAudio,Math.floor(Math.min(15000,restante()-4000)));
+}else{
+await bajarADisco(audioPuro.url,fAudio,90*1048576,Math.floor(Math.min(15000,restante()-4000)));
+}
+if(restante()<7000){borrarCarpetaTemp(carpeta);return {ok:false,razon:'sin presupuesto para combinar'};}
+const hijo=require('node:child_process').spawn(bin,['-y','-i',fVideo,'-i',fAudio,'-map','0:v:0','-map','1:a:0','-c','copy','-movflags','+faststart',fSalida],{stdio:['ignore','ignore','ignore']});
+let termino=false;
+const codigo=await new Promise((resolvio)=>{
+const alarma=setTimeout(()=>{try{hijo.kill('SIGKILL');}catch(e){}},Math.floor(Math.min(30000,restante())));
+hijo.on('error',()=>{clearTimeout(alarma);if(!termino){termino=true;resolvio(-1);}});
+hijo.on('exit',(c)=>{clearTimeout(alarma);if(!termino){termino=true;resolvio(Number(c===null?-1:c));}});
+});
+const peso=nodeFs.existsSync(fSalida)?nodeFs.statSync(fSalida).size:0;
+if(codigo!==0||peso<10240){borrarCarpetaTemp(carpeta);return {ok:false,razon:'ffmpeg '+codigo+' (peso '+peso+'B)'};}
+console.log('[dl][mux] '+alturaPedido+'p combinado: '+Math.round(peso/1048576)+'MB en '+Math.round((Date.now()-t0)/1000)+'s');
+return {ok:true,archivo:fSalida,carpeta,peso,calidad:alturaPedido+'p'};
+}catch(e){
+borrarCarpetaTemp(carpeta);
+return {ok:false,razon:String(e&&e.message||e).slice(0,100)};
+}
+}
+
+// Entrega un archivo local ya combinado, con soporte de Range (una sola
+// gama: los jugadores de WhatsApp piden bytes=0-). Limpieza SIEMPRE en close.
+function streamArchivoMux(req,res,sendJson,requestId,mux){
+const {archivo,carpeta}=mux;
+let peso=0;
+try{peso=nodeFs.statSync(archivo).size;}catch(e){borrarCarpetaTemp(carpeta);return sendJson(502,{ok:false,error:'MUX_TEMPORAL_PERDIDO',message:'El archivo combinado desaparecio antes de enviarse.'});}
+let limpiado=false;
+const limpiar=()=>{if(!limpiado){limpiado=true;borrarCarpetaTemp(carpeta);}};
+res.on('close',limpiar);
+try{res.removeHeader('Content-Encoding');}catch(e){}
+res.removeHeader('Transfer-Encoding');
+const rango=typeof req.headers.range==='string'&&req.headers.range.length<100?req.headers.range.match(/bytes=(\d*)-(\d*)/):null;
+if(rango&&(rango[1]||rango[2])){
+const inicio=rango[1]?Number(rango[1]):Math.max(0,peso-Number(rango[2]||0));
+const fin=rango[2]?Math.min(Number(rango[2]),peso-1):peso-1;
+if(inicio<=fin){
+res.writeHead(206,{'Content-Type':'video/mp4','Content-Length':fin-inicio+1,'Accept-Ranges':'bytes','Content-Range':'bytes '+inicio+'-'+fin+'/'+peso,'Content-Disposition':'inline'});
+const flujo=nodeFs.createReadStream(archivo,{start:inicio,end:fin});
+flujo.on('error',()=>{limpiar();try{res.end();}catch(e){}});
+flujo.pipe(res);
+return;
+}
+}
+res.writeHead(200,{'Content-Type':'video/mp4','Content-Length':peso,'Accept-Ranges':'bytes','Content-Disposition':'inline'});
+const flujo=nodeFs.createReadStream(archivo);
+flujo.on('error',()=>{limpiar();try{res.end();}catch(e){}});
+flujo.pipe(res);
+}
+
 // Probe directo (sin proxy) que ademas valida el content-type: los CDN de Meta
 // a veces responden HTML (muro de login / lookaside) con status 200; transmitir
 // eso al cliente seria entregar basura. OJO: el lookaside de Facebook responde
@@ -613,6 +843,22 @@ return {ok:true,url:r1.url,headers:r1.headers,detalle:r1.detalle,ext:r1.ext,sinR
 }
 return null;
 };
+// MUX REAL 480p+: los pedidos explicitos de 480p/720p+ se resuelven aki con
+// video adaptativo + audio combinados por ffmpeg (la escalera de abajo solo
+// entrega progresivos con audio). Cualquier fallo degrada a la escalera.
+if(kind==='video'&&/^(?:480|720|1080|1440|2160)p$/.test(calidadPedido)&&binFfmpeg()){
+const presupuestoMux=Math.min(42000,dlDeadline-Date.now()-9000);
+if(presupuestoMux>12000){
+console.log('[dl][mux] intento '+calidadPedido+' combinado para '+videoId+' (presupuesto '+Math.round(presupuestoMux/1000)+'s)');
+const mux=await muxVideoCalidad(videoId,Number(calidadPedido.slice(0,-1)),presupuestoMux);
+if(mux&&mux.ok){
+intentos.push({capa:'mux',objetivo:calidadPedido,resultado:'ok '+Math.round(mux.peso/1048576)+'MB',ms:Date.now()-tInicioDl});
+return streamArchivoMux(req,res,sendJson,requestId,mux);
+}
+intentos.push({capa:'mux',objetivo:calidadPedido,resultado:mux?mux.razon:'sin ffmpeg',ms:Date.now()-tInicioDl});
+console.log('[dl][mux] '+calidadPedido+' fallo, sigue la escalera: '+(mux?mux.razon:''));
+}
+}
 // Pasada 1 con la calidad pedida; si falla y el deadline lo permite, pasadas
 // siguientes con calidades degradadas (y la 2da con sesion anonima renovada).
 const escalera=secureApi.escaleraCalidades(kind,calidadPedido);
@@ -663,6 +909,11 @@ let listaBusqueda=null;
 const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
 if(match){
 videoId=match[1];
+}else if(/(?:youtu\.be\/|youtube\.com\/(?:watch\?|v\/|embed\/|shorts\/))/.test(query)&&!/^[a-zA-Z0-9_-]{11}$/.test(query)){
+// Parece URL de YouTube pero no contiene un videoId valido (watch?v=abc,
+// enlace cortado...): buscar la URL literal como texto devolveria un video
+// CUALQUIERA. Error limpio en su lugar.
+return sendJson(400,{ok:false,code:'YOUTUBE_VIDEO_ID_INVALID',message:'El enlace es de YouTube pero no contiene un videoId valido: '+query.slice(0,80)});
 }else if(!/^[a-zA-Z0-9_-]{11}$/.test(query)){
 // BUSQUEDA ROBUSTA: sesion anonima -> HTML de /results -> Invidious.
 // listaBusqueda vive en el scope de la ruta: el plan B la consulta tambien
