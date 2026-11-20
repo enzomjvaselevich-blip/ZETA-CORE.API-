@@ -1126,7 +1126,7 @@ async function fetchYoutubeWatchPageMedia(videoId, type, quality, player, parent
   throw error;
 }
 
-async function selectYoutubeMediaFormat(formats, type, quality, player) {
+async function selectYoutubeMediaFormat(formats, type, quality, player, opciones = {}) {
   const resolved = await Promise.all(
     formats.map(async (format) => ({ format, url: await resolveYoutubeFormatUrl(format, player) })),
   );
@@ -1175,6 +1175,20 @@ async function selectYoutubeMediaFormat(formats, type, quality, player) {
       throw apiError(502, 'No hay un enlace multimedia directo compatible disponible para este video.', {
         code: 'YOUTUBE_FORMAT_UNAVAILABLE',
       });
+    }
+    // aceptarSoloVideo: el buscador de mux (capa de ffmpeg) pide el stream
+    // video-only de la altura pedida para combinarlo con el audio ait-140.
+    if (opciones.aceptarSoloVideo && !progressive.some(({ format }) => format.height === requestedHeight)) {
+      const videoSolo = candidates.filter(({ format }) => format.height === requestedHeight)[0];
+      if (videoSolo) {
+        return {
+          url: videoSolo.url,
+          quality: videoSolo.format.height ? `${videoSolo.format.height}p` : quality,
+          bitrate: videoSolo.format.bitrate || null,
+          conAudio: false,
+          soloVideo: true,
+        };
+      }
     }
     const pool = progressive.length ? progressive : candidates;
     const selected = pool.find(({ format }) => format.height === requestedHeight) ||
@@ -1553,7 +1567,11 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
   if (parentSignal) parentSignal.addEventListener('abort', abortFromParent, { once: true });
   try {
     const youtube = options.youtube || await getYoutubeInstance(options.cookie !== false);
-    const clients = ['IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
+    // Clientes embebidos primero: su contexto (clientScreen EMBED + embedUrl
+    // de tercero, ver HTTPClient.js de youtubei.js) es lo que evita el
+    // anti-bot "Sign in to confirm you're not a bot" SIN cookies, incluso desde
+    // IPs de datacenter. IOS/TV puros son los que primero caen en LOGIN_REQUIRED.
+    const clients = ['TV_EMBEDDED', 'WEB_EMBEDDED', 'IOS', 'TV', 'ANDROID_VR', 'WEB', 'MWEB', 'VISIONOS', 'TV_SIMPLY', 'YTMUSIC', 'ANDROID'];
     const deadline = Date.now() + Math.min(21000, presupuesto - 3000);
     let lastFormatError;
     let lastCause;
@@ -1584,7 +1602,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
           console.log(`[dl][capa1][debug] cliente=${client} type=${type} quality=${quality} playability=${clientDiag.playability} formatos=${clientDiag.formatos} directos=${clientDiag.directos} soloVideo=${clientDiag.soloVideo} progresivos=${clientDiag.progresivos} po_token=${poToken ? 'si' : 'no'} (${Date.now() - inicioMs}ms)`);
         }
         if (clientDiag.playability === 'LOGIN_REQUIRED') loginRequiredCount += 1;
-        const selected = await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player);
+        const selected = await selectYoutubeMediaFormat(formats, type, quality, youtube.session.player, options.aceptarSoloVideo ? { aceptarSoloVideo: true } : {});
         if (debug) {
           console.log(`[dl][capa1][debug] cliente=${client} seleccionado quality=${selected.quality} bitrate=${selected.bitrate || '-'}`);
         }
@@ -1614,6 +1632,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     const mediaAceptable = (media) => {
       if (!media) return false;
       if (preferirAudioPuro) return media.esAudioPuro;
+      if (options.aceptarSoloVideo && media.soloVideo) return true;
       return media.conAudio !== false;
     };
     const aceptarMedia = (media) => {
@@ -1682,7 +1701,7 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
         if (minterData) {
           diagnostics.push({ cliente: 'PO_TOKEN', ok: true });
           const videoToken = await minterData.minter.mintAsWebsafeString(videoId);
-          for (const client of ['IOS', 'ANDROID_VR', 'WEB', 'MWEB']) {
+          for (const client of ['TV_EMBEDDED', 'WEB_EMBEDDED', 'IOS', 'ANDROID_VR', 'WEB', 'MWEB']) {
             if (Date.now() > deadline - 2500) break;
             const media = aceptarMedia(await attemptClient(client, videoToken));
             if (media) return media;
