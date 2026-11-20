@@ -921,6 +921,13 @@ return sendJson(400,{ok:false,code:'YOUTUBE_VIDEO_ID_INVALID',message:'El enlace
 // producia ReferenceError: listaBusqueda is not defined.
 listaBusqueda=await secureApi.buscarVideoYoutube(query,pathname==='/ytsearch'?limit:3).catch(()=>[]);
 if(!Array.isArray(listaBusqueda)||!listaBusqueda.length){
+// La busqueda interna a veces vuelve vacia de forma TRANSITORIA (mismo
+// sintoma que /ytsearch resuelve solo): se renueva la sesion anonima y se
+// reconsulta una vez antes de declarar 404.
+try{await secureApi.obtenerSesionAnonima(true);}catch(e){}
+listaBusqueda=await secureApi.buscarVideoYoutube(query,pathname==='/ytsearch'?limit:3).catch(()=>[]);
+}
+if(!Array.isArray(listaBusqueda)||!listaBusqueda.length){
 return sendJson(404,{ok:false,reintentar:true,message:'No se encontraron resultados para la busqueda: '+query});
 }
 const primer=listaBusqueda[0];
@@ -958,7 +965,7 @@ let media=null;
 let errorCapa1=null;
 if(!saltarCapa1){
 try{
-media=await pedirCapa1Ytmp(12000);
+media=await pedirCapa1Ytmp(Math.min(18000,Math.max(12000,restanteYtmp()-13000)));
 console.log('[ytmp]['+vid+'] capa1 ok ('+(Date.now()-t0Ytmp)+'ms)');
 }catch(e){
 errorCapa1=e;
