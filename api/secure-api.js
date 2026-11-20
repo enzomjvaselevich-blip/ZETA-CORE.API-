@@ -2201,7 +2201,27 @@ async function buscarVideoYoutube(texto, limit = 5) {
   if (!limpio || limpio.length > 120) return [];
   const salida = await buscarYoutubeInnertube(limpio, limit);
   if (salida.length) return salida;
-  return buscarYoutubeHtml(limpio, limit).catch(() => []);
+  const html = await buscarYoutubeHtml(limpio, limit).catch(() => []);
+  if (html.length) return html;
+  // Con 0 resultados reales en ambas capas, YouTube suele estar rechazando la
+  // query exacta (page vacia anti-bot o menos resultados organicos). Se
+  // reintenta con las correcciones del autocompletado publico de YouTube
+  // (suggestqueries): mismo pedido del usuario, redaccion que YouTube si
+  // resuelve._aborta en el primer conjunto con resultados.
+  try {
+    const sugs = await fetch('https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&hl=es&q=' + encodeURIComponent(limpio), {
+      headers: { 'User-Agent': UA_SESION_ANONIMA, Accept: 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    }).then((r) => r.json()).then((j) => (Array.isArray(j) && Array.isArray(j[1]) ? j[1] : [])).catch(() => []);
+    for (const s of sugs.slice(0, 3)) {
+      if (!s || s.toLowerCase() === limpio.toLowerCase()) continue;
+      const r2 = await buscarYoutubeInnertube(String(s), limit);
+      if (r2.length) return r2;
+      const r3 = await buscarYoutubeHtml(String(s), limit).catch(() => []);
+      if (r3.length) return r3;
+    }
+  } catch {}
+  return [];
 }
 
 // ============================================================================
