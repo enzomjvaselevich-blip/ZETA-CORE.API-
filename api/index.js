@@ -1022,7 +1022,8 @@ reemplazo.reintentar=true;
 errorCapa1=reemplazo;
 }
 }
-throw errorCapa1||secureApi.apiError(502,'No se pudo obtener el enlace de descarga desde este hosting: reintentar suele funcionar (Vercel rota la IP de salida).',{code:'IP_BLOQUEADA'});
+const fallbackIp=(secureApi.apiError(502,'No se pudo obtener el enlace de descarga desde este hosting: reintentar suele funcionar (Vercel rota la IP de salida).',{code:'IP_BLOQUEADA'}));fallbackIp.reintentar=true;
+throw errorCapa1||fallbackIp;
 }
 return media;
 };
@@ -1048,7 +1049,8 @@ break;
 }
 }
 if(!media||!media.url){
-throw errorTotal||secureApi.apiError(502,'No se pudo obtener el enlace de descarga desde este hosting: reintentar suele funcionar (Vercel rota la IP de salida).',{code:'IP_BLOQUEADA'});
+const fallbackTotal=(secureApi.apiError(502,'No se pudo obtener el enlace de descarga desde este hosting: reintentar suele funcionar (Vercel rota la IP de salida).',{code:'IP_BLOQUEADA'}));fallbackTotal.reintentar=true;
+throw errorTotal||fallbackTotal;
 }
 const basic=media.basic_info||{};
 const canal=(typeof basic.author==='string'&&basic.author)?basic.author:(searchMeta?.canal||'Desconocido');
