@@ -20,6 +20,13 @@ saveTube=require('./documentos/savetube');
 }catch(e){
 saveTubeLoadError=e;
 }
+let y2down=null;
+let y2downLoadError=null;
+try{
+y2down=require('./documentos/y2down');
+}catch(e){
+y2downLoadError=e;
+}
 let adminApi=null;
 let adminApiLoadError=null;
 try{
@@ -843,6 +850,26 @@ intentos.push({capa:'savetube',objetivo:'cdn',resultado:'fallo: '+String(e&&e.me
 }
 return {ok:false};
 })();
+// Rescate y2down (p.savenow.to) en carrera con capa 1 y savetube: mismo
+// motivo, su CDN propio (savenow) no depende de la IP de salida. La conversion
+// puede tardar 4-20s, por eso AbortController de 20s.
+const intentoY2Down=(async()=>{
+if(!y2down)return {ok:false};
+try{
+const st=await y2down.resolverY2Down({videoId,kind:tipoMedia,calidad,timeoutMs:20000});
+if(!st||!st.url)return {ok:false};
+const probeStatus=await probeMedia(st.url,{});
+intentos.push({capa:'y2down',objetivo:st.detalle,resultado:'probe '+probeStatus,ms:Date.now()-t0Pasada});
+if(probeStatus===200||probeStatus===206){
+console.log('[dl][y2down] OK '+st.detalle+' probe='+probeStatus+' ('+(Date.now()-t0Pasada)+'ms)');
+return {ok:true,url:st.url,headers:{},detalle:'y2down '+st.detalle,ext:st.ext};
+}
+}catch(e){
+intentos.push({capa:'y2down',objetivo:'cdn',resultado:'fallo: '+String(e&&e.message||e).slice(0,110),ms:Date.now()-t0Pasada});
+}
+return {ok:false};
+})();
+intentoY2Down.catch(()=>{});
 intentoSaveTube.catch(()=>{});
 // Primera promesa que entregue ok:true gana; si todas se liquidan con
 // ok:false (o rechazan) antes del presupuesto, resuelve null para seguir con
@@ -864,12 +891,12 @@ if(--pendientes===0){clearTimeout(timer);resolver(null);}
 }
 });
 };
-// Prioridad: capa 1 y savetube a la par, hasta 20s; si ambos se liquidan sin
-// ok se espera otra tanda (las promesas siguen resolviendo internamente).
-let r1=await primeraOk([intentoCapa1,intentoSaveTube],20000);
+// Prioridad: capa 1, savetube y y2down a la par, hasta 20s; si todos se
+// liquidan sin ok se espera otra tanda (las promesas siguen resolviendo).
+let r1=await primeraOk([intentoCapa1,intentoSaveTube,intentoY2Down],20000);
 if(!(r1&&r1.ok)){
-const restante1=Math.max(0,22000-(Date.now()-t0Pasada));
-r1=await primeraOk([intentoCapa1,intentoSaveTube],restante1);
+const restante1=Math.max(0,27000-(Date.now()-t0Pasada));
+r1=await primeraOk([intentoCapa1,intentoSaveTube,intentoY2Down],restante1);
 }
 if(r1&&r1.ok){
 dlMediaCache.set(videoId+'|'+kind+'|'+calidad,{url:r1.url,headers:r1.headers,fuente:'capa1:'+r1.detalle,ext:r1.ext,sinRangos:!!r1.sinRangos,expiresAt:Date.now()+30*60*1000});
@@ -1007,24 +1034,38 @@ const st=await saveTube.resolverSaveTube({videoId:vid,kind:isAudio?'audio':'vide
 console.log('[ytmp]['+vid+'] savetube gano ('+st.detalle+')');
 return {url:st.url,headers:st.headers,fuente:'savetube',proxy_dl:false,quality:st.calidad,detalle:st.detalle,basic_info:{title:st.titulo||'',duration:st.duracion||0,author:''},thumbnail:st.thumbnail||''};
 };
+// Tercer competidor: y2down (PoW de p.savenow.to, CDN propio, sin googlevideo).
+// Mas lento (conversion 4-20s) pero varia frente a savetube cuando su backend
+// marca videos como no disponibles. AbortController de 20s.
+const resolverY2DownYtmp=async(vid)=>{
+if(!y2down)throw new Error('y2down modulo no disponible: '+(y2downLoadError&&y2downLoadError.message||''));
+const st=await y2down.resolverY2Down({videoId:vid,kind:isAudio?'audio':'video',calidad:qualityParam,timeoutMs:20000});
+console.log('[ytmp]['+vid+'] y2down gano ('+st.detalle+')');
+return {url:st.url,headers:st.headers,fuente:'y2down',proxy_dl:false,quality:st.calidad,detalle:st.detalle,basic_info:{title:st.titulo||'',duration:st.duracion||0,author:''},thumbnail:st.thumbnail||''};
+};
 if(!saltarCapa1){
 const correrCapa1Carrera=async()=>{
 try{
 return await pedirCapa1Ytmp(Math.min(18000,Math.max(12000,restanteYtmp()-13000)));}catch(e){errorCapa1=e;throw e;}
 };
 let errorSt=null;
+let errorY2=null;
 const promesaCapa1=correrCapa1Carrera();
 promesaCapa1.catch(()=>{});
 const promesaSt=resolverSaveTubeYtmp(vid).catch((e)=>{errorSt=e;throw e;});
 promesaSt.catch(()=>{});
+const promesaY2=resolverY2DownYtmp(vid).catch((e)=>{errorY2=e;throw e;});
+promesaY2.catch(()=>{});
 try{
-media=await Promise.any([promesaCapa1,promesaSt]);
+media=await Promise.any([promesaCapa1,promesaSt,promesaY2]);
 }catch(agregado){
-errorCapa1=errorCapa1||(errorSt||new Error('capa 1 y savetube fallaron'));
+errorCapa1=errorCapa1||(errorSt||new Error('capa 1, savetube y y2down fallaron'));
 }
-console.log('[ytmp]['+vid+'] carrera capa1+savetube: '+(media&&media.url?'OK '+media.fuente:'ambos fallaron')+' ('+(Date.now()-t0Ytmp)+'ms)');
+console.log('[ytmp]['+vid+'] carrera capa1+savetube+y2down: '+(media&&media.url?'OK '+media.fuente:'todos fallaron')+' ('+(Date.now()-t0Ytmp)+'ms)');
 }else{
-try{media=await resolverSaveTubeYtmp(vid);}catch(e){errorCapa1=e;}
+try{
+media=await Promise.any([resolverSaveTubeYtmp(vid),resolverY2DownYtmp(vid)]);
+}catch(e){errorCapa1=e;}
 }
 if(!media||!media.url){
 // Con LOGIN_REQUIRED el reintento con otra sesion anonima no cambia nada y se
@@ -1178,7 +1219,7 @@ return sendJson(404,{ok:false,error:{message:String(e&&e.message||e).slice(0,220
 }
 }
 if(pathname==='/status'){
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_cookie_vigente:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie)&&secureApi.cookieManualVigente()!==false,youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),precalentamiento:(secureApi.estadoPrecalentamiento&&typeof secureApi.estadoPrecalentamiento==='function')?secureApi.estadoPrecalentamiento():null,sesion_anonima:(secureApi.estadoSesionAnonima?typeof secureApi.estadoSesionAnonima==='function'?secureApi.estadoSesionAnonima():{activa:false}:{activa:false}),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','potoken_botguard','savetube'],configuracion_dueno:'no requerida: la API auto-gestiona su sesion anonima y su PO token BotGuard en memoria',admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_cookie_vigente:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie)&&secureApi.cookieManualVigente()!==false,youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),precalentamiento:(secureApi.estadoPrecalentamiento&&typeof secureApi.estadoPrecalentamiento==='function')?secureApi.estadoPrecalentamiento():null,sesion_anonima:(secureApi.estadoSesionAnonima?typeof secureApi.estadoSesionAnonima==='function'?secureApi.estadoSesionAnonima():{activa:false}:{activa:false}),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','potoken_botguard','savetube','y2down'],configuracion_dueno:'no requerida: la API auto-gestiona su sesion anonima y su PO token BotGuard en memoria',admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
