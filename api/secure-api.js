@@ -2036,26 +2036,19 @@ function publicErrorMessage(error) {
 // Orden = prioridad del resolver secuencial (el presupuesto de capa 2 es de
 // pocos segundos, asi que la unica instancia verificada viva va PRIMERO; si
 // queda al final nunca se llega a ella).
+// Podada en vivo: private.coffee (502), melmac.space (fetch failed), f5.si
+// (530), materialio.us (500), yewtu.be (403 desde datacenter). Las 4 que
+// quedan fueron las unicas que respondieron al directorio oficial
+// api.invidious.io/instances.json en la barrida de hoy.
 const INSTANCIAS_INVIDIOUS = [
-  'https://yt.chocolatemoo53.com',
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
-  'https://yewtu.be',
-  'https://invidious.private.coffee',
-  'https://iv.melmac.space',
-  'https://invidious.f5.si',
-  'https://invidious.materialio.us',
+  'https://yt.chocolatemoo53.com',
+  'https://invidious.tiekoetter.com',
 ];
-const INSTANCIAS_PIPED = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://api.piped.private.coffee',
-  'https://pipedapi.ducks.party',
-  'https://pipedapi.leptons.xyz',
-  'https://pipedapi.moomoo.me',
-  'https://pipedapi.r4fo.com',
-  'https://pipedapi.owo.si',
-];
+// Todas las fijas verificadas muertas en vivo (502/500/403/fetch failed);
+// descubrirInstancias las reemplaza dinamicamente desde los directorios.
+const INSTANCIAS_PIPED = [];
 // Instancias comunitarias de cobalt (publicas, sin clave): devuelven una URL
 // de tunnel con el archivo ya resuelto. co.otomir23.me verificada en vivo.
 const INSTANCIAS_COBALT = [
@@ -2653,14 +2646,124 @@ async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
   return null;
 }
 
-// Lanza los tres resolvers en paralelo (cobalt primero: es el verificado vivo)
-// y devuelve el primer resultado validado, con presupuesto global.
+// ============================================================================
+// CAPA 3 - Extractores web publicos (ultimo respaldo anonimo, sin clave ni
+// cookies). Son las APIs internas de sitios de conversion; en la barrida de
+// hoy la mayoria esta cerrada o detras de WAF, asi que cada extractor fallido
+// se marca caido con TTL 60s: cuando alguno vuelva a la vida entra solo al
+// race, sin tocar nada.
+// ============================================================================
+const UA_EXTRACTOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+function extraerEnlaceExtractor(json) {
+  if (!json || typeof json !== 'object') return '';
+  return String(
+    json.url
+    || json.download_url
+    || json.file
+    || (json.data && (json.data.url || json.data.download))
+    || '',
+  );
+}
+
+// converto.io: POST JSON a /download-v2. Hoy responde 200 con el HTML de la
+// SPA: el check de content-type JSON lo detecta y lo marca caido.
+async function extractorConverto(videoId, kind, presupuestoMs) {
+  const r = await fetch('https://converto.io/download-v2', {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA_EXTRACTOR,
+      Accept: 'application/json, text/plain, */*',
+      'Content-Type': 'application/json',
+      Origin: 'https://converto.io',
+      Referer: 'https://converto.io/',
+    },
+    body: JSON.stringify({
+      url: 'https://www.youtube.com/watch?v=' + videoId,
+      format: kind === 'audio' ? 'mp3' : 'mp4',
+      quality: kind === 'audio' ? '' : '720',
+    }),
+    signal: AbortSignal.timeout(Math.max(1000, presupuestoMs)),
+  });
+  const tipo = String(r.headers.get('content-type') || '');
+  if (!tipo.includes('json')) throw new Error('respuesta no JSON (' + (tipo || 'desconocido').slice(0, 40) + ')');
+  const j = await r.json().catch(() => null);
+  const enlace = extraerEnlaceExtractor(j);
+  if (!enlace) throw new Error('sin enlace (HTTP ' + r.status + ')');
+  return { enlace, calidad: kind === 'audio' ? 'mp3' : '720p', ext: kind === 'audio' ? 'mp3' : 'mp4' };
+}
+
+// familja yt1s: POST form-encoded a /api/ajaxSearch/index (vt=downloader).
+// Hoy 404; mismo esquema de marca caida + reintento automatico.
+async function extractorYt1sFamily(videoId, kind, presupuestoMs) {
+  const r = await fetch('https://www.yt1s.com/api/ajaxSearch/index', {
+    method: 'POST',
+    headers: {
+      'User-Agent': UA_EXTRACTOR,
+      Accept: '*/*',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'X-Requested-With': 'XMLHttpRequest',
+      Origin: 'https://www.yt1s.com',
+      Referer: 'https://www.yt1s.com/',
+    },
+    body: new URLSearchParams({ q: 'https://www.youtube.com/watch?v=' + videoId, vt: 'downloader' }),
+    signal: AbortSignal.timeout(Math.max(1000, presupuestoMs)),
+  });
+  const j = await r.json().catch(() => null);
+  const enlace = extraerEnlaceExtractor(j);
+  if (!enlace) throw new Error('sin enlace (HTTP ' + r.status + ')');
+  return { enlace, calidad: kind === 'audio' ? 'mp3' : '720p', ext: kind === 'audio' ? 'mp3' : 'mp4' };
+}
+
+const EXTRACTORES_WEB = [
+  { nombre: 'converto', resolver: extractorConverto },
+  { nombre: 'yt1s', resolver: extractorYt1sFamily },
+];
+
+async function resolverViaExtractoresWeb(videoId, kind, presupuestoMs = 9000) {
+  const deadline = Date.now() + presupuestoMs;
+  for (const extractor of EXTRACTORES_WEB) {
+    if (Date.now() > deadline - 500) break;
+    const nombre = 'web:' + extractor.nombre;
+    if (!instanciaDisponible(nombre)) continue;
+    const t0 = Date.now();
+    try {
+      const hallado = await extractor.resolver(videoId, kind, Math.max(1000, deadline - Date.now()));
+      const probe = await probeUrlMedia(hallado.enlace, Math.min(5000, Math.max(1000, deadline - Date.now())));
+      console.log('[dl][capa3] ' + extractor.nombre + ' probe=' + probe.status + ' tipo=' + (probe.tipo || '-') + ' (' + (Date.now() - t0) + 'ms)');
+      if (!probe.ok) {
+        registrarIntentoCapa2(nombre, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0);
+        marcarInstancia(nombre, probe.status === 200 ? 'limitada' : false);
+        continue;
+      }
+      marcarInstancia(nombre, true);
+      return {
+        url: hallado.enlace,
+        headers: { Referer: 'https://www.youtube.com/' },
+        fuente: 'web',
+        instancia: extractor.nombre,
+        calidad: hallado.calidad,
+        ext: hallado.ext,
+        meta: {},
+      };
+    } catch (e) {
+      marcarInstancia(nombre, false);
+      registrarIntentoCapa2(nombre, 'fallo: ' + String(e && e.message || e).slice(0, 80), Date.now() - t0);
+      console.log('[dl][capa3] ' + extractor.nombre + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
+    }
+  }
+  return null;
+}
+
+// Lanza capa 2 (cobalt/invidious/piped) y capa 3 (extractores web) en
+// paralelo; devuelve el primer resultado validado, con presupuesto global.
 async function resolverViaInstanciasPublicas(videoId, kind, presupuestoMs = 9000) {
   const t0 = Date.now();
   const promesas = [
     resolverViaCobalt(videoId, kind, presupuestoMs).catch(() => null),
     resolverViaInvidious(videoId, kind, presupuestoMs).catch(() => null),
     resolverViaPiped(videoId, kind, presupuestoMs).catch(() => null),
+    resolverViaExtractoresWeb(videoId, kind, presupuestoMs).catch(() => null),
   ];
   const resultado = await new Promise((resolver) => {
     let terminado = false;
@@ -2904,6 +3007,7 @@ module.exports = {
   elegirFormatoInvidious,
   elegirFormatoPiped,
   resolverViaInstanciasPublicas,
+  resolverViaExtractoresWeb,
   estadoSaludInstancias,
   obtenerRegistroCapa2,
   listadoInstanciasPublicas,
