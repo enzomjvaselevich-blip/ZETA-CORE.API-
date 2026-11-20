@@ -1776,7 +1776,12 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
       // de clientes cayo en LOGIN_REQUIRED, por eso un UNPLAYABLE aislado NO
       // prueba nada (lo demostro Gangnam Style en produccion).
       const esEdad = /confirm you?r age|age.restricted|inappropriate for/i.test(razones);
-      const esIndisponible = /unavailable|private video|video privado|removed|terminated|no longer available/i.test(razones);
+      // Guarda anti-falso-404: cuando hay clientes diciendo 'Sign in to
+      // confirm your not a bot', un 'Video unavailable' aislado (ej. YTMUSIC
+      // bajo throttling, demostrado con jNQXAC9IVRw en produccion) es un
+      // efecto secundario, NO una indisponibilidad real.
+      const hayLogin = /sign in|confirm you|not a bot/i.test(razones);
+      const esIndisponible = !hayLogin && /unavailable|private video|video privado|removed|terminated|no longer available/i.test(razones);
       const codigoFallo = esEdad ? 'YOUTUBE_AGE_CHECK_REQUIRED' : esIndisponible ? 'YOUTUBE_VIDEO_UNAVAILABLE' : 'YOUTUBE_BOT_DETECTION';
       const mensajeFallo = esEdad
         ? 'Este video tiene restriccion de edad: YouTube exige inicio de sesion para verlo o descargarlo.'
