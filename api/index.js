@@ -471,7 +471,7 @@ const dlHeadersBase=hayCookie?{Cookie:cookieHeader}:{};
 // exito (capa 1 + capa 2 en paralelo). Si a los 10s nada paso el probe, se
 // responde 502 IP_BLOQUEADA con reintentar:true en ese momento: el bot
 // reintenta y Vercel rota la IP de salida.
-const dlDeadline=Date.now()+9500;
+const dlDeadline=Date.now()+48000;
 const tInicioDl=Date.now();
 const intentos=[];
 // debug=1: loguea y expone el diagnostico por cliente de la capa 1 (conteo
@@ -510,7 +510,7 @@ console.log('[dl] pasada calidad='+calidad+' con sesion anonima renovada');}catc
 const intentoCapa1=(async()=>{
 const conTimeout=(promesa,ms)=>Promise.race([promesa,new Promise((_,rechazar)=>setTimeout(()=>rechazar(new Error('timeout '+ms+'ms')),ms))]);
 try{
-const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{sinProxy:true,debug:debugDl}),8000);
+const media=await conTimeout(secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{sinProxy:true,debug:debugDl}),20000);
 if(media&&media.url){
 let probeStatus=await probeMedia(media.url,dlHeadersBase);
 if(probeStatus!==200&&probeStatus!==206){
@@ -561,7 +561,7 @@ return base.filter((c)=>(c.cookie!==false?instanciaConCookie:instanciaSinCookie)
 const candidatos=construirCandidatos();
 const resultados=await Promise.allSettled(candidatos.map((c)=>conTimeout(
 secureApi.fetchYoutubeMedia(videoId,tipoMedia,calidad,null,{client:c.cliente,cookie:c.cookie,sinProxy:true,debug:debugDl,youtube:c.cookie!==false?instanciaConCookie:instanciaSinCookie}),
-8000,
+12000,
 )));
 for(let i=0;i<candidatos.length;i+=1){
 if(Date.now()>dlDeadline)break;
@@ -590,11 +590,11 @@ return {ok:true,url:r.value.url,headers,detalle:'capa'+c.capa+' '+c.cliente,ext:
 }
 return {ok:false};
 })();
-const intentoCapa2=secureApi.resolverViaInstanciasPublicas(videoId,tipoMedia,9000).catch(()=>null);
-// Prioridad capa 1: hasta 8s. Si no llega, se usa capa 2 si ya esta lista.
-let r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),8000))]);
+const intentoCapa2=secureApi.resolverViaInstanciasPublicas(videoId,tipoMedia,18000).catch(()=>null);
+// Prioridad capa 1: hasta 20s (Vercel permite 60s). Si no llega, se usa capa 2 si ya esta lista.
+let r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),20000))]);
 if(!(r1&&r1.ok)){
-const restante2=Math.max(0,8800-(Date.now()-t0Pasada));
+const restante2=Math.max(0,21000-(Date.now()-t0Pasada));
 const r2=await Promise.race([intentoCapa2,new Promise((r)=>setTimeout(()=>r(null),restante2))]);
 if(r2&&r2.url){
 dlMediaCache.set(videoId+'|'+kind+'|'+calidad,{url:r2.url,headers:{},fuente:'capa2:'+r2.fuente+':'+r2.instancia,ext:r2.ext,expiresAt:Date.now()+30*60*1000});
@@ -602,7 +602,7 @@ if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
 console.log('[dl] salida por CAPA 2 ('+r2.fuente+':'+r2.instancia+' calidad='+r2.calidad+') a los '+(Date.now()-t0Pasada)+'ms');
 return {ok:true,url:r2.url,headers:{},detalle:'capa2 '+r2.fuente+':'+r2.instancia,ext:r2.ext};
 }
-const restante1=Math.max(0,9000-(Date.now()-t0Pasada));
+const restante1=Math.max(0,22000-(Date.now()-t0Pasada));
 r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),restante1))]);
 }
 if(r1&&r1.ok){
@@ -692,22 +692,22 @@ return sendJson(200,{ok:true,source:'youtube',query,total_resultados:results.len
 const isAudio=pathname==='/ytmp3';
 // Capa 1 = scraping directo desde la IP de salida. Si esta bloqueada (Sign in
 // to confirm you're not a bot), Capa 2 = instancias publicas (cobalt tunnel:
-// no queda amarrado a nuestra IP). Presupuesto global 26s para dejar lugar al
+// no queda amarrado a nuestra IP). Presupuesto global 32s para dejar lugar al
 // plan B (resultados alternativos de la busqueda) en la misma peticion.
 const t0Ytmp=Date.now();
-const restanteYtmp=()=>26000-(Date.now()-t0Ytmp);
+const restanteYtmp=()=>32000-(Date.now()-t0Ytmp);
 // Si en ESTA peticion la capa 1 ya devolvio LOGIN_REQUIRED, los siguientes
 // candidatos van directo a capa 2 (la capa 1 no cambia de opinion por IP).
 let loginDetectado=false;
 let altCapa2=null;
 const resolverYtmp=async(vid,saltarCapa1)=>{
 const pedirCapa1Ytmp=async(presupuestoMs,opciones={})=>secureApi.fetchYoutubeMedia(vid,isAudio?'audio':'video',qualityParam==='best'?'best':qualityParam,null,{presupuestoMs,sesionRenovada:true,...opciones});
-const capa2EnParalelo=secureApi.resolverViaInstanciasPublicas(vid,isAudio?'audio':'video',14000).catch(()=>null);
+const capa2EnParalelo=secureApi.resolverViaInstanciasPublicas(vid,isAudio?'audio':'video',16000).catch(()=>null);
 let media=null;
 let errorCapa1=null;
 if(!saltarCapa1){
 try{
-media=await pedirCapa1Ytmp(8000);
+media=await pedirCapa1Ytmp(12000);
 console.log('[ytmp]['+vid+'] capa1 ok ('+(Date.now()-t0Ytmp)+'ms)');
 }catch(e){
 errorCapa1=e;
@@ -743,7 +743,7 @@ if((!media||!media.url)&&!saltarCapa1){
 // viene frio y la primera ola puede agotarse sin tocar una instancia viva.
 try{await secureApi.descubrirInstancias(true);}catch(e){}
 console.log('[ytmp]['+vid+'] capa 2 segunda ola (descubrimiento forzado)');
-altCapa2=await secureApi.resolverViaInstanciasPublicas(vid,isAudio?'audio':'video',9000).catch(()=>null);
+altCapa2=await secureApi.resolverViaInstanciasPublicas(vid,isAudio?'audio':'video',10000).catch(()=>null);
 if(altCapa2&&altCapa2.url){
 console.log('[ytmp]['+vid+'] respaldo por CAPA 2 (2da ola) via '+altCapa2.fuente+':'+altCapa2.instancia);
 media={url:altCapa2.url,quality:altCapa2.calidad||'',basic_info:{},proxy_dl:true,...(altCapa2.sin_audio?{sin_audio:true}:{})};
