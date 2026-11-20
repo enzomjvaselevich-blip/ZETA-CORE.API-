@@ -23,7 +23,7 @@ saveTubeLoadError=e;
 let y2down=null;
 let y2downLoadError=null;
 try{
-y2down=require('./documentos/y2down');
+y2down=require('../lib/y2down');
 }catch(e){
 y2downLoadError=e;
 }
