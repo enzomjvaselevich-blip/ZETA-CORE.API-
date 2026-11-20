@@ -132,19 +132,42 @@ async function resolverSaveTube({ url, videoId, kind, calidad, timeoutMs, signal
     } else {
       const pedida = calidadVideoPedida(calidad);
       const formatos = Array.isArray(info.video_formats) ? info.video_formats : [];
-      const directo = pedida && formatos.find((f) => f && (String(f.quality) === pedida || String(f.height) === pedida) && f.url);
-      if (directo) {
-        enlace = directo.url;
-        detalle = 'video ' + pedida + ' fast';
-      } else {
-        const objetivo = pedida || '360';
-        if (!formatos.some((f) => f && (String(f.quality) === objetivo || String(f.height) === objetivo))) {
-          throw new Error('savetube no ofrece video ' + objetivo + 'p para este video');
+      // Escalera de degradacion: si el sitio no expone la calidad pedida para
+      // este video, se entrega la mejor inmediatamente inferior disponible
+      // (720->480->360) en vez de fallar: cualquier MP4 real sirve al usuario.
+      const escalera = pedida
+        ? [pedida, '1080', '720', '480', '360'].filter((q, i, a) => a.indexOf(q) === i && q <= pedida)
+        : ['360'];
+      for (const q of escalera) {
+        const directo = formatos.find((f) => f && (String(f.quality) === q || String(f.height) === q) && f.url);
+        if (directo) {
+          enlace = directo.url;
+          detalle = 'video ' + q + ' fast';
+          break;
         }
-        enlace = await pedirLinkDescarga(info.__cdn, { downloadType: 'video', quality: objetivo, key: info.key }, senal);
-        detalle = 'video ' + objetivo;
       }
-      calidadEntregada = (pedida || '360') + 'p';
+      if (!enlace) {
+        for (const q of escalera) {
+          if (!formatos.some((f) => f && (String(f.quality) === q || String(f.height) === q))) continue;
+          try {
+            enlace = await pedirLinkDescarga(info.__cdn, { downloadType: 'video', quality: q, key: info.key }, senal);
+            detalle = 'video ' + q;
+            break;
+          } catch (e) {
+            if (q === escalera[escalera.length - 1]) throw e;
+          }
+        }
+      }
+      if (!enlace) {
+        const cualquiera = formatos.find((f) => f && f.url);
+        if (cualquiera) {
+          enlace = cualquiera.url;
+          detalle = 'video ' + (cualquiera.quality || cualquiera.height || '') + ' fast';
+        }
+      }
+      if (!enlace) throw new Error('savetube no ofrece video descargable para este video');
+      const entregada = (/video (\d+)/.exec(detalle) || [])[1] || pedida || '360';
+      calidadEntregada = entregada + 'p';
     }
     if (!enlace || !/^https?:\/\//.test(enlace)) throw new Error('savetube enlace invalido');
     return {

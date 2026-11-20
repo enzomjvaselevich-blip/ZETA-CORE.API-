@@ -1051,7 +1051,10 @@ errorCapa1=reemplazo;
 }
 }
 const fallbackIp=(secureApi.apiError(502,'No se pudo obtener el enlace de descarga desde este hosting: reintentar suele funcionar (Vercel rota la IP de salida).',{code:'IP_BLOQUEADA'}));fallbackIp.reintentar=true;
-throw errorCapa1||fallbackIp;
+// Errores sin contrato (ex: mensajes crudos del extractor savetube) NO deben
+// salir como 500 CRITICAL_ERROR: se entregan como IP_BLOQUEADA 502.
+const errorFinal=(errorCapa1&&(errorCapa1.code||errorCapa1.statusCode))?errorCapa1:fallbackIp;
+throw errorFinal;
 }
 return media;
 };
