@@ -2209,10 +2209,11 @@ async function buscarVideoYoutube(texto, limit = 5) {
   // (suggestqueries): mismo pedido del usuario, redaccion que YouTube si
   // resuelve._aborta en el primer conjunto con resultados.
   try {
-    const sugs = await fetch('https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&hl=es&q=' + encodeURIComponent(limpio), {
+    const pedirSugerencias = (base) => fetch(base + encodeURIComponent(limpio), {
       headers: { 'User-Agent': UA_SESION_ANONIMA, Accept: 'application/json' },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(8000),
     }).then((r) => r.json()).then((j) => (Array.isArray(j) && Array.isArray(j[1]) ? j[1] : [])).catch(() => []);
+    const sugs = await Promise.any([pedirSugerencias('https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&hl=es&q='), pedirSugerencias('https://suggestqueries-clients6.youtube.com/complete/search?client=firefox&ds=yt&hl=es&q=')]).catch(() => []);
     for (const s of sugs.slice(0, 3)) {
       if (!s || s.toLowerCase() === limpio.toLowerCase()) continue;
       const r2 = await buscarYoutubeInnertube(String(s), limit);
@@ -2221,6 +2222,17 @@ async function buscarVideoYoutube(texto, limit = 5) {
       if (r3.length) return r3;
     }
   } catch {}
+  // Determinista y sin red extra: consultas multi-palabra que YouTube rechaza
+  // enteras se reintentan recortando la ultima palabra ('hola beba dalex' ->
+  // 'hola beba'), que es lo mismo que hace un usuario al acortar su busqueda.
+  const palabras = limpio.split(/\s+/);
+  if (palabras.length >= 2) {
+    const recortada = palabras.slice(0, -1).join(' ');
+    const r4 = await buscarYoutubeInnertube(recortada, limit);
+    if (r4.length) return r4;
+    const r5 = await buscarYoutubeHtml(recortada, limit).catch(() => []);
+    if (r5.length) return r5;
+  }
   return [];
 }
 
