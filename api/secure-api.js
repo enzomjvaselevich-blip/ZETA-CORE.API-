@@ -1676,11 +1676,21 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
       }
       throw apiError(502, `El cliente ${options.client} no pudo obtener un enlace descargable.`, { code: 'YOUTUBE_CLIENT_FAILED' });
     }
+    // El minteo del PO token corre EN PARALELO con la primera ola para que
+    // la escalada no gaste segundos esperandolo justo cuando el presupuesto
+    // es mas corto.
+    const minterEnMarcha = (async () => {
+      try { return await acquireYoutubePoMinter(youtube); } catch { return null; }
+    })();
     for (let round = 0; round < 3; round += 1) {
       if (Date.now() > deadline - 3000) break;
       const media = aceptarMedia(await attemptInParallel(clients.slice(0, 5), undefined));
       if (media) return media;
       if (audioFallback) break;
+      // Si la ola cayo en LOGIN/BOT, repetirla sin PO es quemar presupuesto:
+      // la respuesta de la IP no cambia entre rondas identicas. Se corta a la
+      // escalada real (PO token + watch page) con lo que queda de deadline.
+      if (loginRequiredCount > 0) break;
     }
     for (const client of clients.slice(5)) {
       if (Date.now() > deadline - 2500) break;
@@ -1692,12 +1702,14 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     // OK no garantiza que googlevideo acepte las URLs de video sin pot; ese
     // es el sintoma visto (audio probe 200, video probe 403 en la misma IP).
     const necesitaPo = loginRequiredCount > 0 || type === 'video';
-    if (necesitaPo && Date.now() < deadline - 9000) {
+    // El minteo ya venia corriendo en paralelo con las olas: aqui solo se
+    // recoge el resultado (0 - 1s extra), por eso el umbral baja de 9s a 6s.
+    if (necesitaPo && Date.now() < deadline - 6000) {
       try {
         if (debug) {
           console.log(`[dl][capa1][debug] ronda PO token (type=${type} loginRequired=${loginRequiredCount})`);
         }
-        const minterData = await acquireYoutubePoMinter(youtube);
+        const minterData = await minterEnMarcha;
         if (minterData) {
           diagnostics.push({ cliente: 'PO_TOKEN', ok: true });
           const videoToken = await minterData.minter.mintAsWebsafeString(videoId);
@@ -1755,11 +1767,26 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
       if (options.cookie !== false && cookieManualVigente()) {
         marcarCookieManualInvalida();
       }
-      const loginError = apiError(502, 'Este video tiene restriccion de edad o verificacion anti-bot: YouTube exige inicio de sesion para descargarlo.', {
-        code: 'YOUTUBE_LOGIN_REQUIRED',
+      // Clasificacion REAL por razon de playability: 'confirm your age' es una
+      // restriccion PERMANENTE del video (reintentar no cambia nada); 'not a
+      // bot' es bloqueo anti-bot de IP (reintentar va porque Vercel rota IP);
+      // 'Video unavailable'/UNPLAYABLE es video inexistente o privado.
+      const razones = diagnostics.map((d) => String(d.razon || '')).join(' | ');
+      const esEdad = /confirm you?r age|age.restricted|inappropriate for/i.test(razones);
+      const esIndisponible = /unavailable|private|removed|terminated/i.test(razones) || diagnostics.some((d) => d.playability === 'UNPLAYABLE' && !d.formatos);
+      const codigoFallo = esEdad ? 'YOUTUBE_AGE_CHECK_REQUIRED' : esIndisponible ? 'YOUTUBE_VIDEO_UNAVAILABLE' : 'YOUTUBE_BOT_DETECTION';
+      const mensajeFallo = esEdad
+        ? 'Este video tiene restriccion de edad: YouTube exige inicio de sesion para verlo o descargarlo.'
+        : esIndisponible
+          ? 'Este video no esta disponible: fue eliminado, es privado o da de baja la cuenta.'
+          : "YouTube exige verificacion anti-bot para este video desde la IP del hosting (sin cookies no hay mas capas para este caso).";
+      const loginError = apiError(esIndisponible ? 404 : 502, mensajeFallo, {
+        code: codigoFallo,
       });
-      loginError.reintentar = true;
-      loginError.solucion = 'La API ya gestiona su propia sesion anonima: reintentar suele funcionar porque Vercel rota la IP de salida en cada pedido. No requiere configurar nada.';
+      loginError.reintentar = !esEdad && !esIndisponible;
+      loginError.solucion = loginError.reintentar
+        ? 'La API ya gestiona su propia sesion anonima: reintentar suele funcionar porque Vercel rota la IP de salida en cada pedido. No requiere configurar nada.'
+        : 'Este fallo es permanente para este video: reintentar no cambiaria el resultado.';
       loginError.detalles = diagnostics;
       throw loginError;
     }
