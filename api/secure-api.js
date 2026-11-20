@@ -1770,10 +1770,13 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
       // Clasificacion REAL por razon de playability: 'confirm your age' es una
       // restriccion PERMANENTE del video (reintentar no cambia nada); 'not a
       // bot' es bloqueo anti-bot de IP (reintentar va porque Vercel rota IP);
-      // 'Video unavailable'/UNPLAYABLE es video inexistente o privado.
       const razones = diagnostics.map((d) => String(d.razon || '')).join(' | ');
+      // SOLO la razon textual define indisponibilidad: TV_SIMPLY devuelve
+      // playability UNPLAYABLE incluso cuando el video es publico y el resto
+      // de clientes cayo en LOGIN_REQUIRED, por eso un UNPLAYABLE aislado NO
+      // prueba nada (lo demostro Gangnam Style en produccion).
       const esEdad = /confirm you?r age|age.restricted|inappropriate for/i.test(razones);
-      const esIndisponible = /unavailable|private|removed|terminated/i.test(razones) || diagnostics.some((d) => d.playability === 'UNPLAYABLE' && !d.formatos);
+      const esIndisponible = /unavailable|private video|video privado|removed|terminated|no longer available/i.test(razones);
       const codigoFallo = esEdad ? 'YOUTUBE_AGE_CHECK_REQUIRED' : esIndisponible ? 'YOUTUBE_VIDEO_UNAVAILABLE' : 'YOUTUBE_BOT_DETECTION';
       const mensajeFallo = esEdad
         ? 'Este video tiene restriccion de edad: YouTube exige inicio de sesion para verlo o descargarlo.'
@@ -1790,6 +1793,19 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
       loginError.detalles = diagnostics;
       throw loginError;
     }
+    // Fallo SIN login: videos inexistentes/privados/eliminados hacen fallar
+    // a TODOS los clientes con 'This video is unavailable' (el WATCH_PAGE
+    // aporta un texto generico sin streamingData: se ignora). Regla: alguien
+    // dice unavailable y NADIE dice sign-in/bot/age => PERMANENTE (404,
+    // reintentar:false). Cualquier otra cosa queda como UPSTREAM_FAILED.
+    const diagTextos = diagnostics.map((d) => String(d.razon || d.error || ''));
+    const diagIndisponible = /unavailable|private|removed|terminated|no longer available/i.test(diagTextos.filter(Boolean).join(' | ')) && !/sign in|confirm you|age|bot/i.test(diagTextos.join(' | '));
+    if (diagIndisponible) {
+      const noDisponible = apiError(404, 'Este video no esta disponible: fue eliminado, es privado o no existe.', { code: 'YOUTUBE_VIDEO_UNAVAILABLE' });
+      noDisponible.reintentar = false;
+      noDisponible.detalles = diagnostics;
+      throw noDisponible;
+    }
     const failure = lastFormatError || apiError(502, `YouTube no pudo proporcionar los formatos multimedia en este momento${lastCause?.message ? ` (${String(lastCause.message).slice(0, 140)})` : ''}.`, {
       code: 'YOUTUBE_UPSTREAM_FAILED',
     });
@@ -1799,6 +1815,16 @@ async function fetchYoutubeMedia(videoId, type, quality, parentSignal, options =
     if (error.statusCode) throw error;
     if (parentSignal?.aborted || controller.signal.aborted) {
       throw apiError(504, 'YouTube tardó demasiado en responder.', { code: 'REQUEST_TIMEOUT' });
+    }
+    // Video inexistente/privado/eliminado: el fallo llega aqui SI ningun
+    // cliente proceso la respuesta completa (ej. VideoInfo lanza al parsear).
+    // Es un fallo PERMANENTE: 404 con reintentar:false, no 502 generico.
+    const msgFallo = String(error?.message || error);
+    if (/unavailable|private|removed|terminated|not found|no longer available|does not exist/i.test(msgFallo)) {
+      const noDisponible = apiError(404, 'Este video no esta disponible: fue eliminado, es privado o no existe.', { code: 'YOUTUBE_VIDEO_UNAVAILABLE' });
+      noDisponible.reintentar = false;
+      noDisponible.detalles = diagnostics;
+      throw noDisponible;
     }
     throw apiError(502, `YouTube no pudo proporcionar los formatos multimedia en este momento${error?.message ? ` (${String(error.message).slice(0, 140)})` : ''}.`, {
       code: 'YOUTUBE_UPSTREAM_FAILED',

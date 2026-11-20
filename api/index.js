@@ -1011,7 +1011,10 @@ if(!media||!media.url){
 // En el fallo total se mantiene el error de capa 1 pero con reintentar
 // (FALLA 3): el bot reintenta y Vercel rota la IP de salida.
 if(errorCapa1){
-errorCapa1.reintentar=true;
+// SOLO los errores transitorios (5xx) se marcan reintentar:true: los 4xx
+// permanentes (404 video inexistente, 400 URL invalida) mantienen su flag
+// original porque reintentar no cambiaria el resultado.
+if(!(errorCapa1.statusCode>=400&&errorCapa1.statusCode<500))errorCapa1.reintentar=true;
 if(secureApi.obtenerRegistroCapa2)errorCapa1.registro_capa2=secureApi.obtenerRegistroCapa2();
 if(errorCapa1.code==='REQUEST_TIMEOUT'||errorCapa1.statusCode===504){
 const reemplazo=secureApi.apiError(502,'YouTube no respondio a tiempo. Reintentar suele funcionar (Vercel rota la IP de salida).',{code:'YOUTUBE_TIMEOUT'});
@@ -1148,6 +1151,6 @@ return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureA
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
 console.error(error);
-return sendJson(error.statusCode||500,{ok:false,code:error.code||'CRITICAL_ERROR',message:error.message,solucion:error.solucion||"Revisa los logs en Vercel.",...(error.detalles?{detalles:error.detalles}:{}),...(error.reintentar?{reintentar:true}:{})});
+return sendJson(error.statusCode||500,{ok:false,code:error.code||'CRITICAL_ERROR',message:error.message,solucion:error.solucion||"Revisa los logs en Vercel.",...(error.detalles?{detalles:error.detalles}:{}),reintentar:error.reintentar===false?false:!!error.reintentar});
 }
 };
