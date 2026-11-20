@@ -203,7 +203,7 @@ function extractYoutubeVideoId(inputUrl) {
     const values = url.searchParams.getAll('v');
     return values.length === 1 && /^[\w-]{11}$/.test(values[0]) ? values[0] : null;
   }
-  return url.pathname.match(/^\/(?:shorts|v|embed)\/([\w-]{11})$/)?.[1] || null;
+  return url.pathname.match(/^\/(?:shorts|v|embed|live)\/([\w-]{11})$/)?.[1] || null;
 }
 
 function getRateLimiter() {
@@ -2108,813 +2108,12 @@ function publicErrorMessage(error) {
 }
 
 // ============================================================================
-// CAPA 2 - Instancias publicas gratuitas de respaldo (sin clave, sin proxy).
-// Se usan cuando el scraping directo desde la IP de Vercel esta bloqueado por
-// googlevideo. Cada instancia se valida con un probe de 1 KB antes de usarla;
-// las caidas se recuerdan 15 minutos y se saltan automaticamente.
-// ============================================================================
-// Orden = prioridad del resolver secuencial (el presupuesto de capa 2 es de
-// pocos segundos, asi que la unica instancia verificada viva va PRIMERO; si
-// queda al final nunca se llega a ella).
-// Podada en vivo (barrido 2026-11-20): private.coffee (502), melmac.space
-// (fetch failed), f5.si (530), materialio.us (500), yewtu.be (403 desde
-// datacenter), chocolatemoo53 (403 desde datacenter, es limitada: UNPLAYABLE
-// de ese hosting no significa muerta).
-const INSTANCIAS_INVIDIOUS = [
-  'https://inv.nadeko.net',
-  'https://invidious.nerdvpn.de',
-  'https://invidious.tiekoetter.com',
-  'https://yt.chocolatemoo53.com',
-];
-// Todas las fijas verificadas muertas en vivo (502/500/403/fetch failed);
-// descubrirInstancias las reemplaza dinamicamente desde los directorios.
-const INSTANCIAS_PIPED = [];
-// Instancias comunitarias de cobalt (publicas, sin clave): devuelven una URL
-// de tunnel con el archivo ya resuelto. Barrido 2026-11-20 con entrega REAL
-// de bytes (tunnel + probe 200): rue-cobalt primero (resuelve contenido que
-// Vercel no logra directo, ej. Dalex); ayo.tf (530), kwiatekmiki y capi.oak.li
-// (fetch failed desde todo lado) ELIMINADAS; otomir23 viva pero rechaza
-// contenido con error.api.youtube.login -> se marca 'limitada', no caida.
-const INSTANCIAS_COBALT = [
-  'https://rue-cobalt.xenon.zone',
-  'https://co.otomir23.me',
-];
-const TTL_SALUD_INSTANCIA_OK = 15 * 60 * 1000;
-// Cache NEGATIVA de a lo sumo 60s: si una instancia fallo o resulto limitada,
-// se reintenta despues de 60s (pedirle al usuario reintentar a los 2 min debe
-// reintentar TODO, incluso si Vercel roto IP y las instancias cambiaron).
-const TTL_SALUD_INSTANCIA_NEGATIVA = 60 * 1000;
-const saludInstancias = new Map();
-
-// viva: true=ok, false=caida, 'limitada'=responde pero no entrega archivos
-// (probe 200 con 0 bytes). Una limitada sigue intentandose: la limite puede
-// ser del video (ej. cobalt con videos largos); con videos cortos sirve.
-function marcarInstancia(nombre, viva) {
-  if (!nombre) return;
-  if (viva === 'limitada') {
-    saludInstancias.set(nombre, { viva: true, limitada: true, checkedAt: Date.now() });
-    return;
-  }
-  saludInstancias.set(nombre, { viva: !!viva, limitada: false, checkedAt: Date.now() });
-}
-
-function instanciaDisponible(nombre) {
-  const estado = saludInstancias.get(nombre);
-  if (!estado) return true;
-  // Las caidas solo se saltan durante el TTL negativo de 60s; las ok (y las
-  // limitadas, que siempre se siguen intentando) valen su TTL largo.
-  const ttl = estado.viva ? TTL_SALUD_INSTANCIA_OK : TTL_SALUD_INSTANCIA_NEGATIVA;
-  if (Date.now() - estado.checkedAt > ttl) return true;
-  return estado.viva;
-}
-
-function estadoSaludInstancias() {
-  const ahora = Date.now();
-  return [...saludInstancias.entries()].map(([nombre, estado]) => ({
-    instancia: nombre,
-    viva: estado.viva,
-    verificado_hace_s: Math.round((ahora - estado.checkedAt) / 1000),
-  }));
-}
-
-// Registro de intentos de capa 2 (diagnostico: la respuesta de error de /dl
-// expone los ultimos para ver si las instancias estan muertas o no se llaman).
-const registroIntentosCapa2 = [];
-function registrarIntentoCapa2(objetivo, resultado, ms) {
-  registroIntentosCapa2.push({ capa: 2, objetivo, resultado: String(resultado).slice(0, 120), ms: Math.round(ms) });
-  if (registroIntentosCapa2.length > 60) registroIntentosCapa2.shift();
-}
-function obtenerRegistroCapa2() {
-  return registroIntentosCapa2.slice(-20);
-}
-
-// Listado para /status: hardcodeadas + descubiertas con su salud (sin red).
-function listadoInstanciasPublicas() {
-  const grupos = [
-    ['cobalt', INSTANCIAS_COBALT],
-    ['invidious', INSTANCIAS_INVIDIOUS],
-    ['piped', INSTANCIAS_PIPED],
-    ['invidious', instanciasDescubiertas.invidious],
-    ['piped', instanciasDescubiertas.piped],
-    ['cobalt', instanciasDescubiertas.cobalt],
-  ];
-  const vistas = new Set();
-  const salida = [];
-  for (const [servicio, lista] of grupos) {
-    for (const base of Array.isArray(lista) ? lista : []) {
-      const host = normalizarHostInstancia(base);
-      if (!host || vistas.has(host)) continue;
-      vistas.add(host);
-      const entrada = { nombre: host, servicio, salud: 'sin_probar' };
-      const estado = saludInstancias.get(servicio + ':' + host);
-      if (estado) {
-        entrada.salud = estado.viva ? (estado.limitada ? 'limitada' : 'ok') : 'caida';
-        entrada.verificado_hace_s = Math.round((Date.now() - estado.checkedAt) / 1000);
-      }
-      salida.push(entrada);
-    }
-  }
-  return salida;
-}
-
-// ============================================================================
-// Descubrimiento runtime de instancias publicas (TAREA 2): ademas de las
-// hardcodeadas, se consultan las listas publicas oficiales (Invidious/Piped/
-// cobalt) cada 6h y se agregan las instancias https sin clave que respondan.
-// ============================================================================
-const TTL_LISTAS_INSTANCIAS = 6 * 60 * 60 * 1000;
-// Piped: piped-instances.kavin.rocks esta MUERTA (timeout vivo, barrido
-// 2026-11-20). Fuente oficial actual: el doc de instancias publicas del repo
-// TeamPiped/documentation (markdown; se extraen los hosts pipedapi*/api.piped).
-// Cobalt: instances.cobalt.best BLOQUEA user-agents por defecto (lo dice su
-// propia /api), por eso fetchJsonPublico le manda UA de proyecto.
-const UA_PROYECTO = 'zeta-core-api/1.0 (+https://github.com/enzomjvaselevich-blip/zeta-core-api.vercel.app)';
-const LISTAS_INSTANCIAS = {
-  invidious: 'https://api.invidious.io/instances.json',
-  piped: 'https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md',
-  cobalt: 'https://instances.cobalt.best/api/instances.json',
-};
-const instanciasDescubiertas = { invidious: [], piped: [], cobalt: [], leidoAt: 0, renovando: null };
-
-function normalizarHostInstancia(valor) {
-  try {
-    const crudo = String(valor || '').trim();
-    if (!crudo) return '';
-    const url = new URL(crudo.startsWith('http') ? crudo : 'https://' + crudo);
-    const host = url.host.toLowerCase();
-    const hostname = (url.hostname || '').toLowerCase();
-    if (!hostname.includes('.')) return '';
-    const simboloRed = hostname.match(/\.(onion|ygg|i2p|loki|bit|lock|exit|eth|zil)$/) || hostname.endsWith('.dyn.onion') || hostname.includes('.onion.')
-      // etiquetas DNS que marcan red garlic/I2P en dominios publicos del operador (ej. inv-ygg.nadeko.net)
-      || hostname.split('.').some((etiqueta) => /(^|-)(ygg|i2p)(-|$)/.test(etiqueta));
-    if (simboloRed) return '';
-    const ip = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (ip) {
-      const o = [Number(ip[1]), Number(ip[2]), Number(ip[3]), Number(ip[4])];
-      if (o.some((n) => n > 255)) return '';
-      const [a, b] = o;
-      // privadas/loopback/link-local/multicast/reservadas: inalcanzable o inutiles desde Vercel
-      if (a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224) return '';
-    }
-    return host;
-  } catch {
-    return '';
-  }
-}
-
-// Puro: filtra instancias Invidious de api.invidious.io/instances.json
-// (pares [name, info]; solo type https y api !== false, sin onion).
-function hostsDeInvidious(json) {
-  if (!Array.isArray(json)) return [];
-  const hosts = [];
-  for (const entrada of json) {
-    if (!Array.isArray(entrada) || !entrada[0] || !entrada[1] || typeof entrada[1] !== 'object') continue;
-    const nombre = String(entrada[0]).replace(/\.onion.*$/i, '');
-    const info = entrada[1];
-    if (nombre.endsWith('.onion')) continue;
-    const tipo = info?.type;
-    const esHttps = tipo === 'https' || (Array.isArray(tipo) && tipo.includes('https'));
-    if (!esHttps) continue;
-    if (info.api === false) continue;
-    const host = normalizarHostInstancia(info.uri || nombre);
-    if (host && !host.endsWith('.onion') && !hosts.includes(host)) hosts.push(host);
-  }
-  return hosts;
-}
-
-// Puro: extrae api_url de la lista publica de Piped.
-function hostsDePiped(json) {
-  const lista = Array.isArray(json) ? json : Array.isArray(json?.instances) ? json.instances : [];
-  const hosts = [];
-  for (const entrada of lista) {
-    const host = normalizarHostInstancia(entrada?.api_url || entrada?.api || '');
-    if (host && !host.endsWith('.onion') && !hosts.includes(host)) hosts.push(host);
-  }
-  return hosts;
-}
-
-// Puro: extrae endpoints de API online sin turnstile de la lista comunitaria
-// de cobalt (instances.cobalt.best).
-function hostsDeCobalt(json) {
-  if (!Array.isArray(json)) return [];
-  const hosts = [];
-  for (const entrada of json) {
-    if (!entrada || typeof entrada !== 'object') continue;
-    if (entrada.turnstile) continue;
-    if (entrada.api_online === false || entrada.online === false) continue;
-    const host = normalizarHostInstancia(entrada.api || entrada.url || entrada.domain || '');
-    if (host && !hosts.includes(host)) hosts.push(host);
-  }
-  return hosts;
-}
-
-async function fetchJsonPublico(url, timeoutMs = 6000, ua = '') {
-  if (!url.startsWith('https://')) throw new Error('solo https');
-  const r = await fetch(url, {
-    headers: { 'User-Agent': ua || UA_SESION_ANONIMA, Accept: 'application/json' },
-    redirect: 'follow',
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return await r.json();
-}
-
-// Piped desde el markdown de TeamPiped/documentation: extrae los hosts de API
-// (pipedapi.* y api.piped.*) mencionados en el documento.
-function hostsDePipedDoc(texto) {
-  if (!texto || typeof texto !== 'string') return [];
-  const hosts = [];
-  for (const m of texto.matchAll(/https?:\/\/([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g)) {
-    const host = normalizarHostInstancia(m[1]);
-    if (!host || host.endsWith('.onion')) continue;
-    if (!/^pipedapi|\.pipedapi|api\.piped/.test(host)) continue;
-    if (!hosts.includes(host)) hosts.push(host);
-  }
-  return hosts;
-}
-
-// Validación con descarga REAL de un video corto (19s, verificado vivo):
-// no basta con que la instancia responda; debe entregar el archivo. Se corre
-// en segundo plano para no sumar latencia a /dl; el resultado alimenta el
-// health-check (ok/caida/limitada) que ya salta las instancias muertas.
-// Video de validacion de instancias: dQw4w9WgXcQ esta verificado como
-// entregable por las instancias cobalt vivas (jNQXAC9IVRw daba falsos
-// negativos de probe en algunas).
-const VIDEO_VALIDACION = 'dQw4w9WgXcQ';
-async function validarInstanciaReal(servicio, host) {
-  try {
-    let url = '';
-    if (servicio === 'invidious') {
-      const json = await fetchJsonInstancia('https://' + host + '/api/v1/videos/' + VIDEO_VALIDACION + '?local=true', 6000).catch(() => null);
-      const elegido = json && elegirFormatoInvidious(json, 'video');
-      // Responde con datos pero sin formato para el video de validacion: puede
-      // ser que ESE video este bloqueado, no que la instancia este muerta. Se
-      // marca 'limitada' para que se le siga probando (caida la saltaria 60s).
-      if (!elegido) return 'limitada';
-      url = elegido.url;
-    } else if (servicio === 'piped') {
-      const json = await fetchJsonInstancia('https://' + host + '/streams/' + VIDEO_VALIDACION, 6000).catch(() => null);
-      const elegido = json && elegirFormatoPiped(json, 'video');
-      if (!elegido) return 'limitada';
-      url = elegido.url;
-    } else if (servicio === 'cobalt') {
-      // Los tunnels de cobalt tardan 5-9s en resolver (el POST se queda
-        // esperando el video de youtube por dentro): con 6s daba falsos 'caida'.
-      const r = await fetch('https://' + host + '/', {
-        method: 'POST',
-        headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': NAVEGADOR_UA },
-        body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=' + VIDEO_VALIDACION, downloadMode: 'auto', videoQuality: '720', youtubeVideoCodec: 'h264' }),
-        signal: AbortSignal.timeout(12000),
-      }).catch(() => null);
-      const json = r ? await r.json().catch(() => null) : null;
-      if (!json || !json.url || (json.status !== 'tunnel' && json.status !== 'stream' && json.status !== 'redirect')) return 'caida';
-      url = json.url;
-    } else return 'caida';
-    const probe = await probeUrlMedia(url, 8000);
-    if (probe.ok) return 'ok';
-    if (probe.status === 200) return 'limitada';
-    return 'caida';
-  } catch {
-    return 'caida';
-  }
-}
-function validarEnSegundoPlano(servicio, hosts) {
-  (async () => {
-    let ok = 0, limitada = 0, caida = 0;
-    await Promise.all(hosts.map(async (host) => {
-      const clave = servicio + ':' + host;
-      const previo = saludInstancias.get(clave);
-      if (previo && previo.viva && Date.now() - previo.checkedAt < TTL_SALUD_INSTANCIA_OK) return;
-      const resultado = await validarInstanciaReal(servicio, host);
-      if (resultado === 'ok') { marcarInstancia(clave, true); ok += 1; }
-      else if (resultado === 'limitada') { marcarInstancia(clave, 'limitada'); limitada += 1; }
-      else { marcarInstancia(clave, false); caida += 1; }
-    }));
-    console.log('[inst] validacion real ' + servicio + ': ok=' + ok + ' limitada=' + limitada + ' caida=' + caida);
-  })().catch(() => {});
-}
-
-async function descubrirInstancias(forzar = false) {
-  if (!forzar && instanciasDescubiertas.leidoAt && Date.now() - instanciasDescubiertas.leidoAt < TTL_LISTAS_INSTANCIAS) return instanciasDescubiertas;
-  if (instanciasDescubiertas.renovando) return instanciasDescubiertas.renovando;
-  instanciasDescubiertas.renovando = (async () => {
-    try {
-      const [inv, piped, cobalt] = await Promise.allSettled([
-        fetchJsonPublico(LISTAS_INSTANCIAS.invidious),
-        fetch(LISTAS_INSTANCIAS.piped, { headers: { 'User-Agent': UA_SESION_ANONIMA }, signal: AbortSignal.timeout(8000) }).then((r) => r.ok ? r.text() : ''),
-        fetchJsonPublico(LISTAS_INSTANCIAS.cobalt, 8000, UA_PROYECTO),
-      ]);
-      if (inv.status === 'fulfilled') instanciasDescubiertas.invidious = hostsDeInvidious(inv.value);
-      if (piped.status === 'fulfilled') {
-        const porDoc = hostsDePipedDoc(piped.value);
-        instanciasDescubiertas.piped = porDoc.length ? porDoc : hostsDePiped(piped.value);
-      }
-      if (cobalt.status === 'fulfilled') instanciasDescubiertas.cobalt = hostsDeCobalt(cobalt.value);
-      instanciasDescubiertas.leidoAt = Date.now();
-      console.log('[inst] descubiertas: invidious=' + instanciasDescubiertas.invidious.length + ' piped=' + instanciasDescubiertas.piped.length + ' cobalt=' + instanciasDescubiertas.cobalt.length);
-      validarEnSegundoPlano('invidious', instanciasDescubiertas.invidious.slice(0, 12));
-      validarEnSegundoPlano('piped', instanciasDescubiertas.piped.slice(0, 12));
-      validarEnSegundoPlano('cobalt', instanciasDescubiertas.cobalt.slice(0, 12));
-      return instanciasDescubiertas;
-    } finally {
-      instanciasDescubiertas.renovando = null;
-    }
-  })();
-  return instanciasDescubiertas.renovando;
-}
-
-// Fusiona hardcodeadas (primero) + descubiertas, deduplicadas por host.
-async function instanciasPara(servicio, hardcodeadas) {
-  const vistas = new Set();
-  const finales = [];
-  for (const base of Array.isArray(hardcodeadas) ? hardcodeadas : []) {
-    const host = normalizarHostInstancia(base);
-    if (host && !vistas.has(host)) {
-      vistas.add(host);
-      finales.push('https://' + host);
-    }
-  }
-  // Descubrimiento NO bloqueante: consultar las listas publicas tarda hasta 6s
-  // y el presupuesto de capa 2 son pocos segundos, asi que se lanza en segundo
-  // plano y se usa lo que ya este cacheado (las hardcodeadas siempre estan).
-  descubrirInstancias(false).catch(() => {});
-  try {
-    for (const host of instanciasDescubiertas[servicio] || []) {
-      if (!vistas.has(host)) {
-        vistas.add(host);
-        finales.push('https://' + host);
-      }
-    }
-  } catch {}
-  return finales;
-}
-
-function estadoInstanciasDescubiertas() {
-  return {
-    invidious: instanciasDescubiertas.invidious.length,
-    piped: instanciasDescubiertas.piped.length,
-    cobalt: instanciasDescubiertas.cobalt.length,
-    hace_min: instanciasDescubiertas.leidoAt ? Math.round((Date.now() - instanciasDescubiertas.leidoAt) / 60000) : null,
-  };
-}
-
-function alturaDeCalidad(texto) {
-  const m = String(texto || '').match(/(\d{3,4})p/);
-  return m ? Number(m[1]) : 0;
-}
-
-// Puro (TAREA 3): escalera de calidades a recorrer en /dl cuando la calidad
-// pedida falla en todas las capas. Las calidades bajas pasan los filtros de
-// googlevideo con más frecuencia; solo se responde IP_BLOQUEADA cuando ni la
-// calidad mínima obtiene nada. El audio ya degrada solo dentro de
-// fetchYoutubeMedia (itag 140 -> cualquier audio -> progresivo itag 18).
-function escaleraCalidades(kind, calidad) {
-  const pedido = String(calidad || '').trim();
-  if (kind === 'audio') {
-    return pedido && pedido !== 'best' ? [pedido, 'best'] : ['best'];
-  }
-  // Video: itag 18 PRIMERO (mp4 360p progresivo con audio integrado: el
-  // formato combinado menos bloqueado por googlevideo y que no necesita
-  // DASH ni separar streams). Si itag 18 sale, se streamea ese. El audio
-  // NO se toca (su escalera vive arriba).
-  const escalera = ['18', 'best', '480', '360', '240', '144'];
-  if (pedido && pedido !== 'best' && pedido !== '18' && /^\d+$/.test(pedido)) {
-    const salida = ['18', pedido];
-    for (const q of escalera) {
-      if (q !== '18' && q !== pedido) salida.push(q);
-    }
-    return salida;
-  }
-  return escalera;
-}
-
-// Funcion pura: elige el formato de una respuesta de Invidious
-// (GET /api/v1/videos/<id>). audio -> itag 140 (m4a); video -> mp4 hasta 720p.
-function elegirFormatoInvidious(json, kind) {
-  if (!json || typeof json !== 'object' || json.error) return null;
-  const adaptive = Array.isArray(json.adaptiveFormats)
-    ? json.adaptiveFormats.filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'))
-    : [];
-  // La API de Invidious devuelve los muxed (video+audio) en 'formatStreams';
-  // leer solo 'formats' dejaba esa lista siempre vacia y por eso capa 2
-  // entregaba video sin audio aunque hubiera un progresivo disponible.
-  const listaProgresivos = Array.isArray(json.formatStreams)
-    ? json.formatStreams
-    : Array.isArray(json.formats) ? json.formats : [];
-  const progresivos = listaProgresivos.filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'));
-  if (kind === 'audio') {
-    const audios = adaptive.filter((f) => String(f.type || f.mimeType || '').includes('audio/'));
-    const m4a = audios.filter((f) => String(f.type || f.mimeType || '').includes('audio/mp4'));
-    const itag140 = m4a.find((f) => String(f.itag) === '140');
-    const elegido = itag140
-      || m4a.slice().sort((a, b) => (b.bitrate || b.bitRate || 0) - (a.bitrate || a.bitRate || 0))[0]
-      || audios.slice().sort((a, b) => (b.bitrate || b.bitRate || 0) - (a.bitrate || a.bitRate || 0))[0];
-    if (elegido) {
-      return { url: elegido.url, itag: String(elegido.itag || ''), tipo: 'audio/mp4', calidad: elegido.audioQuality || 'm4a' };
-    }
-    return null;
-  }
-  // Muxed (video+audio) primero, igual que la capa 1: mejor 360p con audio
-  // que 720p mudo.
-  const prog = progresivos
-    .filter((f) => String(f.type || f.mimeType || '').includes('video/mp4'))
-    .sort((a, b) => alturaDeCalidad(b.qualityLabel) - alturaDeCalidad(a.qualityLabel))[0] || null;
-  if (prog) return { url: prog.url, itag: String(prog.itag || ''), tipo: 'video/mp4', calidad: prog.qualityLabel || '360p' };
-  const mp4 = adaptive.filter(
-    (f) => String(f.type || f.mimeType || '').includes('video/mp4') && (alturaDeCalidad(f.qualityLabel) || 0) <= 720,
-  );
-  const mejor = mp4.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
-  if (mejor) {
-    // Ultimo recurso: DASH separado, la instancia no expone el progresivo.
-    return { url: mejor.url, itag: String(mejor.itag || ''), tipo: 'video/mp4', calidad: mejor.qualityLabel || '', sin_audio: true };
-  }
-  return null;
-}
-
-// Funcion pura: elige el formato de una respuesta de Piped
-// (GET /api/v1/streams/<id>). Prefiere video muxed (con audio); si no hay,
-// video-only mp4 hasta 720p. Audio: m4a de mayor bitrate cercano a 128k.
-function elegirFormatoPiped(json, kind) {
-  if (!json || typeof json !== 'object' || json.error) return null;
-  if (kind === 'audio') {
-    const audios = (Array.isArray(json.audioStreams) ? json.audioStreams : [])
-      .filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'));
-    const m4a = audios.filter((f) => String(f.mimeType || '').includes('audio/mp4'));
-    const itag140 = m4a.find((f) => String(f.itag) === '140');
-    const elegido = itag140
-      || m4a.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0]
-      || audios.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-    if (elegido) return { url: elegido.url, itag: String(elegido.itag || ''), tipo: 'audio/mp4', calidad: elegido.quality || 'm4a' };
-    return null;
-  }
-  const videos = (Array.isArray(json.videoStreams) ? json.videoStreams : [])
-    .filter((f) => f && typeof f.url === 'string' && f.url.startsWith('http'))
-    .filter((f) => String(f.mimeType || '').includes('video/mp4'))
-    .filter((f) => (alturaDeCalidad(f.quality) || 0) <= 720 && (alturaDeCalidad(f.quality) || 0) > 0);
-  const muxed = videos.filter((f) => f.videoOnly === false);
-  const mejorMuxed = muxed.slice().sort((a, b) => alturaDeCalidad(b.quality) - alturaDeCalidad(a.quality))[0] || null;
-  if (mejorMuxed) return { url: mejorMuxed.url, itag: String(mejorMuxed.itag || ''), tipo: 'video/mp4', calidad: mejorMuxed.quality || '' };
-  const mejorSolo = videos.slice().sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0] || null;
-  if (mejorSolo) return { url: mejorSolo.url, itag: String(mejorSolo.itag || ''), tipo: 'video/mp4', calidad: mejorSolo.quality || '', sin_audio: true };
-  return null;
-}
-
-async function fetchJsonInstancia(url, timeoutMs) {
-  const r = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      Accept: 'application/json',
-    },
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return await r.json();
-}
-
-// Probe de 1 KB directo: valida que la URL responde 200/206 con media real
-// (no HTML de error). Igual que probeMedia de index.js pero para capa 2.
-async function probeUrlMedia(mediaUrl, timeoutMs = 5000) {
-  try {
-    const r = await fetch(mediaUrl, {
-      headers: { Range: 'bytes=0-1023', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const tipo = String(r.headers.get('content-type') || '');
-    if (r.status !== 200 && r.status !== 206) {
-      try { await r.body?.cancel(); } catch {}
-      return { ok: false, status: r.status, tipo };
-    }
-    // Leer al menos un chunk: algunas instancias responden 200 con cuerpo
-    // vacio (0 bytes) cuando googlevideo les fallo por dentro; entregar eso
-    // seria un archivo roto.
-    let bytes = 0;
-    if (r.body && typeof r.body.getReader === 'function') {
-      const reader = r.body.getReader();
-      try {
-        const primer = await reader.read();
-        bytes = primer.done ? 0 : primer.value.length;
-      } catch {}
-      try { await reader.cancel(); } catch {}
-    }
-    const ok = !tipo.includes('text/html') && (bytes > 0 || Number(r.headers.get('content-length') || 0) > 0);
-    return { ok, status: r.status, tipo, bytes };
-  } catch (e) {
-    return { ok: false, status: 0, tipo: '' };
-  }
-}
-
-async function resolverViaInvidious(videoId, kind, presupuestoMs = 9000) {
-  const deadline = Date.now() + presupuestoMs;
-  for (const base of await instanciasPara('invidious', INSTANCIAS_INVIDIOUS)) {
-    if (Date.now() > deadline - 500) break;
-    let host = '';
-    try { host = new URL(base).host; } catch { continue; }
-    const nombre = 'invidious:' + host;
-    if (!instanciaDisponible(nombre)) continue;
-    const t0 = Date.now();
-    try {
-      const json = await fetchJsonInstancia(base + '/api/v1/videos/' + videoId + '?local=true', Math.min(6000, Math.max(1000, deadline - Date.now())));
-      const elegido = elegirFormatoInvidious(json, kind);
-      if (!elegido) {
-        marcarInstancia(nombre, true);
-        registrarIntentoCapa2('invidious:' + host, 'sin formato util', Date.now() - t0);
-        console.log('[dl][capa2] invidious:' + host + ' sin formato util (' + (Date.now() - t0) + 'ms)');
-        continue;
-      }
-      const probe = await probeUrlMedia(elegido.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
-      console.log('[dl][capa2] invidious:' + host + ' probe=' + probe.status + ' itag=' + elegido.itag + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) { registrarIntentoCapa2('invidious:' + host, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0); if (probe.status === 200) marcarInstancia(nombre, 'limitada'); continue; }
-      marcarInstancia(nombre, true);
-      return {
-        url: elegido.url,
-        headers: {},
-        fuente: 'invidious',
-        instancia: host,
-        calidad: elegido.calidad,
-        ext: kind === 'audio' ? 'm4a' : 'mp4',
-        ...(elegido.sin_audio ? { sin_audio: true } : {}),
-        meta: {
-          titulo: typeof json.title === 'string' ? json.title : '',
-          canal: typeof json.author === 'string' ? json.author : '',
-          duracion: Number(json.lengthSeconds) || 0,
-          visitas: Number(json.viewCount) || 0,
-          likes: Number(json.likeCount) || 0,
-        },
-      };
-    } catch (e) {
-      marcarInstancia(nombre, false);
-      registrarIntentoCapa2('invidious:' + host, 'fallo: ' + String(e && e.message || e).slice(0, 80), Date.now() - t0);
-      console.log('[dl][capa2] invidious:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
-    }
-  }
-  return null;
-}
-
-async function resolverViaPiped(videoId, kind, presupuestoMs = 9000) {
-  const deadline = Date.now() + presupuestoMs;
-  for (const base of await instanciasPara('piped', INSTANCIAS_PIPED)) {
-    if (Date.now() > deadline - 500) break;
-    let host = '';
-    try { host = new URL(base).host; } catch { continue; }
-    const nombre = 'piped:' + host;
-    if (!instanciaDisponible(nombre)) continue;
-    const t0 = Date.now();
-    try {
-      const json = await fetchJsonInstancia(base + '/streams/' + videoId, Math.min(6000, Math.max(1000, deadline - Date.now())));
-      const elegido = elegirFormatoPiped(json, kind);
-      if (!elegido) {
-        marcarInstancia(nombre, true);
-        registrarIntentoCapa2('piped:' + host, 'sin formato util', Date.now() - t0);
-        console.log('[dl][capa2] piped:' + host + ' sin formato util (' + (Date.now() - t0) + 'ms)');
-        continue;
-      }
-      const probe = await probeUrlMedia(elegido.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
-      console.log('[dl][capa2] piped:' + host + ' probe=' + probe.status + ' calidad=' + elegido.calidad + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) { registrarIntentoCapa2('piped:' + host, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0); if (probe.status === 200) marcarInstancia(nombre, 'limitada'); continue; }
-      marcarInstancia(nombre, true);
-      return {
-        url: elegido.url,
-        headers: {},
-        fuente: 'piped',
-        instancia: host,
-        calidad: elegido.calidad,
-        ext: kind === 'audio' ? 'm4a' : 'mp4',
-        meta: {
-          titulo: typeof json.title === 'string' ? json.title : '',
-          canal: typeof json.uploader === 'string' ? json.uploader : '',
-          duracion: Number(json.duration) || 0,
-          visitas: Number(json.views) || 0,
-          likes: Number(json.likes) || 0,
-        },
-      };
-    } catch (e) {
-      marcarInstancia(nombre, false);
-      registrarIntentoCapa2('piped:' + host, 'fallo: ' + String(e && e.message || e).slice(0, 80), Date.now() - t0);
-      console.log('[dl][capa2] piped:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
-    }
-  }
-  return null;
-}
-
-async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
-  const deadline = Date.now() + presupuestoMs;
-  for (const base of await instanciasPara('cobalt', INSTANCIAS_COBALT)) {
-    if (Date.now() > deadline - 500) break;
-    let host = '';
-    try { host = new URL(base).host; } catch { continue; }
-    const nombre = 'cobalt:' + host;
-    if (!instanciaDisponible(nombre)) continue;
-    const t0 = Date.now();
-    try {
-      const cuerpoBase = kind === 'audio'
-        ? { url: 'https://www.youtube.com/watch?v=' + videoId, downloadMode: 'audio', audioFormat: 'mp3' }
-        : { url: 'https://www.youtube.com/watch?v=' + videoId, downloadMode: 'auto' };
-      const cuerpos = kind === 'audio'
-        ? [cuerpoBase]
-        : [{ ...cuerpoBase, videoQuality: '720', youtubeVideoCodec: 'h264' }];
-      let json = null;
-      let r = null;
-      for (const cuerpo of cuerpos) {
-        r = await fetch(base + '/', {
-          method: 'POST',
-          headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
-          body: JSON.stringify(cuerpo),
-          signal: AbortSignal.timeout(Math.min(10000, Math.max(1000, deadline - Date.now()))),
-        });
-        json = await r.json().catch(() => null);
-        if (json && json.status === 'error'
-          && json.error && json.error.code === 'error.api.invalid_body'
-          && cuerpo !== cuerpoBase) {
-          cuerpos.length = 0;
-          cuerpos.push(cuerpoBase);
-          continue;
-        }
-        break;
-      }
-      if (!json || json.status === 'error' || !json.url) {
-        // error.api.youtube.login = la instancia NO puede con ESTE video (su
-        // propia sesion youtube fue throttled), no que este muerta: 'limitada'
-        // para que se le siga probando con otros videos.
-        const rechazo = String(json && json.error && json.error.code || '');
-        marcarInstancia(nombre, rechazo === 'error.api.youtube.login' ? 'limitada' : false);
-        registrarIntentoCapa2('cobalt:' + host, 'rechazo: ' + String(json && (json.error && json.error.code || json.status) || 'HTTP ' + r.status).slice(0, 80), Date.now() - t0);
-        console.log('[dl][capa2] cobalt:' + host + ' rechazo: ' + String(json && (json.error && json.error.code || json.status) || 'HTTP ' + r.status).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
-        continue;
-      }
-      if (json.status !== 'tunnel' && json.status !== 'stream' && json.status !== 'redirect') {
-        marcarInstancia(nombre, false);
-        registrarIntentoCapa2('cobalt:' + host, 'status no usable: ' + json.status, Date.now() - t0);
-        console.log('[dl][capa2] cobalt:' + host + ' status no usable: ' + json.status + ' (' + (Date.now() - t0) + 'ms)');
-        continue;
-      }
-      const probe = await probeUrlMedia(json.url, Math.min(5000, Math.max(1000, deadline - Date.now())));
-      console.log('[dl][capa2] cobalt:' + host + ' probe=' + probe.status + ' tipo=' + (probe.tipo || '-') + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) { registrarIntentoCapa2('cobalt:' + host, 'probe ' + probe.status + ' bytes=' + (probe.bytes ?? '-') + ' ' + (probe.tipo || '-'), Date.now() - t0); if (probe.status === 200) marcarInstancia(nombre, 'limitada'); continue; }
-      marcarInstancia(nombre, true);
-      return {
-        url: json.url,
-        headers: {},
-        fuente: 'cobalt',
-        instancia: host,
-        calidad: kind === 'audio' ? 'mp3' : '720p',
-        ext: kind === 'audio' ? 'mp3' : 'mp4',
-        meta: { titulo: typeof json.filename === 'string' ? json.filename.replace(/\.[a-z0-9]+$/i, '') : '' },
-      };
-    } catch (e) {
-      marcarInstancia(nombre, false);
-      registrarIntentoCapa2('cobalt:' + host, 'fallo: ' + String(e && e.message || e).slice(0, 80), Date.now() - t0);
-      console.log('[dl][capa2] cobalt:' + host + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
-    }
-  }
-  return null;
-}
-
-// ============================================================================
-// CAPA 3 - Extractores web publicos (ultimo respaldo anonimo, sin clave ni
-// cookies). Son las APIs internas de sitios de conversion; en la barrida de
-// hoy la mayoria esta cerrada o detras de WAF, asi que cada extractor fallido
-// se marca caido con TTL 60s: cuando alguno vuelva a la vida entra solo al
-// race, sin tocar nada.
-// ============================================================================
-const UA_EXTRACTOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
-function extraerEnlaceExtractor(json) {
-  if (!json || typeof json !== 'object') return '';
-  return String(
-    json.url
-    || json.download_url
-    || json.file
-    || (json.data && (json.data.url || json.data.download))
-    || '',
-  );
-}
-
-// converto.io: POST JSON a /download-v2. Hoy responde 200 con el HTML de la
-// SPA: el check de content-type JSON lo detecta y lo marca caido.
-async function extractorConverto(videoId, kind, presupuestoMs) {
-  const r = await fetch('https://converto.io/download-v2', {
-    method: 'POST',
-    headers: {
-      'User-Agent': UA_EXTRACTOR,
-      Accept: 'application/json, text/plain, */*',
-      'Content-Type': 'application/json',
-      Origin: 'https://converto.io',
-      Referer: 'https://converto.io/',
-    },
-    body: JSON.stringify({
-      url: 'https://www.youtube.com/watch?v=' + videoId,
-      format: kind === 'audio' ? 'mp3' : 'mp4',
-      quality: kind === 'audio' ? '' : '720',
-    }),
-    signal: AbortSignal.timeout(Math.max(1000, presupuestoMs)),
-  });
-  const tipo = String(r.headers.get('content-type') || '');
-  if (!tipo.includes('json')) throw new Error('respuesta no JSON (' + (tipo || 'desconocido').slice(0, 40) + ')');
-  const j = await r.json().catch(() => null);
-  const enlace = extraerEnlaceExtractor(j);
-  if (!enlace) throw new Error('sin enlace (HTTP ' + r.status + ')');
-  return { enlace, calidad: kind === 'audio' ? 'mp3' : '720p', ext: kind === 'audio' ? 'mp3' : 'mp4' };
-}
-
-// familja yt1s: POST form-encoded a /api/ajaxSearch/index (vt=downloader).
-// Hoy 404; mismo esquema de marca caida + reintento automatico.
-async function extractorYt1sFamily(videoId, kind, presupuestoMs) {
-  const r = await fetch('https://www.yt1s.com/api/ajaxSearch/index', {
-    method: 'POST',
-    headers: {
-      'User-Agent': UA_EXTRACTOR,
-      Accept: '*/*',
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'X-Requested-With': 'XMLHttpRequest',
-      Origin: 'https://www.yt1s.com',
-      Referer: 'https://www.yt1s.com/',
-    },
-    body: new URLSearchParams({ q: 'https://www.youtube.com/watch?v=' + videoId, vt: 'downloader' }),
-    signal: AbortSignal.timeout(Math.max(1000, presupuestoMs)),
-  });
-  const j = await r.json().catch(() => null);
-  const enlace = extraerEnlaceExtractor(j);
-  if (!enlace) throw new Error('sin enlace (HTTP ' + r.status + ')');
-  return { enlace, calidad: kind === 'audio' ? 'mp3' : '720p', ext: kind === 'audio' ? 'mp3' : 'mp4' };
-}
-
-const EXTRACTORES_WEB = [
-  { nombre: 'converto', resolver: extractorConverto },
-  { nombre: 'yt1s', resolver: extractorYt1sFamily },
-];
-
-async function resolverViaExtractoresWeb(videoId, kind, presupuestoMs = 9000) {
-  const deadline = Date.now() + presupuestoMs;
-  for (const extractor of EXTRACTORES_WEB) {
-    if (Date.now() > deadline - 500) break;
-    const nombre = 'web:' + extractor.nombre;
-    if (!instanciaDisponible(nombre)) continue;
-    const t0 = Date.now();
-    try {
-      const hallado = await extractor.resolver(videoId, kind, Math.max(1000, deadline - Date.now()));
-      const probe = await probeUrlMedia(hallado.enlace, Math.min(5000, Math.max(1000, deadline - Date.now())));
-      console.log('[dl][capa3] ' + extractor.nombre + ' probe=' + probe.status + ' tipo=' + (probe.tipo || '-') + ' (' + (Date.now() - t0) + 'ms)');
-      if (!probe.ok) {
-        registrarIntentoCapa2(nombre, 'probe ' + probe.status + ' ' + (probe.tipo || '-'), Date.now() - t0);
-        marcarInstancia(nombre, probe.status === 200 ? 'limitada' : false);
-        continue;
-      }
-      marcarInstancia(nombre, true);
-      return {
-        url: hallado.enlace,
-        headers: { Referer: 'https://www.youtube.com/' },
-        fuente: 'web',
-        instancia: extractor.nombre,
-        calidad: hallado.calidad,
-        ext: hallado.ext,
-        meta: {},
-      };
-    } catch (e) {
-      marcarInstancia(nombre, false);
-      registrarIntentoCapa2(nombre, 'fallo: ' + String(e && e.message || e).slice(0, 80), Date.now() - t0);
-      console.log('[dl][capa3] ' + extractor.nombre + ' fallo: ' + String(e && e.message || e).slice(0, 80) + ' (' + (Date.now() - t0) + 'ms)');
-    }
-  }
-  return null;
-}
-
-// Lanza capa 2 (cobalt/invidious/piped) y capa 3 (extractores web) en
-// paralelo; devuelve el primer resultado validado, con presupuesto global.
-async function resolverViaInstanciasPublicas(videoId, kind, presupuestoMs = 9000) {
-  const t0 = Date.now();
-  const promesas = [
-    resolverViaCobalt(videoId, kind, presupuestoMs).catch(() => null),
-    resolverViaInvidious(videoId, kind, presupuestoMs).catch(() => null),
-    resolverViaPiped(videoId, kind, presupuestoMs).catch(() => null),
-    resolverViaExtractoresWeb(videoId, kind, presupuestoMs).catch(() => null),
-  ];
-  const resultado = await new Promise((resolver) => {
-    let terminado = false;
-    let pendientes = promesas.length;
-    const fin = (v) => { if (!terminado) { terminado = true; clearTimeout(timer); resolver(v); } };
-    const timer = setTimeout(() => fin(null), presupuestoMs);
-    promesas.forEach((p) => p.then((v) => {
-      pendientes -= 1;
-      if (v) return fin(v);
-      if (pendientes <= 0) fin(null);
-    }).catch(() => { pendientes -= 1; if (pendientes <= 0) fin(null); }));
-  });
-  if (resultado) {
-    console.log('[dl][capa2] exito via ' + resultado.fuente + ':' + resultado.instancia + ' (' + (Date.now() - t0) + 'ms)');
-  } else {
-    console.log('[dl][capa2] ninguna instancia publica pudo entregar el archivo (' + (Date.now() - t0) + 'ms)');
-  }
-  return resultado;
-}
-
 // ============================================================================
 // BUSQUEDA ROBUSTA: la busqueda por texto usaba una instancia Innertube
 // pelada (generate_session:false) que YouTube bloquea con el mismo anti-bot
 // que al player (0 resultados -> 404). Estrategia en cascada:
 //  1) Innertube con la sesion anonima auto-generada (2 intentos, 8s c/u)
 //  2) scraping del HTML de /results (videoRenderer)
-//  3) instancias Invidious activas (/api/v1/search)
 // Nunca lanza: devuelve lista (posiblemente vacia) de {videoId,titulo,...}.
 // ============================================================================
 function parsearDuracionTexto(texto) {
@@ -2997,50 +2196,19 @@ async function buscarYoutubeHtml(texto, limit) {
   return salida;
 }
 
-async function buscarYoutubeInvidious(texto, limit) {
-  for (const base of await instanciasPara('invidious', INSTANCIAS_INVIDIOUS)) {
-    let host = '';
-    try { host = new URL(base).host; } catch { continue; }
-    const nombre = 'invidious:' + host;
-    if (!instanciaDisponible(nombre)) continue;
-    try {
-      const json = await fetchJsonInstancia(base + '/api/v1/search?q=' + encodeURIComponent(texto) + '&type=video', 6000);
-      const lista = (Array.isArray(json) ? json : [])
-        .filter((v) => v && v.videoId && /^[a-zA-Z0-9_-]{11}$/.test(String(v.videoId)))
-        .slice(0, limit)
-        .map((v) => ({
-          videoId: String(v.videoId),
-          titulo: v.title || texto,
-          canal: v.author || '',
-          visitas: Number(v.viewCount) || 0,
-          duracion: Number(v.lengthSeconds) || 0,
-        }));
-      if (lista.length) {
-        marcarInstancia(nombre, true);
-        return lista;
-      }
-    } catch {}
-  }
-  return [];
-}
-
 async function buscarVideoYoutube(texto, limit = 5) {
   const limpio = String(texto || '').trim();
   if (!limpio || limpio.length > 120) return [];
   const salida = await buscarYoutubeInnertube(limpio, limit);
   if (salida.length) return salida;
-  const html = await buscarYoutubeHtml(limpio, limit).catch(() => []);
-  if (html.length) return html;
-  return buscarYoutubeInvidious(limpio, limit).catch(() => []);
+  return buscarYoutubeHtml(limpio, limit).catch(() => []);
 }
 
 // ============================================================================
 // Precalentamiento (TAREA 1 + TAREA 2): se corre UNA vez por proceso (cold
 // start de Vercel) en segundo plano, sin bloquear la primera peticion. Deja:
 //  1. la sesion anonima auto-generada lista (visitor data + cookies),
-//  2. la cookie manual validada (si esta vencida, desactivada por TTL),
-//  3. la Capa 2 viva: listas publicas descargadas y TODAS las instancias
-//     (hardcodeadas + descubiertas) con health-check REAL en segundo plano.
+//  2. la cookie manual validada (si esta vencida, desactivada por TTL).
 // ============================================================================
 let precalentamiento = null;
 let precalentamientoEstado = null;
@@ -3067,18 +2235,6 @@ function precalentar() {
         console.log('[precal] cookie manual validada: ' + (vigente === true ? 'sesion activa' : vigente === false ? 'vencida -> desactivada' : 'sin senal'));
         return vigente === false ? 'invalida' : 'ok';
       })(),
-      descubrirInstancias(true)
-        .then((d) => {
-          console.log('[precal] instancias descubiertas: invidious=' + d.invidious.length + ' piped=' + d.piped.length + ' cobalt=' + d.cobalt.length);
-          validarEnSegundoPlano('invidious', INSTANCIAS_INVIDIOUS.map(normalizarHostInstancia).filter(Boolean).slice(0, 12));
-          validarEnSegundoPlano('piped', INSTANCIAS_PIPED.map(normalizarHostInstancia).filter(Boolean).slice(0, 12));
-          validarEnSegundoPlano('cobalt', INSTANCIAS_COBALT.map(normalizarHostInstancia).filter(Boolean).slice(0, 12));
-          return 'ok';
-        })
-        .catch((e) => {
-          console.log('[precal] descubrimiento de instancias fallo: ' + String(e && e.message || e).slice(0, 100));
-          return 'fallo';
-        }),
     ]);
     precalentamientoEstado = {
       iniciado: true,
@@ -3086,7 +2242,7 @@ function precalentar() {
       ms: Date.now() - t0,
       sesion: resultados[0].status === 'fulfilled' ? resultados[0].value : 'fallo',
       cookie: resultados[1].status === 'fulfilled' ? resultados[1].value : 'fallo',
-      instancias: resultados[2].status === 'fulfilled' ? resultados[2].value : 'fallo',
+      instancias: 'eliminadas',
     };
     return precalentamientoEstado;
   })();
@@ -3096,6 +2252,38 @@ function precalentar() {
 function estadoPrecalentamiento() {
   return precalentamientoEstado || { iniciado: false };
 }
+
+function alturaDeCalidad(texto) {
+  const m = String(texto || '').match(/(\d{3,4})p/);
+  return m ? Number(m[1]) : 0;
+}
+
+// Puro (TAREA 3): escalera de calidades a recorrer en /dl cuando la calidad
+// pedida falla en todas las capas. Las calidades bajas pasan los filtros de
+// googlevideo con más frecuencia; solo se responde IP_BLOQUEADA cuando ni la
+// calidad mínima obtiene nada. El audio ya degrada solo dentro de
+// fetchYoutubeMedia (itag 140 -> cualquier audio -> progresivo itag 18).
+function escaleraCalidades(kind, calidad) {
+  const pedido = String(calidad || '').trim();
+  if (kind === 'audio') {
+    return pedido && pedido !== 'best' ? [pedido, 'best'] : ['best'];
+  }
+  // Video: itag 18 PRIMERO (mp4 360p progresivo con audio integrado: el
+  // formato combinado menos bloqueado por googlevideo y que no necesita
+  // DASH ni separar streams). Si itag 18 sale, se streamea ese. El audio
+  // NO se toca (su escalera vive arriba).
+  const escalera = ['18', 'best', '480', '360', '240', '144'];
+  if (pedido && pedido !== 'best' && pedido !== '18' && /^\d+$/.test(pedido)) {
+    const salida = ['18', pedido];
+    for (const q of escalera) {
+      if (q !== '18' && q !== pedido) salida.push(q);
+    }
+    return salida;
+  }
+  return escalera;
+}
+
+// Funcion pura: elige el formato de una respuesta de Invidious
 
 module.exports = {
   apiError,
@@ -3120,21 +2308,6 @@ module.exports = {
   parseSetCookies,
   extraerVisitorData,
   escaleraCalidades,
-  normalizarHostInstancia,
-  hostsDeInvidious,
-  hostsDePiped,
-  hostsDeCobalt,
-  validarInstanciaReal,
-  descubrirInstancias,
-  estadoInstanciasDescubiertas,
-  instanciasPara,
-  elegirFormatoInvidious,
-  elegirFormatoPiped,
-  resolverViaInstanciasPublicas,
-  resolverViaExtractoresWeb,
-  estadoSaludInstancias,
-  obtenerRegistroCapa2,
-  listadoInstanciasPublicas,
   fetchYoutubeMedia,
   buscarVideoYoutube,
   fetchYoutubeWatchPageMedia,

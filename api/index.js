@@ -673,15 +673,13 @@ return sendJson(404,{ok:false,error:'SIN_MEDIA',message:String(ultimoError&&ulti
 return sendJson(404,debugProbes?{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'La plataforma expuso el video pero el archivo no responde como video descargable desde este hosting (puede requerir sesion iniciada).',probes:debugProbes}:{ok:false,error:'SIN_MEDIA_DESCARGABLE',message:'La plataforma expuso el video pero el archivo no responde como video descargable desde este hosting (puede requerir sesion iniciada).'});
 }
 // kind audio|video -> YouTube: sistema 100% scraping en 3 capas, sin proxy.
-// CAPA 1: clientes Innertube directos desde la IP de salida de Vercel.
-// CAPA 2: instancias publicas (cobalt/Invidious/Piped) en paralelo, para
-//   rescatar la descarga cuando la IP de Vercel esta bloqueada por googlevideo.
-// CAPA 3: clientes sin cookie (WEB_EMBEDDED/TV_SIMPLY) al final de la capa 1.
-// Ambas capas arrancan en paralelo; gana la capa 1 si llega a tiempo. Si todo
-// falla se responde rapido con reintentar:true (Vercel rota la IP de salida).
+// CAPA 1: clientes Innertube directos desde la IP de salida de Vercel, con
+//   sesion anonima auto-generada (visitorData) y PO token BotGuard (bgutils).
+// CAPA B: clientes sin cookie (WEB_EMBEDDED/TV_SIMPLY) al final de la cascada.
+// Si todo falla se responde rapido con reintentar:true (Vercel rota la IP).
 let videoId=query;
 let listaDlBusqueda=null;
-const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
+const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/|live\/))([a-zA-Z0-9_-]{11})/);
 if(match){
 videoId=match[1];
 }else if(!/^([a-zA-Z0-9_-]{11})$/.test(query)){
@@ -726,8 +724,7 @@ if(recordado&&recordado.expiresAt<Date.now())dlClienteCache.delete(claveCliente)
 // CAPA 1: scraping directo. Intento A = camino completo de youtubei.js
 // (clientes en paralelo + PO token bgutil + watch page + sesion anonima
 // auto-generada), recortado a 8s. Intento B = clientes puntuales en paralelo
-// (capa 1 + capa 3 sin cookie), probe en orden de prioridad.
-// CAPA 2: instancias publicas en paralelo.
+// (capa 1 + capa B sin cookie), probe en orden de prioridad.
 // TAREAS 3/4: si la calidad pedida falla, se degrada (480p -> 360p -> itag 18)
 // y se re-resuelve una vez con sesion anonima recien renovada antes de
 // responder IP_BLOQUEADA.
@@ -820,18 +817,10 @@ return {ok:true,url:r.value.url,headers,detalle:'capa'+c.capa+' '+c.cliente,ext:
 }
 return {ok:false};
 })();
-const intentoCapa2=secureApi.resolverViaInstanciasPublicas(videoId,tipoMedia,18000).catch(()=>null);
-// Prioridad capa 1: hasta 20s (Vercel permite 60s). Si no llega, se usa capa 2 si ya esta lista.
+// Prioridad capa 1: hasta 20s; si la primera raza se agota se espera otra
+// tanda (la promesa capa 1 sigue resolviendo candidatos internamente).
 let r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),20000))]);
 if(!(r1&&r1.ok)){
-const restante2=Math.max(0,21000-(Date.now()-t0Pasada));
-const r2=await Promise.race([intentoCapa2,new Promise((r)=>setTimeout(()=>r(null),restante2))]);
-if(r2&&r2.url){
-dlMediaCache.set(videoId+'|'+kind+'|'+calidad,{url:r2.url,headers:{},fuente:'capa2:'+r2.fuente+':'+r2.instancia,ext:r2.ext,expiresAt:Date.now()+30*60*1000});
-if(dlMediaCache.size>50)dlMediaCache.delete(dlMediaCache.keys().next().value);
-console.log('[dl] salida por CAPA 2 ('+r2.fuente+':'+r2.instancia+' calidad='+r2.calidad+') a los '+(Date.now()-t0Pasada)+'ms');
-return {ok:true,url:r2.url,headers:{},detalle:'capa2 '+r2.fuente+':'+r2.instancia,ext:r2.ext};
-}
 const restante1=Math.max(0,22000-(Date.now()-t0Pasada));
 r1=await Promise.race([intentoCapa1,new Promise((r)=>setTimeout(()=>r(null),restante1))]);
 }
@@ -900,16 +889,16 @@ if(salida){
 console.log('[dl] entregado calidad='+calidadUsada+' fuente='+salida.detalle+' total='+(Date.now()-tInicioDl)+'ms');
 return streamMedia(req,res,sendJson,requestId,salida.url,{referer:'https://www.youtube.com/',headers:salida.headers,filename:videoId+'.'+salida.ext,sinRangos:!!salida.sinRangos});
 }
-return sendJson(502,{ok:false,error:'IP_BLOQUEADA',reintentar:true,message:'Ningun cliente ni instancia publica pudo descargar desde este hosting. Vercel rota la IP de salida: reintentar suele funcionar.',intentos:[...intentos.slice(-6),...(secureApi.obtenerRegistroCapa2?secureApi.obtenerRegistroCapa2():[]).slice(-9)]});
+return sendJson(502,{ok:false,error:'IP_BLOQUEADA',reintentar:true,message:'Ningun cliente pudo descargar desde este hosting. Vercel rota la IP de salida: reintentar suele funcionar.',intentos:[...intentos.slice(-6)]});
 }
 if(pathname==='/ytmp3'||pathname==='/ytmp4'||pathname==='/youtube'||pathname==='/ytsearch'){
 let videoId=query;
 let searchMeta=null;
 let listaBusqueda=null;
-const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/))([a-zA-Z0-9_-]{11})/);
+const match=query.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|v\/|embed\/|shorts\/|live\/))([a-zA-Z0-9_-]{11})/);
 if(match){
 videoId=match[1];
-}else if(/(?:youtu\.be\/|youtube\.com\/(?:watch\?|v\/|embed\/|shorts\/))/.test(query)&&!/^[a-zA-Z0-9_-]{11}$/.test(query)){
+}else if(/(?:youtu\.be\/|youtube\.com\/(?:watch\?|v\/|embed\/|shorts\/|live\/))/.test(query)&&!/^[a-zA-Z0-9_-]{11}$/.test(query)){
 // Parece URL de YouTube pero no contiene un videoId valido (watch?v=abc,
 // enlace cortado...): buscar la URL literal como texto devolveria un video
 // CUALQUIERA. Error limpio en su lugar.
@@ -948,19 +937,17 @@ thumbnail:`https://i.ytimg.com/vi/${v.videoId}/maxresdefault.jpg`
 return sendJson(200,{ok:true,source:'youtube',query,total_resultados:results.length,resultados:results});
 }
 const isAudio=pathname==='/ytmp3';
-// Capa 1 = scraping directo desde la IP de salida. Si esta bloqueada (Sign in
-// to confirm you're not a bot), Capa 2 = instancias publicas (cobalt tunnel:
-// no queda amarrado a nuestra IP). Presupuesto global 32s para dejar lugar al
-// plan B (resultados alternativos de la busqueda) en la misma peticion.
+// Capa 1 = scraping directo desde la IP de salida con sesion anonima y PO
+// token BotGuard generados en memoria (sin cookies ni instancias de terceros).
+// Presupuesto global 32s para dejar lugar al plan B (resultados alternativos
+// de la busqueda) en la misma peticion.
 const t0Ytmp=Date.now();
 const restanteYtmp=()=>32000-(Date.now()-t0Ytmp);
 // Si en ESTA peticion la capa 1 ya devolvio LOGIN_REQUIRED, los siguientes
 // candidatos van directo a capa 2 (la capa 1 no cambia de opinion por IP).
 let loginDetectado=false;
-let altCapa2=null;
 const resolverYtmp=async(vid,saltarCapa1)=>{
 const pedirCapa1Ytmp=async(presupuestoMs,opciones={})=>secureApi.fetchYoutubeMedia(vid,isAudio?'audio':'video',qualityParam==='best'?'best':qualityParam,null,{presupuestoMs,sesionRenovada:true,...opciones});
-const capa2EnParalelo=secureApi.resolverViaInstanciasPublicas(vid,isAudio?'audio':'video',16000).catch(()=>null);
 let media=null;
 let errorCapa1=null;
 if(!saltarCapa1){
@@ -983,30 +970,6 @@ try{media=await pedirCapa1Ytmp(Math.min(5500,Math.max(3000,restanteYtmp()-500)),
 }
 }
 }
-const cosecharCapa2=async()=>{
-if(!capa2EnParalelo)return;
-const esperaCapa2=Math.max(1200,restanteYtmp()-300);
-altCapa2=await Promise.race([capa2EnParalelo,new Promise((r)=>setTimeout(()=>r(null),esperaCapa2))]);
-if(altCapa2&&altCapa2.url){
-console.log('[ytmp]['+vid+'] respaldo por CAPA 2 via '+altCapa2.fuente+':'+altCapa2.instancia);
-media={url:altCapa2.url,quality:altCapa2.calidad||'',basic_info:{},proxy_dl:true,...(altCapa2.sin_audio?{sin_audio:true}:{})};
-}
-};
-if(!media||!media.url){
-// Se cosecha la capa 2 que ya venia corriendo (no se relanza).
-await cosecharCapa2();
-}
-if((!media||!media.url)&&!saltarCapa1){
-// Segunda ola de CAPA 2 con descubrimiento forzado: en cold start el pool
-// viene frio y la primera ola puede agotarse sin tocar una instancia viva.
-try{await secureApi.descubrirInstancias(true);}catch(e){}
-console.log('[ytmp]['+vid+'] capa 2 segunda ola (descubrimiento forzado)');
-altCapa2=await secureApi.resolverViaInstanciasPublicas(vid,isAudio?'audio':'video',10000).catch(()=>null);
-if(altCapa2&&altCapa2.url){
-console.log('[ytmp]['+vid+'] respaldo por CAPA 2 (2da ola) via '+altCapa2.fuente+':'+altCapa2.instancia);
-media={url:altCapa2.url,quality:altCapa2.calidad||'',basic_info:{},proxy_dl:true,...(altCapa2.sin_audio?{sin_audio:true}:{})};
-}
-}
 if(!media||!media.url){
 // En el fallo total se mantiene el error de capa 1 pero con reintentar
 // (FALLA 3): el bot reintenta y Vercel rota la IP de salida.
@@ -1015,7 +978,6 @@ if(errorCapa1){
 // permanentes (404 video inexistente, 400 URL invalida) mantienen su flag
 // original porque reintentar no cambiaria el resultado.
 if(!(errorCapa1.statusCode>=400&&errorCapa1.statusCode<500))errorCapa1.reintentar=true;
-if(secureApi.obtenerRegistroCapa2)errorCapa1.registro_capa2=secureApi.obtenerRegistroCapa2();
 if(errorCapa1.code==='REQUEST_TIMEOUT'||errorCapa1.statusCode===504){
 const reemplazo=secureApi.apiError(502,'YouTube no respondio a tiempo. Reintentar suele funcionar (Vercel rota la IP de salida).',{code:'YOUTUBE_TIMEOUT'});
 reemplazo.reintentar=true;
@@ -1029,7 +991,6 @@ return media;
 };
 let media=null;
 let errorTotal=null;
-altCapa2=null;
 try{media=await resolverYtmp(videoId,false);}catch(e){errorTotal=e;}
 // PLAN B: si el primer resultado de la busqueda no se pudo resolver (bloqueo
 // por video, instancia saturada...), se prueban los resultados siguientes:
@@ -1148,7 +1109,7 @@ return sendJson(404,{ok:false,error:{message:String(e&&e.message||e).slice(0,220
 }
 }
 if(pathname==='/status'){
-return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_cookie_vigente:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie)&&secureApi.cookieManualVigente()!==false,youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),precalentamiento:(secureApi.estadoPrecalentamiento&&typeof secureApi.estadoPrecalentamiento==='function')?secureApi.estadoPrecalentamiento():null,sesion_anonima:(secureApi.estadoSesionAnonima?typeof secureApi.estadoSesionAnonima==='function'?secureApi.estadoSesionAnonima():{activa:false}:{activa:false}),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','instancias_publicas'],instancias_descubiertas:(secureApi.estadoInstanciasDescubiertas&&typeof secureApi.estadoInstanciasDescubiertas==='function')?secureApi.estadoInstanciasDescubiertas():null,instancias_publicas:(secureApi.listadoInstanciasPublicas&&typeof secureApi.listadoInstanciasPublicas==='function')?secureApi.listadoInstanciasPublicas():null,configuracion_dueno:'no requerida: la API auto-gestiona su sesion anonima y su pool de instancias publicas',admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
+return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_cookie_vigente:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie)&&secureApi.cookieManualVigente()!==false,youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),precalentamiento:(secureApi.estadoPrecalentamiento&&typeof secureApi.estadoPrecalentamiento==='function')?secureApi.estadoPrecalentamiento():null,sesion_anonima:(secureApi.estadoSesionAnonima?typeof secureApi.estadoSesionAnonima==='function'?secureApi.estadoSesionAnonima():{activa:false}:{activa:false}),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','potoken_botguard'],configuracion_dueno:'no requerida: la API auto-gestiona su sesion anonima y su PO token BotGuard en memoria',admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
 }
 return sendJson(404,{ok:false,message:'Ruta no encontrada: '+pathname});
 }catch(error){
