@@ -2707,16 +2707,31 @@ async function resolverViaCobalt(videoId, kind, presupuestoMs = 9000) {
     if (!instanciaDisponible(nombre)) continue;
     const t0 = Date.now();
     try {
-      const cuerpo = kind === 'audio'
+      const cuerpoBase = kind === 'audio'
         ? { url: 'https://www.youtube.com/watch?v=' + videoId, downloadMode: 'audio', audioFormat: 'mp3' }
-        : { url: 'https://www.youtube.com/watch?v=' + videoId, downloadMode: 'auto', videoQuality: '720', youtubeVideoCodec: 'h264' };
-      const r = await fetch(base + '/', {
-        method: 'POST',
-        headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
-        body: JSON.stringify(cuerpo),
-        signal: AbortSignal.timeout(Math.min(6000, Math.max(1000, deadline - Date.now()))),
-      });
-      const json = await r.json().catch(() => null);
+        : { url: 'https://www.youtube.com/watch?v=' + videoId, downloadMode: 'auto' };
+      const cuerpos = kind === 'audio'
+        ? [cuerpoBase]
+        : [{ ...cuerpoBase, videoQuality: '720', youtubeVideoCodec: 'h264' }];
+      let json = null;
+      let r = null;
+      for (const cuerpo of cuerpos) {
+        r = await fetch(base + '/', {
+          method: 'POST',
+          headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
+          body: JSON.stringify(cuerpo),
+          signal: AbortSignal.timeout(Math.min(10000, Math.max(1000, deadline - Date.now()))),
+        });
+        json = await r.json().catch(() => null);
+        if (json && json.status === 'error'
+          && json.error && json.error.code === 'error.api.invalid_body'
+          && cuerpo !== cuerpoBase) {
+          cuerpos.length = 0;
+          cuerpos.push(cuerpoBase);
+          continue;
+        }
+        break;
+      }
       if (!json || json.status === 'error' || !json.url) {
         // error.api.youtube.login = la instancia NO puede con ESTE video (su
         // propia sesion youtube fue throttled), no que este muerta: 'limitada'
