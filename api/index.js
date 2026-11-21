@@ -1220,6 +1220,11 @@ return sendJson(200,data);
 return sendJson(404,{ok:false,error:{message:String(e&&e.message||e).slice(0,220)}});
 }
 }
+if(pathname==='/gacha/tirar'){
+// Handler del gacha movido a lib/ para no superar el limite de 12 funciones
+// serverless del plan Hobby de Vercel.
+return require('../lib/gacha-tirar')(req,res);
+}
 if(pathname==='/status'){
 return sendJson(200,{ok:true,servicio:'ZETA-CORE API',secureApi_cargada:!secureApiLoadError,secureApi_error:secureApiLoadError?String(secureApiLoadError&&secureApiLoadError.message||secureApiLoadError).slice(0,300):undefined,youtube_cookie_configurada:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie),youtube_cookie_vigente:!!(process.env.YOUTUBE_COOKIE||process.env.youtube_cookie)&&secureApi.cookieManualVigente()!==false,youtube_visitor_data_configurada:!!(process.env.YOUTUBE_VISITOR_DATA||process.env.youtube_visitor_data),precalentamiento:(secureApi.estadoPrecalentamiento&&typeof secureApi.estadoPrecalentamiento==='function')?secureApi.estadoPrecalentamiento():null,sesion_anonima:(secureApi.estadoSesionAnonima?typeof secureApi.estadoSesionAnonima==='function'?secureApi.estadoSesionAnonima():{activa:false}:{activa:false}),dl_key_configurada:!!(process.env.DL_KEY||process.env.dl_key),capas_activas:['scraping_directo','potoken_botguard','savetube','y2down'],configuracion_dueno:'no requerida: la API auto-gestiona su sesion anonima y su PO token BotGuard en memoria',admin_password_configurada:!!(process.env.ADMIN_PASSWORD||process.env.admin_password),endpoints:['/ytmp4','/ytmp3','/ytsearch','/tiktok','/ttsearch','/xvideo','/instagram','/facebook','/dl','/status']});
 }
