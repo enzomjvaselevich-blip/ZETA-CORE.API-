@@ -4,6 +4,13 @@
 // browser_native_sd_url (y en algunos casos hd_src / playable_url). Con un
 // User-Agent comun de navegador responde 400 o un muro de login.
 const secureApi = require('../secure-api');
+let snapsave = null;
+let snapsaveLoadError = null;
+try {
+  snapsave = require('../../lib/snapsave');
+} catch (e) {
+  snapsaveLoadError = e;
+}
 
 const BOT_UA = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
 
@@ -100,6 +107,18 @@ async function fetchFacebookVideo(inputUrl, parentSignal) {
   const crudo = String(inputUrl || '').trim();
   if (!/(^|\.)facebook\.com$|^fb\.watch$|(facebook\.com|fb\.watch)\//i.test(crudo)) {
     throw secureApi.apiError(404, 'No se reconoce el enlace de Facebook. Acepta facebook.com/share/v/..., watch, reels y fb.watch.');
+  }
+
+  // Motor snapsave.app primero: su CDN (rapidcdn) no esta amarrado a la IP de
+  // salida ni exige User-Agent de crawler, y sirve MP4 con Range (206).
+  // Si falla, sigue el scraping nativo de crawlers de Facebook de abajo.
+  if (snapsave) {
+    try {
+      return await snapsave.fetchSnapsaveVideo(crudo, parentSignal, 20000);
+    } catch (e) {
+      if (parentSignal && parentSignal.aborted) throw e;
+      console.log('[facebook] snapsave fallo, sigo con scraping nativo: ' + String(e && e.message || e).slice(0, 110));
+    }
   }
 
   const paginas = [];

@@ -670,14 +670,16 @@ return sendJson(404,{ok:false,error:'SIN_VIDEO',message:'El post no contiene un 
 }
 const candidatos=[data.descarga_directa,...(Array.isArray(data.candidatos)?data.candidatos:[])]
 .filter((u,i,a)=>typeof u==='string'&&/^https?:\/\//.test(u)&&a.indexOf(u)===i);
+// Enlaces de snapsave (rapidcdn): headers neutros, su CDN no exige ninguno.
+const headersDescarga=data.fuente==='snapsave'?{}:scrapeHeaders;
 for(const mediaUrl of candidatos){
 // Mismos headers exactos que los probes internos del scraping (sin Referer
 // extra): cualquier diferencia entre el probe y la descarga es una chance de
 // que el CDN de Meta cambie la respuesta.
-const probe=await probeMediaTipo(mediaUrl,scrapeHeaders);
+const probe=await probeMediaTipo(mediaUrl,headersDescarga);
 if(debugProbes)debugProbes.push({ronda,url:mediaUrl.slice(0,70),status:probe.status,tipo:probe.tipo});
 if(probe.ok){
-return streamMedia(req,res,sendJson,requestId,mediaUrl,{sinProxy:true,headers:scrapeHeaders,exigirVideo:true,mensajeBloqueo:'El CDN de '+(kind==='instagram'?'Instagram':'Facebook')+' rechazo la descarga desde este hosting (HTTP 403).'});
+return streamMedia(req,res,sendJson,requestId,mediaUrl,{sinProxy:true,headers:headersDescarga,exigirVideo:true,mensajeBloqueo:'El CDN de '+(kind==='instagram'?'Instagram':'Facebook')+' rechazo la descarga desde este hosting (HTTP 403).'});
 }
 }
 }
